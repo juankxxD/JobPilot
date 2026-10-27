@@ -7,12 +7,20 @@ Requires WeasyPrint's native libraries (pango/cairo), so it skips cleanly locall
 
 from __future__ import annotations
 
+import copy
 import io
+from typing import Any
 
 import pytest
 
 from jobpilot.config import Language
-from jobpilot.documents.render import html_to_pdf, render_cv, render_cv_html
+from jobpilot.documents.render import (
+    MAX_CV_PAGES,
+    CvTooLongError,
+    html_to_pdf,
+    render_cv,
+    render_cv_html,
+)
 from jobpilot.models import ContentSelection
 from jobpilot.profile.model import ProfileModel
 from tests.conftest import skip_without_weasyprint
@@ -67,3 +75,45 @@ def test_pdf_text_is_selectable(example_profile: ProfileModel, language: Languag
     html = render_cv_html(example_profile, _selection(language))
     text = _extract_text(html_to_pdf(html))
     assert example_profile.basics.name in text
+
+
+def _oversized_profile(example_profile_dict: dict[str, Any]) -> tuple[ProfileModel, list[str]]:
+    """Return a valid profile whose single role has enough long achievements to
+    overflow two pages, plus the list of those achievement ids (for the selection)."""
+    data = copy.deepcopy(example_profile_dict)
+    long_text = " ".join(["Delivered a resilient distributed service with measurable impact."] * 20)
+    achievements = []
+    ids: list[str] = []
+    for i in range(40):
+        ach_id = f"ach_bulk_{i}"
+        ids.append(ach_id)
+        achievements.append(
+            {
+                "id": ach_id,
+                "tags": ["Java"],
+                "es": long_text,
+                "en": long_text,
+                "translation_status": "approved",
+            }
+        )
+    data["experience"][0]["achievements"] = achievements
+    return ProfileModel.model_validate(data), ids
+
+
+def test_oversized_valid_cv_is_rejected_not_uploaded(example_profile_dict: dict[str, Any]) -> None:
+    """A valid but very long profile must not yield a CV over the two-page maximum.
+
+    ``render_cv`` raises before returning any bytes, so no oversized CV can reach an
+    upload. This guards the two-page requirement against unbounded profile content.
+    """
+    profile, ids = _oversized_profile(example_profile_dict)
+    selection = ContentSelection(
+        summary_variant="backend_java",
+        ordered_achievement_ids=ids,
+        project_ids=[],
+        highlighted_skill_ids=[],
+        language=Language.en,
+    )
+    with pytest.raises(CvTooLongError) as excinfo:
+        render_cv(profile, selection, company="ACME", role="Backend")
+    assert str(MAX_CV_PAGES) in str(excinfo.value)

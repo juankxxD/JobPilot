@@ -45,6 +45,20 @@ def test_unknown_ids_are_reported(example_profile_dict: dict[str, Any]) -> None:
     assert not issues.is_empty()
 
 
+def test_unknown_highlighted_skill_is_reported(example_profile_dict: dict[str, Any]) -> None:
+    profile = _profile(example_profile_dict)
+    issues = validate_selection(
+        profile,
+        summary_variant="backend_java",
+        achievement_ids=[],
+        project_ids=[],
+        language=Language.en,
+        highlighted_skill_ids=["Java", "invented-skill"],
+    )
+    assert issues.unknown_skill_ids == ["invented-skill"]  # Java is in the profile
+    assert not issues.is_empty()
+
+
 def test_unapproved_translation_is_reported(example_profile_dict: dict[str, Any]) -> None:
     data = copy.deepcopy(example_profile_dict)
     data["projects"][0]["translation_status"] = "pending_review"

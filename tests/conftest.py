@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -43,26 +44,54 @@ def example_profile(example_profile_dict: dict[str, Any]) -> ProfileModel:
     return ProfileModel.model_validate(example_profile_dict)
 
 
+def _running_in_ci() -> bool:
+    """Return whether we are running in CI.
+
+    GitHub Actions (and most CI providers) set ``CI=true``. In CI the WeasyPrint
+    native libraries are installed via apt, so the PDF tests must run — and any
+    failure, including a missing-library or rendering regression, must fail the
+    job rather than silently skip.
+    """
+    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _is_missing_native_lib_error(exc: BaseException) -> bool:
+    """Return whether ``exc`` is WeasyPrint failing to load pango/cairo natively.
+
+    WeasyPrint imports in pure Python but loads libgobject/pango/cairo via cffi at
+    import/render time; when those system libraries are absent the dlopen fails with
+    an ``OSError`` whose message names the missing library. We match only that case
+    so an actual template/CSS/rendering regression is NOT mistaken for a missing lib.
+    """
+    message = str(exc).lower()
+    native_markers = ("gobject", "pango", "cairo", "libffi", "fontconfig", "harfbuzz")
+    return isinstance(exc, OSError) and any(marker in message for marker in native_markers)
+
+
 def weasyprint_available() -> bool:
     """Return whether WeasyPrint can render (native pango/cairo libraries present).
 
-    WeasyPrint imports in Python even without its native libraries, but rendering a
-    PDF fails. We probe a tiny render so the PDF tests skip cleanly locally (no
-    native libs) while still running in CI, where the libs are installed via apt.
+    Probes a tiny render. A missing-native-library failure returns ``False`` so the
+    PDF tests skip cleanly in a local environment without pango/cairo. Any other
+    failure is re-raised so a genuine rendering/template defect surfaces instead of
+    being hidden behind a skip. In CI the skip is never applied (see the marker
+    below), so missing setup or a rendering regression fails the run.
     """
     try:
         from weasyprint import HTML
-    except Exception:  # pragma: no cover - weasyprint is a declared dependency
-        return False
-    try:
+
         HTML(string="<p>probe</p>").write_pdf()
-    except Exception:
-        return False
+    except Exception as exc:
+        if _running_in_ci():
+            raise
+        if _is_missing_native_lib_error(exc):
+            return False
+        raise
     return True
 
 
 skip_without_weasyprint = pytest.mark.skipif(
-    not weasyprint_available(),
+    not _running_in_ci() and not weasyprint_available(),
     reason="WeasyPrint native libraries (pango/cairo) are not available",
 )
 

@@ -50,6 +50,16 @@ def test_select_content_nonexistent_id_fails_after_retry(example_profile: Profil
     assert len(llm.prompts) == 2
 
 
+def test_select_content_nonexistent_skill_fails_after_retry(example_profile: ProfileModel) -> None:
+    bad = _valid_selection().model_copy(update={"highlighted_skill_ids": ["invented-skill"]})
+    # Both attempts cite a skill absent from the profile -> SelectionError after retry.
+    llm = ScriptedFakeLlmClient([bad.model_copy(), bad.model_copy()])
+    with pytest.raises(SelectionError) as excinfo:
+        select_content(_analysis(), example_profile, llm, Language.en)
+    assert "invented-skill" in str(excinfo.value)
+    assert len(llm.prompts) == 2
+
+
 def test_select_content_recovers_on_retry(example_profile: ProfileModel) -> None:
     bad = _valid_selection().model_copy(update={"summary_variant": "made_up"})
     good = _valid_selection()

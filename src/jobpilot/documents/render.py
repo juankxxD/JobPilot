@@ -29,10 +29,15 @@ if TYPE_CHECKING:
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 MAX_COVER_WORDS = 200
+MAX_CV_PAGES = 2
 
 
 class CoverLetterTooLongError(ValueError):
     """Raised when a cover letter exceeds the 200-word limit."""
+
+
+class CvTooLongError(ValueError):
+    """Raised when a rendered CV exceeds the two-page maximum."""
 
 
 class DocumentContentError(ValueError):
@@ -237,6 +242,22 @@ def html_to_pdf(html: str) -> bytes:
     return HTML(string=html).write_pdf()  # type: ignore[no-any-return]
 
 
+def html_to_pdf_with_page_limit(html: str, *, max_pages: int) -> bytes:
+    """Render HTML to PDF, raising :class:`CvTooLongError` if it exceeds ``max_pages``.
+
+    WeasyPrint lays the document out into pages before writing the PDF, so the page
+    count is checked on the rendered ``Document`` and an over-length result is
+    rejected before any bytes are returned (and therefore before any upload).
+    """
+    from weasyprint import HTML  # noqa: PLC0415 - lazy import for optional native deps
+
+    document = HTML(string=html).render()
+    page_count = len(document.pages)
+    if page_count > max_pages:
+        raise CvTooLongError(f"rendered CV has {page_count} pages, the maximum is {max_pages}")
+    return document.write_pdf()  # type: ignore[no-any-return]
+
+
 def render_cv(
     profile: ProfileModel,
     selection: ContentSelection,
@@ -244,9 +265,13 @@ def render_cv(
     company: str,
     role: str,
 ) -> Attachment:
-    """Render a tailored CV to a PDF :class:`~jobpilot.models.Attachment`."""
+    """Render a tailored CV to a PDF :class:`~jobpilot.models.Attachment`.
+
+    The rendered PDF is checked against the two-page maximum before it is returned,
+    so an oversized CV raises :class:`CvTooLongError` and never reaches an upload.
+    """
     html = render_cv_html(profile, selection)
-    pdf = html_to_pdf(html)
+    pdf = html_to_pdf_with_page_limit(html, max_pages=MAX_CV_PAGES)
     filename = build_document_filename(
         full_name=profile.basics.name,
         company=company,

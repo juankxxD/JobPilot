@@ -83,6 +83,7 @@ def select_content(
             achievement_ids=selection.ordered_achievement_ids,
             project_ids=selection.project_ids,
             language=language,
+            highlighted_skill_ids=selection.highlighted_skill_ids,
         )
         if issues.is_empty():
             return selection
