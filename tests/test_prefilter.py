@@ -83,11 +83,26 @@ def test_salary_k_suffix_is_annualized_to_monthly() -> None:
 
 def test_salary_ignores_percentages_and_unrelated_numbers() -> None:
     config = _config(min_salary_usd=5000)
-    # The "15% bonus" and other non-salary figures must not be read as the salary:
-    # the 80k-110k annual range (~6666/month) clears the 5000 monthly threshold.
+    # A percentage bonus must not be read as the salary: the 80k-110k annual range
+    # (~6666/month) clears the 5000 monthly threshold.
     assert prefilter(_raw(salary_text="$80k - $110k USD + 15% bonus"), config) is True
     # Percentages alone do not constitute a declared salary.
     assert prefilter(_raw(salary_text="Great team, 20% equity"), config) is True
+
+
+def test_salary_with_currency_bonus_is_not_filtered() -> None:
+    """A currency-valued bonus/equity mixed with base pay must not over-reject.
+
+    Text alone cannot reliably isolate the base amount from a '$15k signing bonus',
+    so the deterministic prefilter defers to the LLM analysis step (R4) and keeps
+    the job rather than risk filtering a valid high-salary offer on a wrong number.
+    """
+    config = _config(min_salary_usd=5000)
+    # Previously parsed the $15k bonus as the salary floor and dropped the job.
+    assert prefilter(_raw(salary_text="$80k-$110k USD + $15k signing bonus"), config) is True
+    assert prefilter(_raw(salary_text="$120k USD base + $20k equity"), config) is True
+    # A clean base-only declaration is still filtered normally.
+    assert prefilter(_raw(salary_text="$36k USD per year"), config) is False
 
 
 def test_modality_hybrid_only_rejects_onsite_and_remote() -> None:

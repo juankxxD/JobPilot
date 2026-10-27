@@ -9,8 +9,11 @@ A :class:`~jobpilot.models.RawJob` passes when it clears every configured rule:
 * accepted languages — if a language is known it must be in the accepted list;
 * modality — if the config lists modalities and the job declares one, its actual
   modality (remote / hybrid / onsite) must be allowed;
-* minimum salary — only enforced when the offer declares a parseable salary, which
-  is normalized to monthly USD before comparison.
+* minimum salary — only enforced when the offer declares a parseable base salary,
+  normalized to monthly USD before comparison. When the salary string mixes in
+  non-base compensation (bonus, equity, commission, signing, stock), the prefilter
+  declines to filter on salary and defers to the LLM analysis step, since text
+  alone cannot reliably isolate base pay (R4: filter cheap, never over-reject).
 
 The function is pure and performs no I/O.
 """
@@ -105,12 +108,43 @@ def _cadence_factor(text: str) -> float | None:
     return None
 
 
+# Markers of non-base compensation (bonus, equity, commission, signing, stock).
+# When a salary string mixes base pay with any of these, text alone cannot reliably
+# isolate the base amount, so the deterministic prefilter declines to filter on
+# salary and defers to the LLM analysis step (R4: filter cheap, never over-reject).
+_NON_BASE_COMP_MARKERS: tuple[str, ...] = (
+    "bonus",
+    "equity",
+    "commission",
+    "signing",
+    "sign-on",
+    "sign on",
+    "stock",
+    "rsu",
+    "bono",
+    "comisión",
+    "comision",
+)
+
+
+def _has_non_base_compensation(text: str) -> bool:
+    return any(marker in text for marker in _NON_BASE_COMP_MARKERS)
+
+
 def _declared_salary_usd(raw: RawJob) -> float | None:
-    """Return the lowest declared salary, normalized to monthly USD, else None."""
+    """Return the lowest declared base salary, normalized to monthly USD, else None.
+
+    Returns ``None`` (do not filter) when the declaration mixes in non-base
+    compensation such as a currency-valued bonus or equity, since a text-only parser
+    cannot reliably separate base pay from those amounts.
+    """
     if not raw.salary_text:
         return None
     text = raw.salary_text.lower()
     if "usd" not in text and "$" not in text:
+        return None
+    if _has_non_base_compensation(text):
+        # Ambiguous mix of base + bonus/equity/etc.; let the LLM extract salary.
         return None
 
     amounts: list[float] = []
