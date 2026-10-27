@@ -43,6 +43,30 @@ def example_profile(example_profile_dict: dict[str, Any]) -> ProfileModel:
     return ProfileModel.model_validate(example_profile_dict)
 
 
+def weasyprint_available() -> bool:
+    """Return whether WeasyPrint can render (native pango/cairo libraries present).
+
+    WeasyPrint imports in Python even without its native libraries, but rendering a
+    PDF fails. We probe a tiny render so the PDF tests skip cleanly locally (no
+    native libs) while still running in CI, where the libs are installed via apt.
+    """
+    try:
+        from weasyprint import HTML
+    except Exception:  # pragma: no cover - weasyprint is a declared dependency
+        return False
+    try:
+        HTML(string="<p>probe</p>").write_pdf()
+    except Exception:
+        return False
+    return True
+
+
+skip_without_weasyprint = pytest.mark.skipif(
+    not weasyprint_available(),
+    reason="WeasyPrint native libraries (pango/cairo) are not available",
+)
+
+
 @pytest.fixture
 def load_fixture() -> Callable[[str], Any]:
     """Return a loader for JSON files under ``tests/fixtures``."""

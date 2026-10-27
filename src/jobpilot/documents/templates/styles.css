@@ -1,0 +1,79 @@
+/* ATS-friendly document styles.
+ *
+ * Single column, no tables, no images, no icons: an ATS parser reads the text in
+ * a predictable top-to-bottom order. Only common, widely-available fonts are used
+ * so text stays selectable and extractable. The default target is one page; the
+ * page size and conservative spacing keep a typical CV within one to two pages. */
+
+@page {
+  size: A4;
+  margin: 18mm 16mm;
+}
+
+body {
+  font-family: "Helvetica", "Arial", sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.35;
+  color: #1a1a1a;
+  margin: 0;
+}
+
+/* Single-column flow: every block is full width, stacked vertically. */
+header,
+section {
+  display: block;
+  width: 100%;
+}
+
+h1 {
+  font-size: 18pt;
+  margin: 0 0 2pt 0;
+}
+
+h2 {
+  font-size: 12pt;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid #999999;
+  padding-bottom: 2pt;
+  margin: 12pt 0 6pt 0;
+}
+
+h3 {
+  font-size: 11pt;
+  margin: 8pt 0 1pt 0;
+}
+
+p {
+  margin: 0 0 4pt 0;
+}
+
+ul {
+  margin: 2pt 0 6pt 0;
+  padding-left: 16pt;
+}
+
+li {
+  margin: 0 0 2pt 0;
+}
+
+.contact {
+  font-size: 9.5pt;
+  color: #333333;
+  margin-bottom: 2pt;
+}
+
+.role-meta {
+  font-size: 9.5pt;
+  color: #555555;
+  margin: 0 0 2pt 0;
+}
+
+.skills-line {
+  margin: 0 0 3pt 0;
+}
+
+.cover-body p {
+  margin: 0 0 8pt 0;
+  text-align: left;
+}

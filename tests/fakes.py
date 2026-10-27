@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel
 
-from jobpilot.models import Application, Job, JobStatus, RawJob
+from jobpilot.models import Application, Job, JobStatus, RawJob, StoredFile
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -193,3 +194,22 @@ class FakeJobSource:
         if self._error is not None:
             raise self._error
         return list(self._jobs)
+
+
+class FakeFileStorage:
+    """A FileStorage that records uploads and returns a canned StoredFile."""
+
+    def __init__(self, *, base_url: str = "https://drive.example.com/file") -> None:
+        self._base_url = base_url
+        self.uploads: list[tuple[Path, str]] = []
+        self._counter = 0
+
+    def upload(self, path: Path, name: str) -> StoredFile:
+        self._counter += 1
+        self.uploads.append((path, name))
+        file_id = f"file_{self._counter}"
+        return StoredFile(
+            file_id=file_id,
+            name=name,
+            web_view_link=f"{self._base_url}/{file_id}",
+        )

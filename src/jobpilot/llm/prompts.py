@@ -217,3 +217,72 @@ def build_confirm_language_prompt(*, text: str, schema_json: str) -> str:
         text=text,
         schema=schema_json,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4 — document content selection
+# --------------------------------------------------------------------------- #
+
+SELECT_CONTENT_PROMPT = """\
+You are tailoring a candidate's CV for a single job offer by SELECTING which of the
+candidate's existing content to include and in what order. You never write new
+content: you only pick ids that already exist in the profile.
+
+{anti_invention}
+
+Instructions:
+- "summary_variant": choose exactly one key from the profile's summary_variants
+  (listed under "Summary variant keys"). Never invent a key.
+- "ordered_achievement_ids": pick the most relevant achievement ids for THIS offer,
+  most relevant first. Use ONLY ids from "Profile achievement ids". Never invent an
+  id and never include one that is not listed.
+- "project_ids": pick the relevant project ids, or leave empty. Use ONLY ids from
+  "Profile project ids".
+- "highlighted_skill_ids": pick the skills to highlight using ONLY skill names that
+  appear in "Profile skills"; leave empty if unsure.
+- "language": set it to "{language}" (the language the documents will be written
+  in). Do not choose a different language.
+- Prefer content whose claims the offer actually values; do NOT include content
+  just to fill space.
+
+Candidate profile:
+---
+{profile}
+---
+Summary variant keys (choose one): {summary_variants}
+Profile achievement ids (use ONLY these): {achievement_ids}
+Profile project ids (use ONLY these): {project_ids}
+Profile skills (use ONLY these): {skills}
+---
+Analysed offer:
+---
+{analysis}
+---
+
+Return JSON for this schema:
+{schema}
+"""
+
+
+def build_select_content_prompt(
+    *,
+    profile_json: str,
+    summary_variants: list[str],
+    achievement_ids: list[str],
+    project_ids: list[str],
+    skills: list[str],
+    analysis_json: str,
+    language: str,
+    schema_json: str,
+) -> str:
+    return SELECT_CONTENT_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        profile=profile_json,
+        summary_variants=", ".join(sorted(summary_variants)) or "(none)",
+        achievement_ids=", ".join(sorted(achievement_ids)) or "(none)",
+        project_ids=", ".join(sorted(project_ids)) or "(none)",
+        skills=", ".join(sorted(skills)) or "(none)",
+        analysis=analysis_json,
+        language=language,
+        schema=schema_json,
+    )
