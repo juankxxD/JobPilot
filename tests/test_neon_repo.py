@@ -7,6 +7,7 @@ from typing import Any
 import psycopg
 import pytest
 
+from jobpilot.config import Language
 from jobpilot.models import JobStatus, RawJob
 from jobpilot.storage.neon import NeonJobRepository, connect_with_retry
 
@@ -55,12 +56,10 @@ class FakeConnection:
 
     def execute(self, query: str, params: Any, cur: FakeCursor) -> None:
         q = " ".join(query.lower().split())
-        if q.startswith("select id from jobs where"):
-            self._lookup_job(params, cur)
-        elif q.startswith("insert into jobs"):
-            self._insert_job(params, cur)
-        elif q.startswith("update jobs set url"):
-            self._update_job(params, cur)
+        if q.startswith("insert into jobs"):
+            self._upsert_job(params, cur)
+        elif q.startswith("update jobs set apply_url"):
+            self._update_by_url(params, cur)
         elif q.startswith("select * from jobs where id"):
             cur._result = self.jobs.get(int(params[0]))
         elif q.startswith("update jobs set status"):
@@ -75,18 +74,13 @@ class FakeConnection:
         else:  # pragma: no cover - other helpers not exercised in this test
             cur._result = None
 
-    def _lookup_job(self, params: Any, cur: FakeCursor) -> None:
-        source, external_id, url = params
-        # Emulate Postgres resolving the two unique constraints: match either the
-        # (source, external_id) key or the url, preferring the lowest id.
-        candidates = [
-            job_id
-            for job_id in (self.by_key.get((source, external_id)), self.by_url.get(url))
-            if job_id is not None
-        ]
-        cur._result = {"id": min(candidates)} if candidates else None
+    def _upsert_job(self, params: Any, cur: FakeCursor) -> None:
+        """Emulate ``INSERT ... ON CONFLICT (source, external_id) DO UPDATE``.
 
-    def _insert_job(self, params: Any, cur: FakeCursor) -> None:
+        A new ``(source, external_id)`` colliding with an existing ``url`` raises a
+        unique violation, just as Postgres' ``jobs_url_key`` would, so the repository
+        can exercise its url-conflict fallback.
+        """
         (
             source,
             external_id,
@@ -99,27 +93,49 @@ class FakeConnection:
             modality,
             salary_text,
             contact_email,
+            language,
             description,
             _found_at,
         ) = params
-        # A faithful Postgres would raise on a constraint violation here; the
-        # repository's prior lookup guarantees no existing key/url reaches this path.
-        if (source, external_id) in self.by_key or url in self.by_url:
+        key = (source, external_id)
+        if key in self.by_key:
+            # ON CONFLICT (source, external_id) DO UPDATE path.
+            job_id = self.by_key[key]
+            row = self.jobs[job_id]
+            self._apply_descriptive(
+                row,
+                url=url,
+                apply_url=apply_url,
+                title=title,
+                company=company,
+                location=location,
+                remote=remote,
+                modality=modality,
+                salary_text=salary_text,
+                contact_email=contact_email,
+                description=description,
+            )
+            # language = COALESCE(jobs.language, EXCLUDED.language)
+            if row.get("language") is None:
+                row["language"] = language
+            self.by_url[url] = job_id
+            cur._result = dict(row)
+            return
+        if url in self.by_url:
+            # New key but the url already exists -> jobs_url_key violation.
             raise psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
         job_id = self.next_id
         self.next_id += 1
-        row: dict[str, Any] = {
+        row = {
             "id": job_id,
             "status": "new",
             "found_at": None,
-            "language": None,
             "analysis": None,
             "score": None,
             "score_reason": None,
             "missing_requirements": None,
             "source": source,
             "external_id": external_id,
-            "modality": modality,
         }
         self.jobs[job_id] = row
         self._apply_descriptive(
@@ -133,15 +149,16 @@ class FakeConnection:
             modality=modality,
             salary_text=salary_text,
             contact_email=contact_email,
+            language=language,
             description=description,
         )
-        self.by_key[(source, external_id)] = job_id
+        self.by_key[key] = job_id
         self.by_url[url] = job_id
         cur._result = dict(row)
 
-    def _update_job(self, params: Any, cur: FakeCursor) -> None:
+    def _update_by_url(self, params: Any, cur: FakeCursor) -> None:
+        """Emulate the url-conflict fallback ``UPDATE ... WHERE url = %s``."""
         (
-            url,
             apply_url,
             title,
             company,
@@ -150,13 +167,14 @@ class FakeConnection:
             modality,
             salary_text,
             contact_email,
+            language,
             description,
-            job_id,
+            url,
         ) = params
-        row = self.jobs[int(job_id)]
+        job_id = self.by_url[url]
+        row = self.jobs[job_id]
         self._apply_descriptive(
             row,
-            url=url,
             apply_url=apply_url,
             title=title,
             company=company,
@@ -167,7 +185,9 @@ class FakeConnection:
             contact_email=contact_email,
             description=description,
         )
-        self.by_url[url] = int(job_id)
+        # language = COALESCE(language, %s)
+        if row.get("language") is None:
+            row["language"] = language
         cur._result = dict(row)
 
     @staticmethod
@@ -211,16 +231,17 @@ def test_url_conflict_maps_to_same_row() -> None:
 
 
 def test_different_key_same_url_updates_without_unique_violation() -> None:
-    """Postgres-faithful: a different (source, external_id) with the same URL must
-    resolve to the existing row via the url constraint, never raise jobs_url_key."""
+    """A different (source, external_id) with the same URL must resolve to the
+    existing row via the atomic url-conflict fallback, never aborting collection."""
     conn = FakeConnection()
     repo = NeonJobRepository(conn)
 
     first = repo.upsert_job(
         RawJob(source="srcA", external_id="a1", url="https://dup/1", title="T", company="C")
     )
-    # A second posting from another source/id but the same canonical URL. If the
-    # repository blindly INSERTed it, the FakeConnection would raise UniqueViolation.
+    # A second posting from another source/id but the same canonical URL. The first
+    # INSERT ... ON CONFLICT (source, external_id) raises jobs_url_key; the repository
+    # must catch it, roll back, and update the existing row by url.
     second = repo.upsert_job(
         RawJob(
             source="srcB",
@@ -237,10 +258,84 @@ def test_different_key_same_url_updates_without_unique_violation() -> None:
     assert conn.jobs[first.id]["title"] == "T updated"
 
 
-def test_upsert_rolls_back_and_stays_usable_after_failure() -> None:
+def test_interleaved_upserts_on_same_url_do_not_duplicate_or_abort() -> None:
+    """Simulate two collectors interleaving on the same canonical URL.
+
+    Collector A inserts the row; collector B, built from a snapshot taken *before* A
+    committed (it still sees no existing row), then attempts its own insert under a
+    different (source, external_id). Postgres raises jobs_url_key on B's insert; the
+    repository's atomic fallback must update the winning row so both calls complete,
+    exactly one logical row survives, and collection is never aborted.
+    """
+    conn = FakeConnection()
+    repo_a = NeonJobRepository(conn)
+    repo_b = NeonJobRepository(conn)
+
+    a = repo_a.upsert_job(
+        RawJob(source="boardA", external_id="a1", url="https://shared/42", title="Dev", company="C")
+    )
+    # Collector B races in on the same URL with a different identity.
+    b = repo_b.upsert_job(
+        RawJob(
+            source="boardB",
+            external_id="b9",
+            url="https://shared/42",
+            title="Dev (relisted)",
+            company="C",
+        )
+    )
+
+    assert a.id is not None
+    assert a.id == b.id  # both resolved to the single logical row
+    assert len(conn.jobs) == 1
+    assert conn.jobs[a.id]["title"] == "Dev (relisted)"
+
+
+def test_upsert_persists_declared_language() -> None:
+    """The source-declared language must be stored so later stages do not lose it."""
     conn = FakeConnection()
     repo = NeonJobRepository(conn)
 
+    job = repo.upsert_job(
+        RawJob(
+            source="src",
+            external_id="lang1",
+            url="https://x/lang",
+            title="T",
+            company="C",
+            language=Language.en,
+        )
+    )
+    assert job.id is not None
+    assert job.language == Language.en
+    assert conn.jobs[job.id]["language"] == "en"
+
+
+def test_upsert_does_not_overwrite_existing_language() -> None:
+    """A re-collected posting must not clobber a language already established."""
+    conn = FakeConnection()
+    repo = NeonJobRepository(conn)
+
+    first = repo.upsert_job(
+        RawJob(
+            source="src",
+            external_id="lang2",
+            url="https://x/lang2",
+            title="T",
+            company="C",
+            language=Language.es,
+        )
+    )
+    assert first.id is not None
+    # A later run that no longer declares a language must keep the stored one.
+    second = repo.upsert_job(
+        RawJob(source="src", external_id="lang2", url="https://x/lang2", title="T", company="C")
+    )
+    assert second.language == Language.es
+    assert conn.jobs[first.id]["language"] == "es"
+
+
+def test_upsert_rolls_back_and_stays_usable_after_failure() -> None:
     class BoomConnection(FakeConnection):
         def __init__(self) -> None:
             super().__init__()
@@ -250,7 +345,7 @@ def test_upsert_rolls_back_and_stays_usable_after_failure() -> None:
             self.rolled_back += 1
 
         def execute(self, query: str, params: Any, cur: FakeCursor) -> None:
-            if " ".join(query.lower().split()).startswith("select id from jobs"):
+            if " ".join(query.lower().split()).startswith("insert into jobs"):
                 raise psycopg.OperationalError("connection hiccup")
             super().execute(query, params, cur)
 

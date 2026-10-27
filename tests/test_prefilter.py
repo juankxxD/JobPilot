@@ -81,6 +81,15 @@ def test_salary_k_suffix_is_annualized_to_monthly() -> None:
     assert prefilter(_raw(salary_text="$36k USD per year"), config) is False
 
 
+def test_salary_ignores_percentages_and_unrelated_numbers() -> None:
+    config = _config(min_salary_usd=5000)
+    # The "15% bonus" and other non-salary figures must not be read as the salary:
+    # the 80k-110k annual range (~6666/month) clears the 5000 monthly threshold.
+    assert prefilter(_raw(salary_text="$80k - $110k USD + 15% bonus"), config) is True
+    # Percentages alone do not constitute a declared salary.
+    assert prefilter(_raw(salary_text="Great team, 20% equity"), config) is True
+
+
 def test_modality_hybrid_only_rejects_onsite_and_remote() -> None:
     config = _config(modalities=["hybrid"])
     loc = "Bogotá, Colombia"

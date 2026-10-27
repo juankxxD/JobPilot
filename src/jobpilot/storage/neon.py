@@ -162,21 +162,73 @@ class NeonJobRepository:
     # JobRepository Protocol
     # ------------------------------------------------------------------ #
     def upsert_job(self, job: RawJob) -> Job:
-        """Idempotent upsert resolving conflicts on *either* unique identity.
+        """Idempotent, atomic upsert resolving conflicts on *either* unique identity.
 
         The ``jobs`` table has two unique constraints: ``(source, external_id)`` and
-        ``url``. A single ``ON CONFLICT`` clause can only target one of them, so a
-        second posting with a different ``(source, external_id)`` but the same URL
-        (e.g. the same job relisted or cross-posted) would otherwise hit
-        ``jobs_url_key`` and abort collection. To avoid that we first look the job up
-        by either identity in a single statement and, when it already exists, update
-        that row in place; only a genuinely new posting is inserted.
+        ``url``. A ``SELECT`` followed by a plain ``INSERT`` is not safe: two
+        collectors running concurrently can both observe no existing row and then
+        race to insert, so one raises a unique violation and aborts collection.
 
-        On update the mutable descriptive columns are refreshed but the job's id,
-        status, language and any analysis/score are preserved so a later run never
-        regresses progress already made.
+        Instead we rely on Postgres' own conflict handling. The primary path is a
+        single atomic ``INSERT ... ON CONFLICT (source, external_id) DO UPDATE ...
+        RETURNING``, which both inserts a brand-new posting and refreshes an existing
+        one in one statement with no lost-update window. A single ``ON CONFLICT``
+        clause can only name one constraint, so if a *different* ``(source,
+        external_id)`` carries an already-seen ``url`` (a relisted or cross-posted
+        job) the statement raises ``jobs_url_key``. We handle that by rolling back
+        the aborted statement and running an equally atomic ``UPDATE ... WHERE url =
+        %s RETURNING``, which updates the existing row in place. Either way exactly
+        one logical row survives and collection is never aborted.
+
+        On update the mutable descriptive columns are refreshed, but the job's id and
+        status are preserved, and ``language`` is only *filled* when still NULL
+        (``COALESCE``) so a language established later by analysis is never
+        overwritten, while any analysis/score already made is left untouched.
         """
-        descriptive = (
+        import psycopg
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO jobs "
+                    "(source, external_id, url, apply_url, title, company, location, "
+                    " remote, modality, salary_text, contact_email, language, "
+                    " description, found_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    " COALESCE(%s, now())) "
+                    "ON CONFLICT (source, external_id) DO UPDATE SET "
+                    " url = EXCLUDED.url, apply_url = EXCLUDED.apply_url, "
+                    " title = EXCLUDED.title, company = EXCLUDED.company, "
+                    " location = EXCLUDED.location, remote = EXCLUDED.remote, "
+                    " modality = EXCLUDED.modality, salary_text = EXCLUDED.salary_text, "
+                    " contact_email = EXCLUDED.contact_email, "
+                    " language = COALESCE(jobs.language, EXCLUDED.language), "
+                    " description = EXCLUDED.description "
+                    "RETURNING *",
+                    self._insert_params(job),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except psycopg.errors.UniqueViolation:
+            # The new (source, external_id) collided on the url constraint instead.
+            # Roll back the aborted statement and update the existing row by url.
+            self._conn.rollback()
+            row = self._update_by_url(job)
+            self._conn.commit()
+        except Exception:
+            # Leave the connection in a usable state for the next statement so a
+            # single failed upsert does not abort the rest of collection.
+            self._conn.rollback()
+            raise
+        if row is None:  # pragma: no cover - RETURNING always yields a row
+            raise RuntimeError("upsert_job did not return a row")
+        return _row_to_job(row)
+
+    @staticmethod
+    def _insert_params(job: RawJob) -> tuple[Any, ...]:
+        return (
+            job.source,
+            job.external_id,
             job.url,
             job.apply_url,
             job.title,
@@ -186,59 +238,40 @@ class NeonJobRepository:
             job.modality.value if job.modality is not None else None,
             job.salary_text,
             job.contact_email,
+            job.language.value if job.language is not None else None,
             job.description,
+            job.found_at,
         )
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM jobs WHERE (source = %s AND external_id = %s) OR url = %s "
-                    "ORDER BY id LIMIT 1",
-                    (job.source, job.external_id, job.url),
-                )
-                existing = cur.fetchone()
-                if existing is not None:
-                    cur.execute(
-                        "UPDATE jobs SET "
-                        " url = %s, apply_url = %s, title = %s, company = %s, "
-                        " location = %s, remote = %s, modality = %s, salary_text = %s, "
-                        " contact_email = %s, description = %s "
-                        "WHERE id = %s RETURNING *",
-                        (*descriptive, existing["id"]),
-                    )
-                else:
-                    cur.execute(
-                        "INSERT INTO jobs "
-                        "(source, external_id, url, apply_url, title, company, location, "
-                        " remote, modality, salary_text, contact_email, description, found_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                        " COALESCE(%s, now())) "
-                        "RETURNING *",
-                        (
-                            job.source,
-                            job.external_id,
-                            job.url,
-                            job.apply_url,
-                            job.title,
-                            job.company,
-                            job.location,
-                            job.remote,
-                            job.modality.value if job.modality is not None else None,
-                            job.salary_text,
-                            job.contact_email,
-                            job.description,
-                            job.found_at,
-                        ),
-                    )
-                row = cur.fetchone()
-        except Exception:
-            # Leave the connection in a usable state for the next statement so a
-            # single failed upsert does not abort the rest of collection.
-            self._conn.rollback()
-            raise
-        self._conn.commit()
-        if row is None:  # pragma: no cover - RETURNING always yields a row
-            raise RuntimeError("upsert_job did not return a row")
-        return _row_to_job(row)
+
+    def _update_by_url(self, job: RawJob) -> dict[str, Any] | None:
+        """Atomically update the row that already owns ``job.url`` (url-conflict path).
+
+        The ``(source, external_id)`` of the existing row is kept (the colliding new
+        identity is discarded); ``language`` is only filled when still NULL so later
+        analysis is never regressed.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET "
+                " apply_url = %s, title = %s, company = %s, location = %s, "
+                " remote = %s, modality = %s, salary_text = %s, contact_email = %s, "
+                " language = COALESCE(language, %s), description = %s "
+                "WHERE url = %s RETURNING *",
+                (
+                    job.apply_url,
+                    job.title,
+                    job.company,
+                    job.location,
+                    job.remote,
+                    job.modality.value if job.modality is not None else None,
+                    job.salary_text,
+                    job.contact_email,
+                    job.language.value if job.language is not None else None,
+                    job.description,
+                    job.url,
+                ),
+            )
+            return cur.fetchone()
 
     def get_job(self, job_id: int) -> Job | None:
         with self._conn.cursor() as cur:

@@ -68,8 +68,23 @@ def _modality_ok(raw: RawJob, config: PrefilterConfig) -> bool:
     return raw.modality.value in allowed
 
 
-# A number optionally followed by a magnitude suffix (k = thousands).
-_SALARY_NUMBER_RE = re.compile(r"(\d[\d,.]*)\s*(k)?", re.IGNORECASE)
+# A currency salary amount: a number optionally carrying a magnitude suffix
+# (k = thousands) that is *attached to a currency marker*. We only accept amounts
+# that are preceded by ``$``/``USD`` or immediately followed by a ``k`` suffix or a
+# currency marker, so unrelated figures such as "15% bonus", "40 hours" or
+# "3 years" are never mistaken for pay. A number directly followed by ``%`` is
+# explicitly rejected (negative lookahead) so percentages can never leak in.
+_SALARY_NUMBER_RE = re.compile(
+    r"""
+    (?:\$|usd\s*)            # a leading currency marker ($ or USD), or ...
+    (?P<pre>\d[\d,.]*)\s*(?P<pre_k>k)?(?!\s*%)
+    |                        # ... a number carrying a k suffix / trailing currency
+    (?P<post>\d[\d,.]*)\s*(?P<post_k>k)(?!\s*%)
+    |
+    (?P<bare>\d[\d,.]*)\s*(?:k)?\s*(?:usd|\$)(?!\s*%)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 # Pay cadence keywords, mapped to the factor that converts the amount to monthly.
 _CADENCE_FACTORS: list[tuple[tuple[str, ...], float]] = [
     (("per year", "/year", "/yr", "per annum", "annual", "yearly", "año", "anual"), 1.0 / 12.0),
@@ -100,13 +115,17 @@ def _declared_salary_usd(raw: RawJob) -> float | None:
 
     amounts: list[float] = []
     for match in _SALARY_NUMBER_RE.finditer(raw.salary_text):
-        digits = match.group(1).replace(",", "")
-        suffix = match.group(2)
+        digits = match.group("pre") or match.group("post") or match.group("bare")
+        if digits is None:
+            continue
+        has_k = bool(match.group("pre_k") or match.group("post_k")) or (
+            match.group("bare") is not None and "k" in match.group(0).lower()
+        )
         try:
-            value = float(digits)
+            value = float(digits.replace(",", ""))
         except ValueError:
             continue
-        if suffix:  # "80k" -> 80000
+        if has_k:  # "80k" -> 80000
             value *= 1000.0
         amounts.append(value)
     if not amounts:

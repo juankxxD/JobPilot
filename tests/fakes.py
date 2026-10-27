@@ -64,8 +64,13 @@ class FakeJobRepository:
                     "company": job.company,
                     "location": job.location,
                     "remote": job.remote,
+                    "modality": job.modality,
                     "salary_text": job.salary_text,
                     "contact_email": job.contact_email,
+                    # Only fill language while still unknown so a language established
+                    # later by analysis is never overwritten (mirrors the COALESCE in
+                    # NeonJobRepository.upsert_job).
+                    "language": current.language if current.language is not None else job.language,
                     "description": job.description,
                 }
             )
@@ -86,8 +91,10 @@ class FakeJobRepository:
             company=job.company,
             location=job.location,
             remote=job.remote,
+            modality=job.modality,
             salary_text=job.salary_text,
             contact_email=job.contact_email,
+            language=job.language,
             description=job.description,
             found_at=job.found_at,
             status=JobStatus.new,

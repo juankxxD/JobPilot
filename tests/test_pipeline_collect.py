@@ -114,8 +114,11 @@ def test_declared_disallowed_language_is_filtered_out() -> None:
 
     summary = collect_and_persist([source], repo, config)
 
-    statuses = {job.external_id: job.status for job in repo.jobs}
-    assert statuses["es"] == JobStatus.new
+    jobs_by_id = {job.external_id: job for job in repo.jobs}
+    assert jobs_by_id["es"].status == JobStatus.new
     # A job whose source-declared language is disallowed is filtered before any LLM.
-    assert statuses["en"] == JobStatus.filtered_out
+    assert jobs_by_id["en"].status == JobStatus.filtered_out
     assert summary.filtered_out == 1
+    # The declared language must be persisted, not dropped, for later stages.
+    assert jobs_by_id["es"].language == Language.es
+    assert jobs_by_id["en"].language == Language.en
