@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from jobpilot.channels.telegram import (
     IntentKind,
+    TelegramDeliveryError,
     TelegramIntent,
     language_buttons,
     parse_intent,
@@ -31,11 +32,13 @@ from jobpilot.config import AppConfig, Language, Settings, get_settings
 from jobpilot.documents.render import (
     MAX_COVER_WORDS,
     CoverLetterTooLongError,
+    CvTooLongError,
+    DocumentContentError,
     count_words,
     render_cover_letter,
     render_cv,
 )
-from jobpilot.documents.selector import select_content
+from jobpilot.documents.selector import SelectionError, select_content
 from jobpilot.filters.prefilter import prefilter
 from jobpilot.language import detect_language
 from jobpilot.logging import get_logger
@@ -43,10 +46,10 @@ from jobpilot.models import Job, JobStatus
 from jobpilot.scoring.scorer import analyze_and_score, passes_threshold
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from jobpilot.interfaces import FileStorage, JobRepository, JobSource, LlmClient, Notifier
-    from jobpilot.models import Attachment, ContentSelection, StoredFile
+    from jobpilot.models import Application, Attachment, ContentSelection, RawJob, StoredFile
     from jobpilot.profile.model import ProfileModel
 
 log = get_logger(__name__)
@@ -56,6 +59,19 @@ log = get_logger(__name__)
 LAST_UPDATE_ID_KEY = "telegram_last_update_id"
 # ``telegram_state`` key holding the job id awaiting a free-text Ajustar instruction.
 PENDING_ADJUST_KEY = "telegram_pending_adjust_job_id"
+
+# Spanish labels for every job status, shown in Telegram responses (R16.2). The
+# internal ``JobStatus`` values stay English; only these labels reach the owner.
+_STATUS_LABELS: dict[JobStatus, str] = {
+    JobStatus.new: "nuevas",
+    JobStatus.filtered_out: "descartadas por filtro",
+    JobStatus.scored: "evaluadas",
+    JobStatus.proposed: "propuestas",
+    JobStatus.approved: "aprobadas",
+    JobStatus.applied: "aplicadas",
+    JobStatus.discarded: "descartadas",
+    JobStatus.error: "con error",
+}
 
 
 @dataclass(slots=True)
@@ -148,10 +164,12 @@ def score_new_jobs(
     Telegram Español/Inglés/Descartar choice flow rather than silently committing to
     a possibly wrong source-declared language.
 
-    A job that scores at or above ``MIN_SCORE`` becomes ``scored``; one below the
-    threshold is still persisted as ``scored`` but flagged (its score is below
-    ``MIN_SCORE``). An unrecoverable LLM/validation failure marks the job ``error``.
-    Jobs not in ``new`` are skipped so reruns are idempotent.
+    A job that scores at or above ``MIN_SCORE`` becomes ``scored`` and is eligible
+    for a proposal; one below the threshold is persisted with its analysis/score but
+    moved to ``filtered_out`` (a non-continuing state), so a low-scoring job never
+    reaches document generation or a Telegram proposal (R8.6/R10.7). An unrecoverable
+    LLM/validation failure marks the job ``error``. Jobs not in ``new`` are skipped
+    so reruns are idempotent.
     """
     active_settings = settings or get_settings()
     summary = ScoreSummary()
@@ -173,6 +191,10 @@ def score_new_jobs(
         # wrong source-declared language.
         detected = detect_language(_offer_text(job), config.language, llm)
         above = passes_threshold(score.score, active_settings.min_score)
+        # Below-threshold jobs keep their analysis/score for the record but are moved
+        # to filtered_out so they never continue to a proposal (R8.6/R10.7); only
+        # jobs at or above MIN_SCORE become 'scored' and proposable.
+        status = JobStatus.scored if above else JobStatus.filtered_out
         updated = job.model_copy(
             update={
                 "analysis": analysis,
@@ -180,12 +202,13 @@ def score_new_jobs(
                 "score": score.score,
                 "score_reason": "; ".join(score.reasons) or None,
                 "missing_requirements": score.missing_requirements,
-                "status": JobStatus.scored,
+                "status": status,
             }
         )
         repo.save_job(updated)
-        summary.scored += 1
-        if not above:
+        if above:
+            summary.scored += 1
+        else:
             summary.below_threshold += 1
             log.info("job_below_threshold", job_id=job.id, score=score.score)
 
@@ -225,15 +248,19 @@ def generate_documents(
     *,
     language: Language,
     cover_letter_body: str,
+    instruction: str | None = None,
 ) -> GeneratedDocuments:
     """Select content, render the CV + cover letter, and upload both.
 
     The LLM only selects which existing profile ids to use (validated in code); the
-    cover-letter body is enforced to be <= 200 words before rendering. The rendered
-    PDFs are uploaded through the swappable :class:`FileStorage`, and the returned
-    ``web_view_link`` values are what a later phase persists on the application.
-    Raises on invalid selection or an over-length cover letter so the caller can
-    mark the job ``error`` rather than sending an invented document.
+    cover-letter body is enforced to be <= 200 words before rendering. An optional
+    ``instruction`` (the owner's free-text Ajustar note) is passed to the selector
+    as re-selection guidance, so the regenerated CV reflects the request without the
+    instruction text ever appearing in a document. The rendered PDFs are uploaded
+    through the swappable :class:`FileStorage`, and the returned ``web_view_link``
+    values are what a later phase persists on the application. Raises on invalid
+    selection or an over-length cover letter so the caller can mark the job
+    ``error`` rather than sending an invented document.
     """
     import tempfile  # noqa: PLC0415 - only needed when documents are generated
 
@@ -248,7 +275,7 @@ def generate_documents(
             f"the limit is {MAX_COVER_WORDS}"
         )
 
-    selection = select_content(job.analysis, profile, llm, language)
+    selection = select_content(job.analysis, profile, llm, language, instruction=instruction)
     cv = render_cv(profile, selection, company=job.company, role=job.title)
     cover = render_cover_letter(
         profile,
@@ -312,14 +339,13 @@ def _cover_letter_body(
     *,
     language: Language,
     company: str,
-    instruction: str | None = None,
 ) -> str:
     """Compose a deterministic cover-letter body from the profile summary.
 
     The body is built in code from an existing profile summary variant (never
-    invented) and kept within the 200-word limit. An optional Ajustar instruction
-    is appended verbatim so a regeneration reflects the owner's note; the result is
-    still truncated to the word limit so rendering never rejects it.
+    invented) and kept within the 200-word limit. The owner's Ajustar instruction
+    is NOT written into the letter: it is handled by the content selector as
+    re-selection guidance, so the instruction text never reaches a document.
     """
     variant = next(iter(profile.summary_variants.values()))
     summary = variant.text(language)
@@ -329,10 +355,7 @@ def _cover_letter_body(
     else:
         greeting = f"Dear {company} team,"
         closing = f"I look forward to hearing from you.\n\n{profile.basics.name}"
-    parts = [greeting, summary]
-    if instruction:
-        parts.append(instruction.strip())
-    parts.append(closing)
+    parts = [greeting, summary, closing]
     body = "\n\n".join(p for p in parts if p)
     words = body.split()
     if len(words) > MAX_COVER_WORDS:
@@ -351,29 +374,40 @@ def tailor_and_send_proposal(
     language: Language,
     instruction: str | None = None,
 ) -> GeneratedDocuments:
-    """Generate the tailored documents for ``job`` and send the Telegram proposal.
+    """Generate the tailored documents for ``job``, deliver them, then mark proposed.
 
     Used both when proposing a job whose language is already known and when the
     owner later picks a language or asks to adjust (``instruction`` carries the
-    free-text Ajustar note). The job's language is persisted and its status is left
-    ``proposed`` awaiting an explicit button; nothing is sent without that button.
+    free-text Ajustar note, which guides re-selection but never appears in a
+    document). Delivery happens BEFORE the status transition: the documents and the
+    proposal message are sent first, and only once Telegram confirms delivery is the
+    job persisted as ``proposed``. A delivery rejection raises
+    :class:`~jobpilot.channels.telegram.TelegramDeliveryError` and leaves the job in
+    its prior state so a later run retries it instead of silently skipping it.
+    Nothing moves to ``approved``/``applied`` without a later explicit button.
     """
     job_id = job.id
     if job_id is None:
         raise ValueError("tailor_and_send_proposal requires a persisted job with an id")
-    body = _cover_letter_body(
-        profile, language=language, company=job.company, instruction=instruction
-    )
+    body = _cover_letter_body(profile, language=language, company=job.company)
     documents = generate_documents(
-        job, profile, llm, storage, language=language, cover_letter_body=body
+        job,
+        profile,
+        llm,
+        storage,
+        language=language,
+        cover_letter_body=body,
+        instruction=instruction,
     )
-    updated = job.model_copy(update={"language": language, "status": JobStatus.proposed})
-    repo.save_job(updated)
+    # Persist the resolved language on the job we render the proposal text from, but
+    # only commit the 'proposed' status AFTER delivery is confirmed below.
+    proposed = job.model_copy(update={"language": language, "status": JobStatus.proposed})
     notifier.send_message(
-        render_proposal_text(updated),
+        render_proposal_text(proposed),
         buttons=proposal_buttons(job_id),
         attachments=[documents.cv, documents.cover_letter],
     )
+    repo.save_job(proposed)
     log.info("proposal_sent", job_id=job_id, language=language.value)
     return documents
 
@@ -434,14 +468,36 @@ def propose_scored_jobs(
             continue
 
         if job.language is None:
-            repo.set_status(job.id, JobStatus.proposed)
-            _ask_language(notifier, job)
-            summary.language_prompts += 1
-            summary.proposed += 1
+            # Send the Español/Inglés/Descartar prompt FIRST; only mark the job
+            # proposed (awaiting the choice) once the prompt was delivered, so a
+            # rejected prompt leaves the job 'scored' to retry rather than stranding
+            # it as proposed with no message sent.
+            try:
+                _ask_language_and_mark(repo, notifier, job)
+            except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:  # pragma: no cover - no docs here
+                log.error("proposal_generation_failed", job_id=job.id, error=str(exc))
+                repo.set_status(job.id, JobStatus.error)
+            except TelegramDeliveryError as exc:
+                log.warning("proposal_delivery_failed", job_id=job.id, error=str(exc))
+            else:
+                summary.language_prompts += 1
+                summary.proposed += 1
             continue
 
-        tailor_and_send_proposal(job, repo, notifier, profile, llm, storage, language=job.language)
-        summary.proposed += 1
+        # Generate + deliver + persist. A selection/validation failure is
+        # unrecoverable and marks the job 'error'; a delivery failure is retryable
+        # and leaves the job 'scored'. Either way the batch continues with the rest.
+        try:
+            tailor_and_send_proposal(
+                job, repo, notifier, profile, llm, storage, language=job.language
+            )
+        except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:
+            log.error("proposal_generation_failed", job_id=job.id, error=str(exc))
+            repo.set_status(job.id, JobStatus.error)
+        except TelegramDeliveryError as exc:
+            log.warning("proposal_delivery_failed", job_id=job.id, error=str(exc))
+        else:
+            summary.proposed += 1
 
     log.info(
         "propose_done",
@@ -453,10 +509,54 @@ def propose_scored_jobs(
     return summary
 
 
-def _ask_language(notifier: Notifier, job: Job) -> None:
+# Failures that mean the selection can never produce a valid document; the job is
+# marked ``error`` and never retried. A delivery failure is handled separately as a
+# retryable condition (the job keeps its prior state).
+_UNRECOVERABLE_DOCUMENT_ERRORS = (
+    SelectionError,
+    CoverLetterTooLongError,
+    CvTooLongError,
+    DocumentContentError,
+)
+
+
+def _ask_language_and_mark(repo: ProposalRepository, notifier: Notifier, job: Job) -> None:
+    """Send the ambiguous-language prompt, then mark the job proposed (unresolved).
+
+    The prompt is sent first so a delivery rejection propagates before the status
+    changes, leaving the job ``scored`` to retry instead of proposed with nothing
+    sent. The persisted job keeps ``language = None`` to mark the unresolved state.
+    """
     if job.id is None:  # pragma: no cover - callers guarantee an id
-        raise ValueError("_ask_language requires a persisted job with an id")
+        raise ValueError("_ask_language_and_mark requires a persisted job with an id")
     notifier.send_message(render_language_prompt(job), buttons=language_buttons(job.id))
+    repo.save_job(job.model_copy(update={"status": JobStatus.proposed, "language": None}))
+
+
+def _try_proposal(
+    job_id: int,
+    action: Callable[[], object],
+    *,
+    on_unrecoverable: Callable[[], object] | None = None,
+) -> bool:
+    """Run a proposal ``action`` for one job, isolating its failure from the batch.
+
+    Returns ``True`` when the action completed. An unrecoverable selection/validation
+    failure runs ``on_unrecoverable`` (used to mark the job ``error``); a retryable
+    Telegram delivery failure is logged and left for a later run. Either way the
+    exception never aborts processing of the remaining jobs.
+    """
+    try:
+        action()
+    except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:
+        log.error("proposal_generation_failed", job_id=job_id, error=str(exc))
+        if on_unrecoverable is not None:
+            on_unrecoverable()
+        return False
+    except TelegramDeliveryError as exc:
+        log.warning("proposal_delivery_failed", job_id=job_id, error=str(exc))
+        return False
+    return True
 
 
 @dataclass(slots=True)
@@ -484,17 +584,23 @@ def process_telegram_updates(
 
     The ``last_update_id`` persisted in ``telegram_state`` is used both as the
     ``getUpdates`` offset and as an in-code guard, so an update is never acted on
-    twice even if Telegram returns it again. Each handled update advances
-    ``last_update_id`` before the next, so a crash mid-batch never reprocesses what
-    already ran. Only the configured owner's updates reach here (the notifier drops
-    the rest).
+    twice even if Telegram returns it again. The handlers themselves are idempotent:
+    every status-changing action requires the job to be in an eligible state, so a
+    replayed update (for example after a crash between the effect and the checkpoint)
+    finds the job already in its new state and makes no further change.
+
+    Each handled owner update advances ``last_update_id`` before the next. After the
+    batch, the cursor is advanced to the highest *raw* update id Telegram returned —
+    including ignored non-owner updates — so a batch made only of unauthorized
+    messages still moves forward and can never starve a later owner update.
     """
     summary = TelegramRunSummary()
     last_raw = repo.get_state(LAST_UPDATE_ID_KEY)
     last_update_id = int(last_raw) if last_raw is not None else None
     offset = last_update_id + 1 if last_update_id is not None else None
 
-    updates = sorted(notifier.get_updates(offset=offset), key=lambda u: u.update_id)
+    batch = notifier.get_update_batch(offset=offset)
+    updates = sorted(batch.updates, key=lambda u: u.update_id)
     for update in updates:
         if last_update_id is not None and update.update_id <= last_update_id:
             continue
@@ -503,6 +609,11 @@ def process_telegram_updates(
         last_update_id = update.update_id
         repo.set_state(LAST_UPDATE_ID_KEY, str(last_update_id))
         summary.processed += 1
+
+    # Advance past ignored non-owner updates so they are never re-fetched forever.
+    highest = batch.highest_update_id
+    if highest is not None and (last_update_id is None or highest > last_update_id):
+        repo.set_state(LAST_UPDATE_ID_KEY, str(highest))
 
     log.info(
         "telegram_run_done",
@@ -529,17 +640,17 @@ def _handle_intent(  # noqa: C901, PLR0912 - a flat dispatch over the intent kin
 ) -> None:
     kind = intent.kind
     if kind is IntentKind.send:
-        _transition(repo, notifier, intent.job_id, JobStatus.approved, "Postulación aprobada.")
-        summary.approved += 1
+        if _transition(repo, notifier, intent.job_id, JobStatus.approved, "Postulación aprobada."):
+            summary.approved += 1
     elif kind is IntentKind.discard:
-        _transition(repo, notifier, intent.job_id, JobStatus.discarded, "Oferta descartada.")
-        summary.discarded += 1
+        if _transition(repo, notifier, intent.job_id, JobStatus.discarded, "Oferta descartada."):
+            summary.discarded += 1
     elif kind is IntentKind.mark_applied:
-        _transition(repo, notifier, intent.job_id, JobStatus.applied, "Marcada como aplicada.")
-        summary.applied += 1
+        if _transition(repo, notifier, intent.job_id, JobStatus.applied, "Marcada como aplicada."):
+            summary.applied += 1
     elif kind is IntentKind.choose_language:
-        _handle_language_choice(intent, repo, notifier, profile, llm, storage)
-        summary.regenerated += 1
+        if _handle_language_choice(intent, repo, notifier, profile, llm, storage):
+            summary.regenerated += 1
     elif kind is IntentKind.adjust:
         _handle_adjust_request(intent, repo, notifier)
         summary.commands += 1
@@ -564,22 +675,54 @@ _COMMAND_KINDS = frozenset(
 )
 
 
+# The job statuses from which each owner action is allowed. Enforcing these makes
+# the callbacks idempotent and rejects stale/crafted clicks: a second 'Enviar' on an
+# already-approved job, or an approval of a 'new'/'scored'/'discarded' job, changes
+# nothing. 'Ya apliqué' is valid both straight from a proposal and after an approval
+# (the manual send path).
+_ELIGIBLE_SOURCES: dict[JobStatus, frozenset[JobStatus]] = {
+    JobStatus.approved: frozenset({JobStatus.proposed}),
+    JobStatus.discarded: frozenset({JobStatus.proposed}),
+    JobStatus.applied: frozenset({JobStatus.proposed, JobStatus.approved}),
+}
+
+
 def _transition(
     repo: ProposalRepository,
     notifier: Notifier,
     job_id: int | None,
     status: JobStatus,
     message: str,
-) -> None:
+) -> bool:
+    """Apply a status transition only if the job is in an eligible source state.
+
+    Returns ``True`` when the transition was applied. A missing job, or one whose
+    current status is not eligible for ``status`` (a stale or out-of-order
+    callback), is rejected without any data change, so finished jobs are never
+    resurrected and ineligible jobs are never approved.
+    """
     if job_id is None:
         notifier.send_message("No pude identificar la oferta de esa acción.")
-        return
+        return False
     job = repo.get_job(job_id)
     if job is None:
         notifier.send_message(f"No encontré la oferta {job_id}.")
-        return
+        return False
+    if job.status not in _ELIGIBLE_SOURCES.get(status, frozenset()):
+        log.info(
+            "telegram_stale_action_ignored",
+            job_id=job_id,
+            current=job.status.value,
+            requested=status.value,
+        )
+        notifier.send_message(
+            f"Esa acción ya no aplica para la oferta {job_id} "
+            f"(estado actual: {_STATUS_LABELS[job.status]})."
+        )
+        return False
     repo.set_status(job_id, status)
     notifier.send_message(f"{message} ({job.company} — {job.title})")
+    return True
 
 
 def _handle_language_choice(
@@ -589,15 +732,42 @@ def _handle_language_choice(
     profile: ProfileModel,
     llm: LlmClient,
     storage: FileStorage,
-) -> None:
+) -> bool:
+    """Resolve the language for a proposed-but-undecided job and send the proposal.
+
+    Only valid when the job is ``proposed`` with an unresolved language; a choice for
+    any other job (already resolved, discarded, not yet proposed) is a stale callback
+    and is rejected without change — which also makes a replay idempotent, since the
+    first success leaves the job with a language set. Returns ``True`` only when a
+    regeneration actually ran and was delivered.
+    """
     if intent.job_id is None or intent.language is None:
         notifier.send_message("No pude procesar la elección de idioma.")
-        return
+        return False
     job = repo.get_job(intent.job_id)
     if job is None:
         notifier.send_message(f"No encontré la oferta {intent.job_id}.")
-        return
-    tailor_and_send_proposal(job, repo, notifier, profile, llm, storage, language=intent.language)
+        return False
+    if job.status is not JobStatus.proposed or job.language is not None:
+        log.info(
+            "telegram_stale_language_choice_ignored",
+            job_id=intent.job_id,
+            current=job.status.value,
+            language=job.language.value if job.language else None,
+        )
+        notifier.send_message(
+            f"La oferta {intent.job_id} ya no está esperando una elección de idioma."
+        )
+        return False
+    job_id = intent.job_id
+    language = intent.language
+    return _try_proposal(
+        job_id,
+        lambda: tailor_and_send_proposal(
+            job, repo, notifier, profile, llm, storage, language=language
+        ),
+        on_unrecoverable=lambda: repo.set_status(job_id, JobStatus.error),
+    )
 
 
 def _handle_adjust_request(
@@ -614,6 +784,24 @@ def _handle_adjust_request(
     )
 
 
+def _pending_adjust_job_id(repo: ProposalRepository) -> int | None:
+    """Return the job id awaiting an Ajustar instruction, or ``None`` if none.
+
+    The marker is cleared to an empty string after a completed or failed
+    adjustment, so an empty or otherwise non-numeric value is treated as "no pending
+    adjustment" rather than being fed to ``int()`` (which would abort the batch and
+    leave the update uncheckpointed to fail forever).
+    """
+    raw = repo.get_state(PENDING_ADJUST_KEY)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("telegram_invalid_pending_adjust", value=raw)
+        return None
+
+
 def _handle_free_text(
     intent: TelegramIntent,
     repo: ProposalRepository,
@@ -623,28 +811,30 @@ def _handle_free_text(
     storage: FileStorage,
     summary: TelegramRunSummary,
 ) -> None:
-    pending = repo.get_state(PENDING_ADJUST_KEY)
-    if pending is None:
+    pending_id = _pending_adjust_job_id(repo)
+    if pending_id is None:
         summary.ignored += 1
         notifier.send_message("No hay ninguna oferta esperando ajustes. Usa los botones.")
         return
-    job = repo.get_job(int(pending))
-    if job is None or job.language is None:
+    job = repo.get_job(pending_id)
+    if job is None or job.language is None or job.status is not JobStatus.proposed:
         repo.set_state(PENDING_ADJUST_KEY, "")
         notifier.send_message("No pude ajustar: la oferta no está lista o no tiene idioma.")
         return
-    tailor_and_send_proposal(
-        job,
-        repo,
-        notifier,
-        profile,
-        llm,
-        storage,
-        language=job.language,
-        instruction=intent.text,
+    language = job.language
+    ran = _try_proposal(
+        pending_id,
+        lambda: tailor_and_send_proposal(
+            job, repo, notifier, profile, llm, storage, language=language, instruction=intent.text
+        ),
+        on_unrecoverable=lambda: repo.set_status(pending_id, JobStatus.error),
     )
+    # Clear the marker whether the regeneration succeeded or failed unrecoverably, so
+    # the next free-text message is not mistaken for another adjustment. A retryable
+    # delivery failure also clears it (the owner can press Ajustar again).
     repo.set_state(PENDING_ADJUST_KEY, "")
-    summary.regenerated += 1
+    if ran:
+        summary.regenerated += 1
 
 
 def _handle_command(
@@ -677,13 +867,17 @@ def _render_pending(repo: ProposalRepository) -> str:
 
 
 def _render_status(repo: ProposalRepository) -> str:
-    counts: dict[str, int] = {}
+    counts: dict[JobStatus, int] = {}
     for job in _all_jobs(repo):
-        counts[job.status.value] = counts.get(job.status.value, 0) + 1
+        counts[job.status] = counts.get(job.status, 0) + 1
     if not counts:
         return "Aún no hay ofertas registradas."
     lines = ["Estado de las ofertas:"]
-    lines.extend(f"- {status}: {count}" for status, count in sorted(counts.items()))
+    # Report in a stable order using the Spanish labels (R16.2: Telegram copy is
+    # Spanish, so the internal English status values are never shown to the owner).
+    lines.extend(
+        f"- {_STATUS_LABELS[status]}: {counts[status]}" for status in JobStatus if status in counts
+    )
     return "\n".join(lines)
 
 
@@ -718,3 +912,86 @@ def _all_jobs(repo: ProposalRepository) -> list[Job]:
     if isinstance(jobs, list):
         return [job for job in jobs if isinstance(job, Job)]
     return []
+
+
+# --------------------------------------------------------------------------- #
+# One-run orchestration (wired to ``jobpilot run``)
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class RunSummary:
+    """The end-to-end summary of a single pipeline run."""
+
+    collect: CollectSummary
+    score: ScoreSummary
+    propose: ProposeSummary
+    telegram: TelegramRunSummary
+
+
+class RunRepository(Protocol):
+    """The repository surface a full run needs.
+
+    A superset of :class:`~jobpilot.interfaces.JobRepository` (so it can drive
+    collection and scoring) plus the proposal-guard and status-listing helpers the
+    proposal/approval stages use. Satisfied by the concrete ``NeonJobRepository``
+    and by the in-memory test fake.
+    """
+
+    def upsert_job(self, job: RawJob) -> Job: ...
+
+    def get_job(self, job_id: int) -> Job | None: ...
+
+    def set_status(self, job_id: int, status: JobStatus) -> None: ...
+
+    def save_job(self, job: Job) -> Job: ...
+
+    def create_application(self, app: Application) -> Application: ...
+
+    def get_state(self, key: str) -> str | None: ...
+
+    def set_state(self, key: str, value: str) -> None: ...
+
+    def count_applications_on(self, day: date) -> int: ...
+
+    def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool: ...
+
+    def list_by_status(self, status: JobStatus) -> list[Job]: ...
+
+
+def run_once(
+    sources: Sequence[JobSource],
+    repo: RunRepository,
+    notifier: Notifier,
+    profile: ProfileModel,
+    llm: LlmClient,
+    storage: FileStorage,
+    config: AppConfig,
+    settings: Settings | None = None,
+) -> RunSummary:
+    """Run the whole pipeline once: collect, score, propose, process approvals.
+
+    This is the single production orchestrator behind ``jobpilot run``. It composes
+    the already-tested stages end to end — collection and dedupe, analysis/scoring
+    with the ``MIN_SCORE`` gate, proposal generation under the daily and
+    company+role guards, and the human-in-the-loop Telegram update processing — so a
+    user or a scheduled invocation reaches proposal creation and approval handling.
+    Dependencies are injected so the composition root (the CLI) owns construction of
+    the real Neon/Telegram/Drive/LLM implementations and tests can pass fakes.
+    """
+    active_settings = settings or get_settings()
+    collect = collect_and_persist(sources, repo, config)
+    score = score_new_jobs(
+        repo.list_by_status(JobStatus.new), repo, profile, llm, config, active_settings
+    )
+    propose = propose_scored_jobs(
+        repo.list_by_status(JobStatus.scored),
+        repo,
+        notifier,
+        profile,
+        llm,
+        storage,
+        config,
+        active_settings,
+    )
+    telegram = process_telegram_updates(repo, notifier, profile, llm, storage, config)
+    log.info("run_once_done")
+    return RunSummary(collect=collect, score=score, propose=propose, telegram=telegram)

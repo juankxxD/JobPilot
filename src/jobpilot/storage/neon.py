@@ -123,6 +123,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         missing_requirements=missing,
         status=JobStatus(row["status"]),
         found_at=row.get("found_at"),
+        status_changed_at=row.get("status_changed_at"),
     )
 
 
@@ -282,7 +283,7 @@ class NeonJobRepository:
     def set_status(self, job_id: int, status: JobStatus) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "UPDATE jobs SET status = %s WHERE id = %s",
+                "UPDATE jobs SET status = %s, status_changed_at = now() WHERE id = %s",
                 (status.value, job_id),
             )
         self._conn.commit()
@@ -297,7 +298,8 @@ class NeonJobRepository:
             cur.execute(
                 "UPDATE jobs SET "
                 " language = %s, modality = %s, analysis = %s, score = %s, "
-                " score_reason = %s, missing_requirements = %s, status = %s "
+                " score_reason = %s, missing_requirements = %s, status = %s, "
+                " status_changed_at = now() "
                 "WHERE id = %s RETURNING *",
                 (
                     job.language.value if job.language else None,
@@ -364,19 +366,29 @@ class NeonJobRepository:
     # Query helpers used by later phases (A3) — not part of the Protocol.
     # ------------------------------------------------------------------ #
     def list_proposed(self) -> list[Job]:
+        return self.list_by_status(JobStatus.proposed)
+
+    def list_by_status(self, status: JobStatus) -> list[Job]:
+        """Return every job currently in ``status`` (ordered by id)."""
         with self._conn.cursor() as cur:
-            cur.execute("SELECT * FROM jobs WHERE status = %s ORDER BY id", ("proposed",))
+            cur.execute("SELECT * FROM jobs WHERE status = %s ORDER BY id", (status.value,))
             rows = cur.fetchall()
         return [_row_to_job(row) for row in rows]
 
-    def recent_company_role(self, company: str, role: str, within_days: int) -> bool:
-        """True if a job for the same company+role was proposed within the window."""
+    def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool:
+        """True if a job for the same company+role was proposed within the window.
+
+        The window is measured against ``status_changed_at`` (the last status
+        transition, which for a proposed/approved/applied job is when it reached
+        that state), not ``found_at``: a job collected long ago but only proposed
+        today must still block an identical proposal made right afterwards.
+        """
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM jobs "
                 "WHERE lower(company) = lower(%s) AND lower(title) = lower(%s) "
                 "  AND status IN ('proposed', 'approved', 'applied') "
-                "  AND found_at >= now() - make_interval(days => %s) "
+                "  AND status_changed_at >= now() - make_interval(days => %s) "
                 "LIMIT 1",
                 (company, role, within_days),
             )

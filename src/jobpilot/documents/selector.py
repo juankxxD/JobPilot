@@ -44,6 +44,7 @@ def _build_prompt(
     profile: ProfileModel,
     analysis: JobAnalysis,
     language: Language,
+    instruction: str | None,
 ) -> str:
     return build_select_content_prompt(
         profile_json=profile.model_dump_json(),
@@ -54,6 +55,7 @@ def _build_prompt(
         analysis_json=analysis.model_dump_json(),
         language=language.value,
         schema_json=_selection_schema_json(),
+        instruction=instruction,
     )
 
 
@@ -62,14 +64,21 @@ def select_content(
     profile: ProfileModel,
     llm: LlmClient,
     language: Language,
+    *,
+    instruction: str | None = None,
 ) -> ContentSelection:
     """Select tailored CV content for ``language``, validating ids and translations.
+
+    When ``instruction`` is given (the owner's free-text Ajustar note) it is passed
+    to the LLM as re-selection guidance: it may change *which* existing ids are
+    chosen and their order, but never introduces new wording, and the instruction
+    text itself never ends up in a document.
 
     Retries the selection once if the LLM cites an unknown id, an unknown summary
     variant, or a text whose translation is not approved in ``language``; raises
     :class:`SelectionError` if it still fails after the retry.
     """
-    prompt = _build_prompt(profile, analysis, language)
+    prompt = _build_prompt(profile, analysis, language, instruction)
     last_message = ""
     attempts = 2
     for attempt in range(1, attempts + 1):

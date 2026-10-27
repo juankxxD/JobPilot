@@ -123,10 +123,12 @@ def test_below_threshold_is_flagged(example_profile: ProfileModel, load_fixture:
     )
 
     summary = score_new_jobs([job], repo, example_profile, llm, AppConfig(), Settings(min_score=70))
-    assert summary.scored == 1
+    # A below-threshold job keeps its analysis/score but does not become 'scored':
+    # it is moved to filtered_out so it never continues to a proposal (R8.6/R10.7).
+    assert summary.scored == 0
     assert summary.below_threshold == 1
     stored = repo.get_job(job.id)  # type: ignore[arg-type]
-    assert stored is not None and stored.status is JobStatus.scored
+    assert stored is not None and stored.status is JobStatus.filtered_out
     assert stored.score == 40
 
 

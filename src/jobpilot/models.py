@@ -167,6 +167,7 @@ class Job(BaseModel):
     missing_requirements: list[str] = Field(default_factory=list)
     status: JobStatus = JobStatus.new
     found_at: datetime | None = None
+    status_changed_at: datetime | None = None
 
 
 class Application(BaseModel):

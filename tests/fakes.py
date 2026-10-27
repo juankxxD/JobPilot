@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel
 
-from jobpilot.interfaces import Button, Update
+from jobpilot.channels.telegram import TelegramDeliveryError
+from jobpilot.interfaces import Button, Update, UpdateBatch
 from jobpilot.models import Application, Attachment, Job, JobStatus, RawJob, StoredFile
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
@@ -142,14 +143,21 @@ class FakeJobRepository:
 
     def set_status(self, job_id: int, status: JobStatus) -> None:
         job = self._jobs[job_id]
-        self._jobs[job_id] = job.model_copy(update={"status": status})
+        self._jobs[job_id] = job.model_copy(
+            update={"status": status, "status_changed_at": self._now()}
+        )
         self.status_changes.append((job_id, status))
 
     def save_job(self, job: Job) -> Job:
         if job.id is None:
             raise ValueError("save_job requires a job with an id")
-        self._jobs[job.id] = job
-        return job
+        # Mirror the concrete repository, which stamps status_changed_at on every
+        # save_job, so the dedupe window measures from the proposal time.
+        self._jobs[job.id] = job.model_copy(update={"status_changed_at": self._now()})
+        return self._jobs[job.id]
+
+    def _now(self) -> datetime:
+        return datetime.now(UTC)
 
     def create_application(self, app: Application) -> Application:
         app_id = self._next_app_id
@@ -174,22 +182,38 @@ class FakeJobRepository:
         )
 
     def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool:
-        """Return whether a job for the same company+role was already proposed/applied.
+        """Return whether a job for the same company+role was recently proposed.
 
-        The in-memory fake does not track timestamps per status change, so
-        ``within_days`` is accepted for parity with the concrete repository and the
-        guard treats any proposed/applied/approved job with the same company and
-        role as a recent duplicate.
+        Mirrors the concrete repository: a proposed/approved/applied job for the
+        same company and role counts only when its last status transition
+        (``status_changed_at``) falls within ``within_days``. A job whose proposal
+        is older than the window no longer blocks a new identical proposal.
         """
         seen = {JobStatus.proposed, JobStatus.approved, JobStatus.applied}
-        return any(
-            job.company == company and job.title == role and job.status in seen
-            for job in self._jobs.values()
-        )
+        cutoff = self._now() - timedelta(days=within_days)
+        for job in self._jobs.values():
+            if job.company != company or job.title != role or job.status not in seen:
+                continue
+            changed = job.status_changed_at
+            if changed is None or changed >= cutoff:
+                return True
+        return False
 
     def list_proposed(self) -> list[Job]:
         """Return every job currently in the ``proposed`` status."""
-        return [job for job in self._jobs.values() if job.status is JobStatus.proposed]
+        return self.list_by_status(JobStatus.proposed)
+
+    def list_by_status(self, status: JobStatus) -> list[Job]:
+        """Return every job currently in ``status`` (ordered by id)."""
+        return [
+            job
+            for job in sorted(self._jobs.values(), key=lambda j: j.id or 0)
+            if job.status is status
+        ]
+
+    def set_status_changed_at(self, job_id: int, when: datetime) -> None:
+        """Override a job's status-transition timestamp (test helper for dedupe)."""
+        self._jobs[job_id] = self._jobs[job_id].model_copy(update={"status_changed_at": when})
 
     def seed_job(self, job: Job) -> Job:
         """Insert a fully-formed ``Job`` directly (test helper for later phases).
@@ -274,11 +298,25 @@ class FakeNotifier:
     can assert on the Spanish copy and the inline keyboard, and replays a queued
     list of :class:`Update` objects, honouring the ``offset`` so already-acknowledged
     updates are not returned twice (mirroring Telegram's ``getUpdates`` contract).
+
+    ``highest_update_id`` is reported over every queued update (including ones a
+    real notifier would drop for not belonging to the owner), so the pipeline can
+    checkpoint an all-ignored batch. ``fail_send_after`` lets a test simulate the
+    Telegram Bot API rejecting a send: once that many ``send_message`` calls have
+    succeeded, the next raises :class:`TelegramDeliveryError`.
     """
 
-    def __init__(self, updates: Iterable[Update] = ()) -> None:
+    def __init__(
+        self,
+        updates: Iterable[Update] = (),
+        *,
+        highest_update_id: int | None = None,
+        fail_send_after: int | None = None,
+    ) -> None:
         self.messages: list[SentMessage] = []
         self._updates: list[Update] = list(updates)
+        self._highest_update_id = highest_update_id
+        self._fail_send_after = fail_send_after
         self.get_updates_calls: list[int | None] = []
 
     def queue_updates(self, *updates: Update) -> None:
@@ -290,6 +328,8 @@ class FakeNotifier:
         buttons: Sequence[Button] | None = None,
         attachments: Sequence[Attachment] | None = None,
     ) -> None:
+        if self._fail_send_after is not None and len(self.messages) >= self._fail_send_after:
+            raise TelegramDeliveryError("simulated Telegram Bot API rejection")
         self.messages.append(
             SentMessage(
                 text=text,
@@ -298,11 +338,24 @@ class FakeNotifier:
             )
         )
 
-    def get_updates(self, offset: int | None = None) -> list[Update]:
-        self.get_updates_calls.append(offset)
+    def _visible(self, offset: int | None) -> list[Update]:
         if offset is None:
             return list(self._updates)
         return [u for u in self._updates if u.update_id >= offset]
+
+    def _highest(self, offset: int | None) -> int | None:
+        if self._highest_update_id is not None:
+            return self._highest_update_id
+        visible = self._visible(offset)
+        return max((u.update_id for u in visible), default=None)
+
+    def get_updates(self, offset: int | None = None) -> list[Update]:
+        self.get_updates_calls.append(offset)
+        return self._visible(offset)
+
+    def get_update_batch(self, offset: int | None = None) -> UpdateBatch:
+        self.get_updates_calls.append(offset)
+        return UpdateBatch(updates=self._visible(offset), highest_update_id=self._highest(offset))
 
     # Test conveniences ------------------------------------------------- #
     @property

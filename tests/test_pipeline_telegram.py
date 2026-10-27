@@ -214,4 +214,6 @@ def test_pendientes_and_estado_report_in_spanish(example_profile: ProfileModel) 
     status_msg = notifier.messages[1].text
     assert "Ofertas pendientes" in pending_msg
     assert "ACME Corp" in pending_msg
-    assert "proposed" in status_msg
+    # R16.2: the status report shows Spanish labels, never the English enum values.
+    assert "propuestas" in status_msg
+    assert "proposed" not in status_msg

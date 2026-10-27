@@ -244,7 +244,7 @@ Instructions:
   in). Do not choose a different language.
 - Prefer content whose claims the offer actually values; do NOT include content
   just to fill space.
-
+{adjustment}
 Candidate profile:
 ---
 {profile}
@@ -263,6 +263,13 @@ Return JSON for this schema:
 {schema}
 """
 
+_ADJUSTMENT_INSTRUCTION = """\
+- The owner asked for an adjustment to the previous selection. Honour this
+  instruction by RE-SELECTING which existing ids to include and in what order; it
+  changes only your choice of ids, never the wording of any content, and the
+  instruction text must NOT appear in the output: "{instruction}"
+"""
+
 
 def build_select_content_prompt(
     *,
@@ -274,9 +281,16 @@ def build_select_content_prompt(
     analysis_json: str,
     language: str,
     schema_json: str,
+    instruction: str | None = None,
 ) -> str:
+    adjustment = (
+        _ADJUSTMENT_INSTRUCTION.format(instruction=instruction.strip())
+        if instruction and instruction.strip()
+        else ""
+    )
     return SELECT_CONTENT_PROMPT.format(
         anti_invention=ANTI_INVENTION_RULES,
+        adjustment=adjustment,
         profile=profile_json,
         summary_variants=", ".join(sorted(summary_variants)) or "(none)",
         achievement_ids=", ".join(sorted(achievement_ids)) or "(none)",

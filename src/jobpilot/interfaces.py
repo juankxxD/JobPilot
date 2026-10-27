@@ -62,6 +62,20 @@ class Update(BaseModel):
     callback_data: str | None = None
 
 
+class UpdateBatch(BaseModel):
+    """A fetched batch of Telegram updates plus the highest raw ``update_id`` seen.
+
+    ``updates`` only contains the owner's updates (everything else is refused), but
+    ``highest_update_id`` reflects every update returned by Telegram, including the
+    ignored non-owner ones. The pipeline checkpoints ``highest_update_id`` so a
+    batch made entirely of unauthorized messages still advances the cursor and can
+    never starve a later owner update.
+    """
+
+    updates: list[Update]
+    highest_update_id: int | None = None
+
+
 @runtime_checkable
 class Notifier(Protocol):
     """The Telegram-facing channel."""
@@ -74,6 +88,8 @@ class Notifier(Protocol):
     ) -> None: ...
 
     def get_updates(self, offset: int | None = None) -> list[Update]: ...
+
+    def get_update_batch(self, offset: int | None = None) -> UpdateBatch: ...
 
 
 @runtime_checkable

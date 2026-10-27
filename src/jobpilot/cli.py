@@ -99,8 +99,54 @@ def auth_mail() -> None:
 
 @app.command()
 def run() -> None:
-    """Run the full pipeline once (Phase 5+)."""
-    typer.echo(f"run: {_NOT_IMPLEMENTED}")
+    """Run the full pipeline once: collect, score, propose and process approvals."""
+    from jobpilot.config import PROJECT_ROOT, get_settings, load_app_config
+    from jobpilot.pipeline.run import run_once
+
+    settings = get_settings()
+    if not settings.database_url:
+        typer.echo("Cannot run: DATABASE_URL is not set.", err=True)
+        typer.echo("Set DATABASE_URL in your .env and try again.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        config = load_app_config()
+        profile = _load_run_profile(PROJECT_ROOT)
+        sources, repo, notifier, llm, storage = _build_run_dependencies(settings, config)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Cannot run: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    summary = run_once(sources, repo, notifier, profile, llm, storage, config, settings)
+    typer.echo(
+        "Run complete: "
+        f"{summary.collect.kept_new} new, "
+        f"{summary.score.scored} scored, "
+        f"{summary.propose.proposed} proposed, "
+        f"{summary.telegram.processed} updates processed."
+    )
+
+
+def _load_run_profile(project_root: Any) -> Any:
+    from jobpilot.profile.model import load_profile
+
+    return load_profile(project_root / "profile.yaml")
+
+
+def _build_run_dependencies(settings: Any, config: Any) -> tuple[Any, Any, Any, Any, Any]:
+    """Construct the real external dependencies for a run (composition root)."""
+    from jobpilot.channels.telegram import TelegramNotifier
+    from jobpilot.fetchers.base import iter_enabled
+    from jobpilot.llm.client import build_default_client
+    from jobpilot.storage.drive import DriveFileStorage
+    from jobpilot.storage.neon import NeonJobRepository
+
+    sources = iter_enabled(config)
+    repo = NeonJobRepository.connect(settings.database_url)
+    notifier = TelegramNotifier.from_settings(settings)
+    llm = build_default_client()
+    storage = DriveFileStorage.from_settings(settings)
+    return sources, repo, notifier, llm, storage
 
 
 if __name__ == "__main__":

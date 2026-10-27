@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from pydantic import BaseModel
 
 from jobpilot.config import Language, Settings, get_settings
-from jobpilot.interfaces import Button, Update
+from jobpilot.interfaces import Button, Update, UpdateBatch
 from jobpilot.logging import get_logger
 
 if TYPE_CHECKING:
@@ -38,6 +38,15 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _API_BASE = "https://api.telegram.org"
+
+
+class TelegramDeliveryError(RuntimeError):
+    """Raised when the Telegram Bot API rejects a send (``ok: false``).
+
+    The caller must not treat a rejected send as delivered: a proposal whose
+    message or document never reached the owner must not advance to ``proposed``,
+    so the job is retried on a later run instead of being silently skipped.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -302,6 +311,7 @@ class TelegramNotifier:
         data = resp.json()
         if not data.get("ok", False):
             log.warning("telegram_api_error", method=method, response=data)
+            raise TelegramDeliveryError(f"Telegram {method} failed: {data}")
 
     def _send_document(self, attachment: Attachment, *, caption: str | None = None) -> None:
         payload: dict[str, Any] = {
@@ -321,6 +331,7 @@ class TelegramNotifier:
         data = resp.json()
         if not data.get("ok", False):
             log.warning("telegram_document_error", filename=attachment.filename, response=data)
+            raise TelegramDeliveryError(f"Telegram sendDocument failed: {attachment.filename}")
 
     # ------------------------------ Notifier ------------------------------ #
     def send_message(
@@ -346,6 +357,17 @@ class TelegramNotifier:
         never returned again. Updates from any chat other than the configured owner
         are ignored outright.
         """
+        return self.get_update_batch(offset).updates
+
+    def get_update_batch(self, offset: int | None = None) -> UpdateBatch:
+        """Fetch a batch, returning owner updates and the highest raw ``update_id``.
+
+        Only the owner's updates are returned in ``updates`` (every other chat is
+        refused), but ``highest_update_id`` is computed over *every* update Telegram
+        returned, including the ignored non-owner ones. The pipeline checkpoints
+        that highest id so a batch of only unauthorized messages still advances the
+        cursor and can never starve a later owner update.
+        """
         payload: dict[str, Any] = {}
         if offset is not None:
             payload["offset"] = offset
@@ -353,12 +375,14 @@ class TelegramNotifier:
         data = resp.json()
         if not data.get("ok", False):
             log.warning("telegram_get_updates_error", response=data)
-            return []
+            return UpdateBatch(updates=[], highest_update_id=None)
         updates: list[Update] = []
+        highest: int | None = None
         for raw in data.get("result", []):
             update = self._normalize_update(raw)
             if update is None:
                 continue
+            highest = update.update_id if highest is None else max(highest, update.update_id)
             if update.chat_id != self._owner_chat_id:
                 log.info(
                     "telegram_ignored_non_owner",
@@ -367,7 +391,7 @@ class TelegramNotifier:
                 )
                 continue
             updates.append(update)
-        return updates
+        return UpdateBatch(updates=updates, highest_update_id=highest)
 
     @staticmethod
     def _normalize_update(raw: dict[str, Any]) -> Update | None:
