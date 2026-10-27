@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ basics.name }} — CV</title>
+    <style>
+      {{ styles }}
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>{{ basics.name }}</h1>
+      <p class="contact">
+        {% set bits = [] %}
+        {% if basics.email %}{% set _ = bits.append(basics.email) %}{% endif %}
+        {% if basics.phone %}{% set _ = bits.append(basics.phone) %}{% endif %}
+        {% if basics.location %}{% set _ = bits.append(basics.location) %}{% endif %}
+        {{ bits | join(" · ") }}
+      </p>
+      {% if basics.links %}
+      <p class="contact">{{ basics.links | join(" · ") }}</p>
+      {% endif %}
+    </header>
+
+    {% if summary %}
+    <section>
+      <h2>Resumen</h2>
+      <p>{{ summary }}</p>
+    </section>
+    {% endif %}
+
+    {% if experiences %}
+    <section>
+      <h2>Experiencia</h2>
+      {% for exp in experiences %}
+      <h3>{{ exp.role }} — {{ exp.company }}</h3>
+      <p class="role-meta">{{ exp.start }}{% if exp.end %} – {{ exp.end }}{% else %} – Actual{% endif %}</p>
+      {% if exp.achievements %}
+      <ul>
+        {% for item in exp.achievements %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if education %}
+    <section>
+      <h2>Educación</h2>
+      {% for edu in education %}
+      <h3>{{ edu.degree }} — {{ edu.institution }}</h3>
+      {% if edu.start or edu.end %}
+      <p class="role-meta">{{ edu.start }}{% if edu.end %} – {{ edu.end }}{% endif %}</p>
+      {% endif %}
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if skills %}
+    <section>
+      <h2>Habilidades</h2>
+      <p class="skills-line">{{ skills | join(", ") }}</p>
+    </section>
+    {% endif %}
+
+    {% if certifications %}
+    <section>
+      <h2>Certificaciones</h2>
+      <ul>
+        {% for cert in certifications %}
+        <li>{{ cert.name }}{% if cert.issuer %} — {{ cert.issuer }}{% endif %}{% if cert.date %} ({{ cert.date }}){% endif %}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if projects %}
+    <section>
+      <h2>Proyectos</h2>
+      {% for prj in projects %}
+      <h3>{{ prj.name }}</h3>
+      <p>{{ prj.text }}</p>
+      {% endfor %}
+    </section>
+    {% endif %}
+  </body>
+</html>

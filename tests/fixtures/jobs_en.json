@@ -1,0 +1,15 @@
+{
+  "source": "remoteok",
+  "external_id": "rok-en-001",
+  "url": "https://remoteok.com/remote-jobs/backend-java-en-001",
+  "apply_url": "https://remoteok.com/remote-jobs/backend-java-en-001/apply",
+  "title": "Senior Backend Engineer (Java / Spring Boot)",
+  "company": "Globex Remote",
+  "location": "Remote - Worldwide",
+  "remote": true,
+  "modality": "remote",
+  "salary_text": "$90k - $120k USD / year",
+  "contact_email": "jobs@globexremote.example",
+  "language": null,
+  "description": "We are hiring a senior backend engineer to design and maintain our event-driven payment platform. You will work with Java, Spring Boot, PostgreSQL and AWS. Requirements: 5+ years of backend experience, strong Java and Spring Boot skills, experience building Kafka-based event-driven architectures, and comfort owning services end to end. Fully remote, overlap with US timezones preferred."
+}

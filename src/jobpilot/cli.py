@@ -6,6 +6,8 @@ print a clear "not implemented yet" message so the CLI is usable end to end.
 
 from __future__ import annotations
 
+from typing import Any
+
 import typer
 
 from jobpilot.logging import configure_logging, get_logger
@@ -39,7 +41,31 @@ def check_all() -> None:
 @app.command()
 def migrate() -> None:
     """Apply pending database migrations (Phase 2)."""
-    typer.echo(f"migrate: {_NOT_IMPLEMENTED}")
+    from jobpilot.config import get_settings
+    from jobpilot.storage.migrate import run_migrations
+    from jobpilot.storage.neon import connect_with_retry
+
+    settings = get_settings()
+    if not settings.database_url:
+        typer.echo("Cannot run migrate: DATABASE_URL is not set.", err=True)
+        typer.echo("Set DATABASE_URL in your .env and try again.", err=True)
+        raise typer.Exit(code=1)
+
+    dsn = settings.database_url
+
+    def conn_factory() -> Any:
+        return connect_with_retry(dsn)
+
+    try:
+        applied = run_migrations(conn_factory)
+    except Exception as exc:  # noqa: BLE001 - surface a clear message, not a traceback
+        typer.echo(f"Migration failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if applied:
+        typer.echo(f"Applied migrations: {', '.join(applied)}")
+    else:
+        typer.echo("Database is up to date; no migrations applied.")
 
 
 @app.command("import-cv")

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ basics.name }} — Carta de presentación</title>
+    <style>
+      {{ styles }}
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>{{ basics.name }}</h1>
+      <p class="contact">
+        {% set bits = [] %}
+        {% if basics.email %}{% set _ = bits.append(basics.email) %}{% endif %}
+        {% if basics.phone %}{% set _ = bits.append(basics.phone) %}{% endif %}
+        {% if basics.location %}{% set _ = bits.append(basics.location) %}{% endif %}
+        {{ bits | join(" · ") }}
+      </p>
+    </header>
+
+    <section class="cover-body">
+      {% if company %}<p>{{ company }}</p>{% endif %}
+      {% for paragraph in paragraphs %}
+      <p>{{ paragraph }}</p>
+      {% endfor %}
+    </section>
+  </body>
+</html>

@@ -1,0 +1,35 @@
+{
+  "data": [
+    {
+      "id": "gob-1",
+      "type": "job-posts",
+      "attributes": {
+        "title": "Senior Backend Engineer (Java/Spring)",
+        "public_url": "https://www.getonbrd.com/jobs/gob-1",
+        "apply_url": "https://www.getonbrd.com/jobs/gob-1/apply",
+        "remote": true,
+        "modality": "fully_remote",
+        "country": "Colombia",
+        "min_salary": 4000,
+        "max_salary": 6000,
+        "description": "We are looking for a backend engineer with Java and Spring.",
+        "company": {
+          "data": { "attributes": { "name": "Acme LATAM" } }
+        }
+      }
+    },
+    {
+      "id": "gob-2",
+      "type": "job-posts",
+      "attributes": {
+        "title": "Python Cloud Developer",
+        "public_url": "https://www.getonbrd.com/jobs/gob-2",
+        "remote": false,
+        "city": "Bogotá",
+        "country": "Colombia",
+        "description": "Python and AWS cloud role.",
+        "company_name": "Nube SAS"
+      }
+    }
+  ]
+}

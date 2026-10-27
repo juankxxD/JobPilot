@@ -1,0 +1,21 @@
+{
+  "score": 0,
+  "dimensions": {
+    "required_stack": 95,
+    "seniority_and_years": 90,
+    "modality_and_timezone": 85,
+    "language": 100,
+    "salary_and_conditions": 60,
+    "other": 70
+  },
+  "reasons": [
+    "Strong Java and Spring Boot match with the required stack.",
+    "Event-driven Kafka experience matches a key requirement."
+  ],
+  "met_requirements": [
+    { "requirement": "Java and Spring Boot", "achievement_id": "ach_acme_latency" },
+    { "requirement": "Event-driven Kafka architecture", "achievement_id": "ach_acme_events" }
+  ],
+  "missing_requirements": ["US timezone overlap"],
+  "recommendation": "apply"
+}

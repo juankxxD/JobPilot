@@ -29,6 +29,7 @@ class ValidationIssues:
 
     unknown_achievement_ids: list[str] = field(default_factory=list)
     unknown_project_ids: list[str] = field(default_factory=list)
+    unknown_skill_ids: list[str] = field(default_factory=list)
     unknown_summary_variant: str | None = None
     unapproved_language_ids: list[str] = field(default_factory=list)
     unknown_technologies: list[str] = field(default_factory=list)
@@ -37,6 +38,7 @@ class ValidationIssues:
         return not (
             self.unknown_achievement_ids
             or self.unknown_project_ids
+            or self.unknown_skill_ids
             or self.unknown_summary_variant
             or self.unapproved_language_ids
             or self.unknown_technologies
@@ -48,6 +50,8 @@ class ValidationIssues:
             parts.append(f"unknown achievement ids: {self.unknown_achievement_ids}")
         if self.unknown_project_ids:
             parts.append(f"unknown project ids: {self.unknown_project_ids}")
+        if self.unknown_skill_ids:
+            parts.append(f"unknown skill ids: {self.unknown_skill_ids}")
         if self.unknown_summary_variant:
             parts.append(f"unknown summary variant: {self.unknown_summary_variant}")
         if self.unapproved_language_ids:
@@ -64,19 +68,27 @@ def validate_selection(
     achievement_ids: list[str],
     project_ids: list[str],
     language: Language,
+    highlighted_skill_ids: list[str] | None = None,
 ) -> ValidationIssues:
     """Validate an LLM content selection against the profile.
 
-    Checks id existence, summary-variant existence, and that each referenced text
-    has an approved translation in the target language.
+    Checks id existence (achievements, projects, highlighted skills), summary-variant
+    existence, and that each referenced text has an approved translation in the target
+    language. Highlighted skills are matched case-insensitively against the profile's
+    declared skills; any that are not present are reported so the caller can retry/error
+    instead of silently dropping them.
     """
     issues = ValidationIssues()
 
     known_ach = profile.achievement_ids()
     known_prj = profile.project_ids()
+    known_skills = {s.lower() for s in profile.skills.all()}
 
     issues.unknown_achievement_ids = [i for i in achievement_ids if i not in known_ach]
     issues.unknown_project_ids = [i for i in project_ids if i not in known_prj]
+    issues.unknown_skill_ids = [
+        s for s in (highlighted_skill_ids or []) if s.lower() not in known_skills
+    ]
 
     if summary_variant not in profile.summary_variants:
         issues.unknown_summary_variant = summary_variant

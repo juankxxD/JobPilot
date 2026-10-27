@@ -87,3 +87,114 @@ def test_fallback_without_secondary_reraises() -> None:
     client = FallbackLlmClient(_Primary(), None)
     with pytest.raises(RuntimeError, match="primary down"):
         client.complete_json("p", _Schema)
+
+
+class _RateLimitPrimary:
+    """Primary that raises a Groq rate-limit (429) error."""
+
+    def complete_json(self, prompt, schema, *, max_retries=1):  # type: ignore[no-untyped-def]
+        import httpx
+        from groq import RateLimitError
+
+        request = httpx.Request("POST", "https://api.groq.com/v1/chat")
+        response = httpx.Response(429, request=request)
+        raise RateLimitError("quota exceeded", response=response, body=None)
+
+
+def test_fallback_on_groq_429_uses_secondary() -> None:
+    secondary = _Secondary()
+    client = FallbackLlmClient(_RateLimitPrimary(), secondary)
+    result = client.complete_json("p", _Schema)
+    assert result.value == 42
+    assert secondary.called is True
+
+
+def test_classify_rate_limit_reason() -> None:
+    import httpx
+    from groq import RateLimitError
+
+    from jobpilot.llm.client import _classify_primary_failure
+
+    request = httpx.Request("POST", "https://api.groq.com/v1/chat")
+    response = httpx.Response(429, request=request)
+    exc = RateLimitError("quota", response=response, body=None)
+    assert _classify_primary_failure(exc) == "rate_limit_429"
+
+
+def test_classify_schema_failure_reason() -> None:
+    from jobpilot.llm.client import _classify_primary_failure
+
+    assert _classify_primary_failure(LlmError("bad json")) == "schema_failure"
+
+
+def test_score_missing_dimensions_triggers_schema_retry() -> None:
+    """A JobScore response without dimensions fails validation and is retried."""
+    import json
+
+    from jobpilot.models import JobScore
+
+    partial = json.dumps({"score": 99, "recommendation": "apply"})
+    full = json.dumps(
+        {
+            "score": 0,
+            "dimensions": {
+                "required_stack": 80,
+                "seniority_and_years": 70,
+                "modality_and_timezone": 60,
+                "language": 100,
+                "salary_and_conditions": 50,
+                "other": 40,
+            },
+            "recommendation": "apply",
+        }
+    )
+    responses = iter([partial, full])
+
+    def call(_prompt: str) -> str:
+        return next(responses)
+
+    result = _complete_json_with_retry(call, "prompt", JobScore, max_retries=1)
+    assert result.dimensions.required_stack == 80
+
+
+def test_score_missing_dimensions_exhausted_falls_back() -> None:
+    """A primary that always omits dimensions exhausts retries and falls back."""
+    import json
+
+    from jobpilot.models import JobScore
+
+    class _PartialScorePrimary:
+        """Always returns a dimensions-less JobScore, so retries exhaust -> LlmError."""
+
+        def complete_json(self, prompt, schema, *, max_retries=1):  # type: ignore[no-untyped-def]
+            partial = json.dumps({"score": 99, "recommendation": "apply"})
+            return _complete_json_with_retry(
+                lambda _p: partial, prompt, schema, max_retries=max_retries
+            )
+
+    class _FullScoreSecondary:
+        def __init__(self) -> None:
+            self.called = False
+
+        def complete_json(self, prompt, schema, *, max_retries=1):  # type: ignore[no-untyped-def]
+            self.called = True
+            return schema.model_validate(
+                {
+                    "score": 0,
+                    "dimensions": {
+                        "required_stack": 10,
+                        "seniority_and_years": 10,
+                        "modality_and_timezone": 10,
+                        "language": 10,
+                        "salary_and_conditions": 10,
+                        "other": 10,
+                    },
+                    "recommendation": "discard",
+                }
+            )
+
+    secondary = _FullScoreSecondary()
+    client = FallbackLlmClient(_PartialScorePrimary(), secondary)
+    result = client.complete_json("p", JobScore)
+    assert secondary.called is True
+    assert result.dimensions.language == 10

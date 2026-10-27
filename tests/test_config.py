@@ -44,7 +44,7 @@ def test_missing_config_file(tmp_path: Path) -> None:
 def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     # Ignore any real .env on the developer machine.
     monkeypatch.chdir(PROJECT_ROOT.parent)
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    settings = Settings(_env_file=None)
     assert settings.mail_provider is MailProvider.outlook
     assert settings.min_score == 70
     assert settings.daily_application_limit == 5
@@ -55,6 +55,6 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_settings_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIN_SCORE", "85")
     monkeypatch.setenv("MAIL_PROVIDER", "gmail")
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    settings = Settings(_env_file=None)
     assert settings.min_score == 85
     assert settings.mail_provider is MailProvider.gmail

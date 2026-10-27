@@ -1,0 +1,24 @@
+[
+  {
+    "legal": "RemoteOK API legal notice; this entry has no id or position."
+  },
+  {
+    "id": "rok-1",
+    "position": "Backend Engineer",
+    "company": "Remote Co",
+    "url": "https://remoteok.com/remote-jobs/rok-1",
+    "apply_url": "https://remoteok.com/remote-jobs/rok-1/apply",
+    "location": "Worldwide",
+    "salary_min": 90000,
+    "salary_max": 120000,
+    "description": "Backend role using python and aws."
+  },
+  {
+    "id": "rok-2",
+    "position": "Frontend Developer",
+    "company": "Pixel Inc",
+    "url": "https://remoteok.com/remote-jobs/rok-2",
+    "location": "Europe",
+    "description": "React frontend role."
+  }
+]

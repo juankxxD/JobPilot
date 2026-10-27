@@ -143,11 +143,40 @@ class OllamaClient:
         return _complete_json_with_retry(self._call, prompt, schema, max_retries)
 
 
+def _classify_primary_failure(exc: Exception) -> str:
+    """Return a short reason describing why the primary client failed.
+
+    Recognises Groq quota/rate-limit (429), authentication and connection errors,
+    as well as our own :class:`LlmError` (schema failure after the single retry).
+    The reason is only used for logging; the fallback is attempted regardless.
+    """
+    try:
+        from groq import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
+    except Exception:  # pragma: no cover - groq always installed, defensive only
+        APIConnectionError = APIStatusError = APITimeoutError = RateLimitError = ()  # type: ignore[assignment,misc]
+
+    if isinstance(exc, RateLimitError):
+        return "rate_limit_429"
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        if status == 429:
+            return "quota_429"
+        return f"api_status_{status}"
+    if isinstance(exc, APITimeoutError):
+        return "timeout"
+    if isinstance(exc, APIConnectionError):
+        return "connection_error"
+    if isinstance(exc, LlmError):
+        return "schema_failure"
+    return exc.__class__.__name__
+
+
 class FallbackLlmClient:
     """Try the primary client; fall back to the secondary on failure.
 
-    Phase 1 uses this to wrap Groq (primary). The Ollama fallback is exercised and
-    hardened (quota/429 handling) in Phase 3.
+    Falls back to the secondary (Ollama) on quota/429, connection/timeout errors and
+    schema failures (``LlmError`` after the single retry). The classified reason is
+    logged so fallbacks are observable.
     """
 
     def __init__(self, primary: object, secondary: object | None = None) -> None:
@@ -162,9 +191,11 @@ class FallbackLlmClient:
                 prompt, schema, max_retries=max_retries
             )
         except Exception as exc:  # noqa: BLE001 - fall back on any primary failure
+            reason = _classify_primary_failure(exc)
             if self._secondary is None:
+                log.warning("llm_primary_failed_no_fallback", reason=reason, error=str(exc))
                 raise
-            log.warning("llm_primary_failed_falling_back", error=str(exc))
+            log.warning("llm_primary_failed_falling_back", reason=reason, error=str(exc))
             return self._secondary.complete_json(  # type: ignore[attr-defined,no-any-return]
                 prompt, schema, max_retries=max_retries
             )
