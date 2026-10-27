@@ -10,7 +10,11 @@ from typing import Any
 from jobpilot.config import AppConfig, Settings, SourceFlag
 from jobpilot.fetchers.adzuna import AdzunaSource
 from jobpilot.fetchers.base import iter_enabled
-from jobpilot.fetchers.gmail_alerts import GmailAlertsSource
+from jobpilot.fetchers.gmail_alerts import (
+    GmailAlertsSource,
+    _GmailApiService,
+    build_gmail_alerts_source,
+)
 from jobpilot.fetchers.himalayas import HimalayasSource
 from tests.httpx_fakes import FakeClient, FakeResponse
 
@@ -96,5 +100,38 @@ def test_gmail_alerts_reads_email_links_only() -> None:
     assert jobs[0].url == "https://www.linkedin.com/jobs/view/123"
 
 
-def test_gmail_alerts_without_service_yields_nothing() -> None:
-    assert list(GmailAlertsSource(service=None).fetch()) == []
+def test_gmail_alerts_without_credentials_yields_nothing() -> None:
+    # No injected service and no credentials -> nothing collected, no network call.
+    settings = Settings(gmail_client_id=None, gmail_client_secret=None, gmail_refresh_token=None)
+    assert list(GmailAlertsSource(service=None, settings=settings).fetch()) == []
+
+
+def test_gmail_alerts_builds_lazy_adapter_from_credentials() -> None:
+    # With credentials present, the source lazily builds a read-only Gmail adapter
+    # (constructed without any network call — the client is built on first request).
+    settings = Settings(
+        gmail_client_id="id",
+        gmail_client_secret="secret",
+        gmail_refresh_token="refresh",
+    )
+    source = build_gmail_alerts_source(settings=settings)
+    service = source._resolve_service()
+    assert isinstance(service, _GmailApiService)
+
+
+def test_gmail_alerts_enabled_in_registry_exercises_adapter() -> None:
+    # Registry-level: when the feature flag is on, the registered factory yields a
+    # ready-to-fetch source whose configured adapter is a real Gmail read adapter.
+    config = AppConfig(sources={"gmail_alerts": SourceFlag(enabled=True)})
+    settings = Settings(
+        gmail_client_id="id",
+        gmail_client_secret="secret",
+        gmail_refresh_token="refresh",
+    )
+    sources = {s.name: s for s in iter_enabled(config)}
+    assert "gmail_alerts" in sources
+    source = sources["gmail_alerts"]
+    assert isinstance(source, GmailAlertsSource)
+    # Inject the configured settings and confirm it resolves to the Gmail adapter.
+    source._settings = settings
+    assert isinstance(source._resolve_service(), _GmailApiService)

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     company              text NOT NULL,
     location             text,
     remote               boolean NOT NULL DEFAULT false,
+    modality             text,
     salary_text          text,
     contact_email        text,
     language             text,

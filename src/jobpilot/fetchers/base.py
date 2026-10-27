@@ -16,9 +16,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Protocol
 
-from jobpilot.config import AppConfig
+from jobpilot.config import AppConfig, Language
 from jobpilot.logging import get_logger
-from jobpilot.models import RawJob
+from jobpilot.models import Modality, RawJob
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -85,14 +85,21 @@ def normalize(
     apply_url: str | None = None,
     location: str | None = None,
     remote: bool = False,
+    modality: Modality | None = None,
     salary_text: str | None = None,
     contact_email: str | None = None,
+    language: Language | None = None,
     description: str = "",
 ) -> RawJob:
     """Build a validated :class:`RawJob` with trimmed fields and a stable id.
 
     Raises ``ValueError`` when a required field (url, title, company) is blank, so a
     malformed payload is rejected by the fetcher rather than persisted.
+
+    ``modality`` and ``language`` carry whatever the source itself declares; both are
+    optional (``None`` means "not declared"). When a source marks a job ``remote``
+    but does not declare an explicit modality, the modality is inferred as
+    ``Modality.remote`` so the prefilter can act on it.
     """
     clean_url = _clean(url)
     clean_title = _clean(title)
@@ -104,6 +111,10 @@ def normalize(
     if not clean_company:
         raise ValueError("normalize: company is required")
 
+    resolved_modality = modality
+    if resolved_modality is None and remote:
+        resolved_modality = Modality.remote
+
     return RawJob(
         source=source,
         external_id=_stable_external_id(source, external_id, clean_url),
@@ -113,8 +124,10 @@ def normalize(
         company=clean_company,
         location=_clean(location),
         remote=remote,
+        modality=resolved_modality,
         salary_text=_clean(salary_text),
         contact_email=_clean(contact_email),
+        language=language,
         description=(description or "").strip(),
     )
 

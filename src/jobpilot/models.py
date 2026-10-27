@@ -47,6 +47,14 @@ class ApplicationOutcome(StrEnum):
     no_response = "no_response"
 
 
+class Modality(StrEnum):
+    """Work modality a source may declare (``None`` when unknown)."""
+
+    remote = "remote"
+    hybrid = "hybrid"
+    onsite = "onsite"
+
+
 class RawJob(BaseModel):
     """Normalized output of a fetcher before persistence."""
 
@@ -58,8 +66,10 @@ class RawJob(BaseModel):
     company: str
     location: str | None = None
     remote: bool = False
+    modality: Modality | None = None
     salary_text: str | None = None
     contact_email: str | None = None
+    language: Language | None = None
     description: str = ""
     found_at: datetime | None = None
 
@@ -118,6 +128,7 @@ class Job(BaseModel):
     company: str
     location: str | None = None
     remote: bool = False
+    modality: Modality | None = None
     salary_text: str | None = None
     contact_email: str | None = None
     language: Language | None = None

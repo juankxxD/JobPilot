@@ -99,10 +99,15 @@ module = [
 ]
 ignore_missing_imports = true
 
-# The credential checks call untyped third-party client libraries
-# (Google auth, msal). Relax the strict "untyped call" rule for them only.
+# The credential checks and the Gmail-alerts adapter call untyped third-party
+# client libraries (Google auth, msal). Relax the strict "untyped call" rule for
+# them only.
 [[tool.mypy.overrides]]
-module = ["jobpilot.checks.drive", "jobpilot.checks.mail"]
+module = [
+    "jobpilot.checks.drive",
+    "jobpilot.checks.mail",
+    "jobpilot.fetchers.gmail_alerts",
+]
 disallow_untyped_calls = false
 
 [tool.pytest.ini_options]

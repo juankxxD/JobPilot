@@ -69,7 +69,7 @@ def collect_and_persist(
             if job.status != JobStatus.new:
                 continue
 
-            if prefilter(raw, config.prefilter, language=None):
+            if prefilter(raw, config.prefilter, language=raw.language):
                 summary.kept_new += 1
             else:
                 repo.set_status(job.id, JobStatus.filtered_out)

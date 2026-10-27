@@ -23,6 +23,7 @@ from jobpilot.models import (
     Job,
     JobAnalysis,
     JobStatus,
+    Modality,
     RawJob,
 )
 
@@ -100,6 +101,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         missing = list(json.loads(missing_raw))
 
     language = row.get("language")
+    modality = row.get("modality")
     return Job(
         id=row["id"],
         source=row["source"],
@@ -110,6 +112,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         company=row["company"],
         location=row.get("location"),
         remote=bool(row.get("remote", False)),
+        modality=Modality(modality) if modality else None,
         salary_text=row.get("salary_text"),
         contact_email=row.get("contact_email"),
         language=Language(language) if language else None,
@@ -159,45 +162,79 @@ class NeonJobRepository:
     # JobRepository Protocol
     # ------------------------------------------------------------------ #
     def upsert_job(self, job: RawJob) -> Job:
-        """Idempotent insert keyed on ``(source, external_id)``.
+        """Idempotent upsert resolving conflicts on *either* unique identity.
 
-        On conflict the mutable descriptive columns are refreshed but the job's
-        id, status and any analysis/score are preserved. The ``url`` unique
-        constraint guarantees the same posting is not stored twice under a
-        different external id.
+        The ``jobs`` table has two unique constraints: ``(source, external_id)`` and
+        ``url``. A single ``ON CONFLICT`` clause can only target one of them, so a
+        second posting with a different ``(source, external_id)`` but the same URL
+        (e.g. the same job relisted or cross-posted) would otherwise hit
+        ``jobs_url_key`` and abort collection. To avoid that we first look the job up
+        by either identity in a single statement and, when it already exists, update
+        that row in place; only a genuinely new posting is inserted.
+
+        On update the mutable descriptive columns are refreshed but the job's id,
+        status, language and any analysis/score are preserved so a later run never
+        regresses progress already made.
         """
-        sql = (
-            "INSERT INTO jobs "
-            "(source, external_id, url, apply_url, title, company, location, "
-            " remote, salary_text, contact_email, description, found_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            " COALESCE(%s, now())) "
-            "ON CONFLICT (source, external_id) DO UPDATE SET "
-            " url = EXCLUDED.url, apply_url = EXCLUDED.apply_url, "
-            " title = EXCLUDED.title, company = EXCLUDED.company, "
-            " location = EXCLUDED.location, remote = EXCLUDED.remote, "
-            " salary_text = EXCLUDED.salary_text, "
-            " contact_email = EXCLUDED.contact_email, "
-            " description = EXCLUDED.description "
-            "RETURNING *"
-        )
-        params = (
-            job.source,
-            job.external_id,
+        descriptive = (
             job.url,
             job.apply_url,
             job.title,
             job.company,
             job.location,
             job.remote,
+            job.modality.value if job.modality is not None else None,
             job.salary_text,
             job.contact_email,
             job.description,
-            job.found_at,
         )
-        with self._conn.cursor() as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM jobs WHERE (source = %s AND external_id = %s) OR url = %s "
+                    "ORDER BY id LIMIT 1",
+                    (job.source, job.external_id, job.url),
+                )
+                existing = cur.fetchone()
+                if existing is not None:
+                    cur.execute(
+                        "UPDATE jobs SET "
+                        " url = %s, apply_url = %s, title = %s, company = %s, "
+                        " location = %s, remote = %s, modality = %s, salary_text = %s, "
+                        " contact_email = %s, description = %s "
+                        "WHERE id = %s RETURNING *",
+                        (*descriptive, existing["id"]),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO jobs "
+                        "(source, external_id, url, apply_url, title, company, location, "
+                        " remote, modality, salary_text, contact_email, description, found_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                        " COALESCE(%s, now())) "
+                        "RETURNING *",
+                        (
+                            job.source,
+                            job.external_id,
+                            job.url,
+                            job.apply_url,
+                            job.title,
+                            job.company,
+                            job.location,
+                            job.remote,
+                            job.modality.value if job.modality is not None else None,
+                            job.salary_text,
+                            job.contact_email,
+                            job.description,
+                            job.found_at,
+                        ),
+                    )
+                row = cur.fetchone()
+        except Exception:
+            # Leave the connection in a usable state for the next statement so a
+            # single failed upsert does not abort the rest of collection.
+            self._conn.rollback()
+            raise
         self._conn.commit()
         if row is None:  # pragma: no cover - RETURNING always yields a row
             raise RuntimeError("upsert_job did not return a row")
@@ -226,11 +263,12 @@ class NeonJobRepository:
         with self._conn.cursor() as cur:
             cur.execute(
                 "UPDATE jobs SET "
-                " language = %s, analysis = %s, score = %s, score_reason = %s, "
-                " missing_requirements = %s, status = %s "
+                " language = %s, modality = %s, analysis = %s, score = %s, "
+                " score_reason = %s, missing_requirements = %s, status = %s "
                 "WHERE id = %s RETURNING *",
                 (
                     job.language.value if job.language else None,
+                    job.modality.value if job.modality else None,
                     analysis_json,
                     job.score,
                     job.score_reason,

@@ -8,7 +8,13 @@ from jobpilot.pipeline.run import collect_and_persist
 from tests.fakes import FakeJobRepository, FakeJobSource
 
 
-def _raw(external_id: str, url: str, *, description: str = "java backend") -> RawJob:
+def _raw(
+    external_id: str,
+    url: str,
+    *,
+    description: str = "java backend",
+    language: Language | None = None,
+) -> RawJob:
     return RawJob(
         source="src",
         external_id=external_id,
@@ -17,6 +23,7 @@ def _raw(external_id: str, url: str, *, description: str = "java backend") -> Ra
         company="Acme",
         description=description,
         remote=True,
+        language=language,
     )
 
 
@@ -85,4 +92,30 @@ def test_prefiltered_jobs_get_filtered_out() -> None:
     assert statuses["keep"] == JobStatus.new
     assert statuses["drop"] == JobStatus.filtered_out
     assert summary.kept_new == 1
+    assert summary.filtered_out == 1
+
+
+def test_declared_disallowed_language_is_filtered_out() -> None:
+    repo = FakeJobRepository()
+    config = AppConfig(
+        prefilter=PrefilterConfig(
+            countries=[],
+            remote_ok=True,
+            required_keywords=["java"],
+            excluded_keywords=[],
+            accepted_languages=[Language.es],
+            modalities=[],
+            min_salary_usd=0,
+        )
+    )
+    es_job = _raw("es", "https://x/es", language=Language.es)
+    en_job = _raw("en", "https://x/en", language=Language.en)
+    source = FakeJobSource("src", [es_job, en_job])
+
+    summary = collect_and_persist([source], repo, config)
+
+    statuses = {job.external_id: job.status for job in repo.jobs}
+    assert statuses["es"] == JobStatus.new
+    # A job whose source-declared language is disallowed is filtered before any LLM.
+    assert statuses["en"] == JobStatus.filtered_out
     assert summary.filtered_out == 1

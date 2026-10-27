@@ -14,18 +14,18 @@ from __future__ import annotations
 import base64
 import re
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
+from jobpilot.config import Settings, get_settings
 from jobpilot.fetchers.base import JobSource, normalize, register
 from jobpilot.logging import get_logger
 from jobpilot.models import RawJob
 
-if TYPE_CHECKING:
-    from jobpilot.config import Settings
-
 log = get_logger(__name__)
 
 SOURCE = "gmail_alerts"
+# Read-only access: the source only reads alert emails, never modifies the mailbox.
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 # Only alert senders are read; nothing else in the mailbox is touched.
 ALERT_QUERY = (
     "from:(jobalerts-noreply@linkedin.com OR alert@indeed.com OR "
@@ -61,10 +61,29 @@ class GmailAlertsSource(JobSource):
         self._service = service
         self._settings = settings
 
+    def _resolve_service(self) -> GmailService | None:
+        """Return the injected service, or lazily build one from settings.
+
+        Tests inject a fake service; in production the registry builds the source
+        with no service, so we construct a read-only Gmail adapter from the
+        environment-backed OAuth credentials when they are present.
+        """
+        if self._service is not None:
+            return self._service
+        settings = self._settings or get_settings()
+        if not (
+            settings.gmail_client_id
+            and settings.gmail_client_secret
+            and settings.gmail_refresh_token
+        ):
+            log.warning("gmail_alerts_missing_credentials", source=SOURCE)
+            return None
+        self._service = _GmailApiService(settings)
+        return self._service
+
     def fetch(self) -> Iterable[RawJob]:
-        service = self._service
+        service = self._resolve_service()
         if service is None:
-            log.warning("gmail_alerts_no_service", source=SOURCE)
             return []
         try:
             jobs: list[RawJob] = []
@@ -130,4 +149,58 @@ def _message_html(message: dict[str, Any]) -> str:
     return ""
 
 
-register(SOURCE, GmailAlertsSource)
+class _GmailApiService:
+    """Read-only Gmail adapter over ``google-api-python-client``.
+
+    Implements the :class:`GmailService` Protocol. The underlying client is built
+    lazily on first use from the stored OAuth refresh token with the minimum
+    ``gmail.readonly`` scope, so importing this module never contacts Google and
+    unit tests inject a fake service instead.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._client: Any = None
+
+    def _resource(self) -> Any:
+        if self._client is None:
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+
+            creds = Credentials(
+                token=None,
+                refresh_token=self._settings.gmail_refresh_token,
+                client_id=self._settings.gmail_client_id,
+                client_secret=self._settings.gmail_client_secret,
+                token_uri="https://oauth2.googleapis.com/token",
+                scopes=[GMAIL_READONLY_SCOPE],
+            )
+            self._client = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        return self._client
+
+    def list_messages(self, query: str) -> list[dict[str, Any]]:
+        resource = self._resource()
+        response = resource.users().messages().list(userId="me", q=query, maxResults=25).execute()
+        messages: list[dict[str, Any]] = response.get("messages", [])
+        return messages
+
+    def get_message(self, message_id: str) -> dict[str, Any]:
+        resource = self._resource()
+        message: dict[str, Any] = (
+            resource.users().messages().get(userId="me", id=message_id, format="full").execute()
+        )
+        return message
+
+
+def build_gmail_alerts_source(settings: Settings | None = None) -> GmailAlertsSource:
+    """Factory used by the registry: build the source with a lazy Gmail adapter.
+
+    The service stays ``None`` at construction time; the adapter is built on first
+    ``fetch`` from environment-backed credentials (see
+    :meth:`GmailAlertsSource._resolve_service`). Tests bypass this factory and inject
+    a fake service directly.
+    """
+    return GmailAlertsSource(settings=settings)
+
+
+register(SOURCE, build_gmail_alerts_source)

@@ -11,12 +11,22 @@ from typing import Any
 
 from jobpilot.fetchers.base import HttpClient, JobSource, normalize, register
 from jobpilot.logging import get_logger
-from jobpilot.models import RawJob
+from jobpilot.models import Modality, RawJob
 
 log = get_logger(__name__)
 
 SOURCE = "getonboard"
 API_URL = "https://www.getonbrd.com/api/v0/search/jobs"
+
+# GetOnBoard declares modality with its own vocabulary; map it to our enum.
+_MODALITY_MAP = {
+    "fully_remote": Modality.remote,
+    "remote": Modality.remote,
+    "hybrid": Modality.hybrid,
+    "no_remote": Modality.onsite,
+    "on_site": Modality.onsite,
+    "onsite": Modality.onsite,
+}
 
 
 class GetOnBoardSource(JobSource):
@@ -60,8 +70,11 @@ class GetOnBoardSource(JobSource):
         company_name = company.get("data", {}).get("attributes", {}).get("name")
         if not company_name:
             company_name = attrs.get("company_name")
-        modality = attrs.get("modality")
-        remote = bool(attrs.get("remote")) or modality == "fully_remote"
+        raw_modality = attrs.get("modality")
+        modality = _MODALITY_MAP.get(str(raw_modality).lower()) if raw_modality else None
+        if modality is None and bool(attrs.get("remote")):
+            modality = Modality.remote
+        remote = modality == Modality.remote
         salary = None
         if attrs.get("min_salary") or attrs.get("max_salary"):
             salary = f"{attrs.get('min_salary') or ''}-{attrs.get('max_salary') or ''} USD"
@@ -74,6 +87,7 @@ class GetOnBoardSource(JobSource):
             company=company_name or "",
             location=attrs.get("country") or attrs.get("city"),
             remote=remote,
+            modality=modality,
             salary_text=salary,
             description=attrs.get("description") or "",
         )
