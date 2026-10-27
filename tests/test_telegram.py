@@ -101,6 +101,32 @@ def test_get_updates_drops_non_owner_chats() -> None:
     assert updates[0].text == "/estado"
 
 
+class _RaisingHttp:
+    """An HTTP client whose POST always raises a raw transport error."""
+
+    def post(self, url: str, **kwargs: Any) -> _Resp:
+        raise RuntimeError("connection reset")
+
+
+def test_send_normalizes_transport_error_to_delivery_error() -> None:
+    from jobpilot.channels.telegram import TelegramDeliveryError
+
+    notifier = _notifier(_RaisingHttp())  # type: ignore[arg-type]
+    try:
+        notifier.send_message("hola")
+    except TelegramDeliveryError:
+        pass
+    else:  # pragma: no cover - the call must raise
+        raise AssertionError("expected TelegramDeliveryError")
+
+
+def test_get_update_batch_swallows_transport_error_into_empty_batch() -> None:
+    notifier = _notifier(_RaisingHttp())  # type: ignore[arg-type]
+    batch = notifier.get_update_batch()
+    assert batch.updates == []
+    assert batch.highest_update_id is None
+
+
 def test_get_updates_parses_owner_callback_and_passes_offset() -> None:
     result = [
         {

@@ -271,6 +271,85 @@ _ADJUSTMENT_INSTRUCTION = """\
 """
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5 — cover-letter composition (approved facts only)
+# --------------------------------------------------------------------------- #
+
+COVER_LETTER_PROMPT = """\
+You are writing the BODY of a short cover letter for a single job offer, in
+{language_name}. You compose it ONLY from the approved facts provided below: the
+candidate's summary, their selected achievements, and their known technologies. You
+never add a company, role, number, date, or technology that is not in those facts.
+
+{anti_invention}
+
+Instructions:
+- Write a cohesive body of AT MOST {max_words} words in {language_name}.
+- Use ONLY the approved summary, achievements and technologies below. Do NOT claim
+  any technology that is not in "Known technologies".
+- Do NOT include a greeting ("Dear ...", "Estimado ...") or a sign-off/signature:
+  those are added around your body in code. Write only the message paragraphs.
+- Keep it professional and specific to this offer using the facts given; never
+  invent new facts to sound more impressive.
+{adjustment}
+Approved summary:
+---
+{summary}
+---
+Selected achievements (most relevant first):
+---
+{achievements}
+---
+Known technologies (the ONLY technologies you may mention):
+{technologies}
+---
+Analysed offer:
+---
+{analysis}
+---
+
+Return JSON for this schema (the "body" field holds ONLY the paragraphs):
+{schema}
+"""
+
+_COVER_ADJUSTMENT_INSTRUCTION = """\
+- The owner asked for an adjustment to the previous letter. Honour this instruction
+  by rewriting the TONE/EMPHASIS/ARRANGEMENT of the approved facts only; it must not
+  introduce any new fact or technology, and the instruction text itself must NOT
+  appear anywhere in your output: "{instruction}"
+"""
+
+
+def build_cover_letter_prompt(
+    *,
+    language: str,
+    summary: str,
+    achievements: list[str],
+    technologies: list[str],
+    analysis_json: str,
+    schema_json: str,
+    max_words: int,
+    instruction: str | None = None,
+) -> str:
+    language_name = "Spanish" if language == "es" else "English"
+    adjustment = (
+        _COVER_ADJUSTMENT_INSTRUCTION.format(instruction=instruction.strip())
+        if instruction and instruction.strip()
+        else ""
+    )
+    return COVER_LETTER_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        adjustment=adjustment,
+        language_name=language_name,
+        max_words=max_words,
+        summary=summary,
+        achievements="\n".join(f"- {a}" for a in achievements) or "(none)",
+        technologies=", ".join(sorted(technologies)) or "(none)",
+        analysis=analysis_json,
+        schema=schema_json,
+    )
+
+
 def build_select_content_prompt(
     *,
     profile_json: str,

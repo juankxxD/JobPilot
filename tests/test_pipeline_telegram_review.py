@@ -14,16 +14,18 @@ or fail (delivery/selection) before any PDF step, so they run without native lib
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from jobpilot.channels.telegram import CallbackAction, encode_callback
 from jobpilot.config import AppConfig, Language, ProposalsConfig, Settings
+from jobpilot.documents.cover import generate_cover_letter_body
 from jobpilot.interfaces import Update
 from jobpilot.llm.prompts import build_select_content_prompt
-from jobpilot.models import ContentSelection, Job, JobAnalysis, JobStatus
+from jobpilot.llm.schemas import CoverLetterDraft
+from jobpilot.models import ContentSelection, Job, JobAnalysis, JobStatus, StoredFile
 from jobpilot.pipeline.run import (
     LAST_UPDATE_ID_KEY,
     PENDING_ADJUST_KEY,
-    _cover_letter_body,
     process_telegram_updates,
     propose_scored_jobs,
 )
@@ -78,11 +80,68 @@ def test_adjustment_instruction_flows_to_selection_prompt() -> None:
     assert "RE-SELECTING" in prompt
 
 
-def test_cover_letter_body_never_contains_instruction(example_profile: ProfileModel) -> None:
-    # The instruction is handled by the selector, so the deterministic letter body
-    # must not carry it (it is not even a parameter of the body builder).
-    body = _cover_letter_body(example_profile, language=Language.es, company="ACME Corp")
-    assert "tono más formal" not in body
+def _analysis() -> JobAnalysis:
+    return JobAnalysis(normalized_title="Backend Engineer", language=Language.es)
+
+
+def test_adjustment_changes_cover_letter_without_leaking_instruction(
+    example_profile: ProfileModel,
+) -> None:
+    # The cover letter is composed by the LLM from approved facts. An Ajustar
+    # instruction changes the composed body (a formal variant here) while the
+    # instruction text itself never appears in the output, and only approved
+    # technologies may be mentioned.
+    instruction = "haz la carta más formal"
+    selection = _valid_selection()
+    base_body = "Me entusiasma postularme y aportar mi experiencia en Java."
+    formal_body = (
+        "Me dirijo a ustedes con el mayor respeto para expresar mi interés formal "
+        "en la posición y aportar mi experiencia en Java."
+    )
+
+    base_llm = ScriptedFakeLlmClient([CoverLetterDraft(body=base_body)])
+    base = generate_cover_letter_body(
+        example_profile, _analysis(), selection, base_llm, language=Language.es, company="ACME Corp"
+    )
+
+    adjusted_llm = ScriptedFakeLlmClient([CoverLetterDraft(body=formal_body)])
+    adjusted = generate_cover_letter_body(
+        example_profile,
+        _analysis(),
+        selection,
+        adjusted_llm,
+        language=Language.es,
+        company="ACME Corp",
+        instruction=instruction,
+    )
+
+    # The letter content actually changed, and the instruction text did not leak.
+    assert base != adjusted
+    assert formal_body in adjusted
+    assert instruction not in adjusted
+    # The adjustment instruction reached the composition prompt.
+    assert any(instruction in p for p in adjusted_llm.prompts)
+
+
+def test_cover_letter_rejects_instruction_echo(example_profile: ProfileModel) -> None:
+    # A body that literally echoes the instruction is rejected; the retry supplies a
+    # clean body, which is accepted. The instruction text never reaches a document.
+    instruction = "menciona que eres proactiva"
+    selection = _valid_selection()
+    leaking = f"Soy una persona que {instruction} en cada proyecto."
+    clean = "Soy una persona orientada a resultados con experiencia en Java."
+    llm = ScriptedFakeLlmClient([CoverLetterDraft(body=leaking), CoverLetterDraft(body=clean)])
+    body = generate_cover_letter_body(
+        example_profile,
+        _analysis(),
+        selection,
+        llm,
+        language=Language.es,
+        company="ACME Corp",
+        instruction=instruction,
+    )
+    assert instruction not in body
+    assert clean in body
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +198,180 @@ def test_approve_on_scored_job_is_rejected(example_profile: ProfileModel) -> Non
 
     job = repo.get_job(1)
     assert job is not None and job.status is JobStatus.scored
+
+
+# --------------------------------------------------------------------------- #
+# P5-005 — Ajustar callbacks are subject to the same state guard
+# --------------------------------------------------------------------------- #
+def test_adjust_on_non_proposed_job_does_not_arm_marker(example_profile: ProfileModel) -> None:
+    # A crafted adjust:<id> for an applied job must be rejected WITHOUT arming the
+    # pending-adjust marker, so it cannot overwrite a valid pending adjustment.
+    repo = FakeJobRepository()
+    repo.seed_job(_scored_job(job_id=1))
+    repo.set_status(1, JobStatus.applied)
+    notifier = FakeNotifier([_callback(12, CallbackAction.adjust, 1)])
+
+    process_telegram_updates(
+        repo, notifier, example_profile, ScriptedFakeLlmClient(), FakeFileStorage(), AppConfig()
+    )
+
+    assert repo.get_state(PENDING_ADJUST_KEY) is None
+    assert "no está lista para ajustes" in notifier.last().text
+
+
+def test_adjust_on_unresolved_language_job_does_not_arm_marker(
+    example_profile: ProfileModel,
+) -> None:
+    # A proposed job still awaiting a language choice cannot be adjusted yet.
+    repo = FakeJobRepository()
+    repo.seed_job(_scored_job(job_id=1, language=None))
+    repo.set_status(1, JobStatus.proposed)
+    notifier = FakeNotifier([_callback(13, CallbackAction.adjust, 1)])
+
+    process_telegram_updates(
+        repo, notifier, example_profile, ScriptedFakeLlmClient(), FakeFileStorage(), AppConfig()
+    )
+
+    assert repo.get_state(PENDING_ADJUST_KEY) is None
+
+
+def test_adjust_on_missing_job_does_not_overwrite_valid_marker(
+    example_profile: ProfileModel,
+) -> None:
+    # A valid pending adjustment is armed for job 1; a crafted adjust for a missing
+    # job 999 must not clobber it.
+    repo = FakeJobRepository()
+    repo.seed_job(_scored_job(job_id=1))
+    repo.set_status(1, JobStatus.proposed)
+    repo.set_state(PENDING_ADJUST_KEY, "1")
+    notifier = FakeNotifier([_callback(14, CallbackAction.adjust, 999)])
+
+    process_telegram_updates(
+        repo, notifier, example_profile, ScriptedFakeLlmClient(), FakeFileStorage(), AppConfig()
+    )
+
+    assert repo.get_state(PENDING_ADJUST_KEY) == "1"
+    assert "No encontré la oferta 999" in notifier.last().text
+
+
+def test_adjust_on_valid_proposed_job_arms_marker(example_profile: ProfileModel) -> None:
+    repo = FakeJobRepository()
+    repo.seed_job(_scored_job(job_id=1, language=Language.es))
+    repo.set_status(1, JobStatus.proposed)
+    notifier = FakeNotifier([_callback(15, CallbackAction.adjust, 1)])
+
+    process_telegram_updates(
+        repo, notifier, example_profile, ScriptedFakeLlmClient(), FakeFileStorage(), AppConfig()
+    )
+
+    assert repo.get_state(PENDING_ADJUST_KEY) == "1"
+
+
+# --------------------------------------------------------------------------- #
+# P5-006 — a replayed free-text adjustment does not regenerate/resend
+# --------------------------------------------------------------------------- #
+def test_replayed_adjustment_update_is_not_reprocessed(example_profile: ProfileModel) -> None:
+    # The update that carries the free-text adjustment is claimed (checkpointed)
+    # before its effects run, so even though the status stays 'proposed' the update
+    # is never reprocessed on a replay — no second regeneration/upload/send.
+    repo = FakeJobRepository()
+    repo.seed_job(_scored_job(job_id=1, language=Language.es))
+    repo.set_status(1, JobStatus.proposed)
+    repo.set_state(PENDING_ADJUST_KEY, "1")
+
+    from tests.conftest import weasyprint_available
+
+    update = Update(update_id=42, chat_id="1", text="usa un tono más formal")
+
+    if not weasyprint_available():
+        # Without native libs the regeneration cannot render; assert the checkpoint
+        # claim happens regardless, which is what makes the replay a no-op.
+        notifier = FakeNotifier([update])
+        process_telegram_updates(
+            repo,
+            notifier,
+            example_profile,
+            ScriptedFakeLlmClient([_valid_selection(), _cover()]),
+            FakeFileStorage(),
+            AppConfig(),
+        )
+        assert repo.get_state(LAST_UPDATE_ID_KEY) == "42"
+        return
+
+    first = FakeNotifier([update])
+    summary = process_telegram_updates(
+        repo,
+        first,
+        example_profile,
+        ScriptedFakeLlmClient([_valid_selection(), _cover()]),
+        FakeFileStorage(),
+        AppConfig(),
+    )
+    assert summary.regenerated == 1
+    assert repo.get_state(LAST_UPDATE_ID_KEY) == "42"
+
+    # Replay the same update (Telegram returned it again) with the checkpoint intact.
+    replay_storage = FakeFileStorage()
+    replay = FakeNotifier([update])
+    summary = process_telegram_updates(
+        repo,
+        replay,
+        example_profile,
+        ScriptedFakeLlmClient([_valid_selection(), _cover()]),
+        replay_storage,
+        AppConfig(),
+    )
+    # The replay is skipped by the update_id guard: nothing regenerated or uploaded.
+    assert summary.processed == 0
+    assert summary.regenerated == 0
+    assert replay_storage.uploads == []
+
+
+# --------------------------------------------------------------------------- #
+# P5-010 — a transient storage failure on one proposal does not block the batch
+# --------------------------------------------------------------------------- #
+def test_storage_failure_isolated_and_keeps_job_scored(example_profile: ProfileModel) -> None:
+    from tests.conftest import weasyprint_available
+
+    if not weasyprint_available():
+        return
+
+    repo = FakeJobRepository()
+    first = repo.seed_job(_scored_job(job_id=1, company="FirstCo"))
+    second = repo.seed_job(_scored_job(job_id=2, company="SecondCo"))
+    notifier = FakeNotifier()
+    # The first upload raises a Drive-style transport error; the second succeeds.
+    storage = _FailingOnceStorage()
+    llm = ScriptedFakeLlmClient([_valid_selection(), _cover(), _valid_selection(), _cover()])
+
+    summary = propose_scored_jobs(
+        [first, second], repo, notifier, example_profile, llm, storage, AppConfig(), Settings()
+    )
+
+    # The failed job stays scored for a later retry; the second job is still proposed.
+    assert summary.proposed == 1
+    assert repo.get_job(1).status is JobStatus.scored  # type: ignore[union-attr]
+    assert repo.get_job(2).status is JobStatus.proposed  # type: ignore[union-attr]
+
+
+class _FailingOnceStorage(FakeFileStorage):
+    """A FileStorage whose first upload raises a Drive-style error, then succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._failed = False
+
+    def upload(self, path: Path, name: str) -> StoredFile:
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("drive API error")
+        return super().upload(path, name)
+
+
+def _cover() -> CoverLetterDraft:
+    return CoverLetterDraft(
+        body="Me entusiasma aportar mi experiencia en Java y Spring Boot a su equipo."
+    )
 
 
 # --------------------------------------------------------------------------- #

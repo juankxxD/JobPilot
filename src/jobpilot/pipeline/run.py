@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -29,12 +30,11 @@ from jobpilot.channels.telegram import (
     render_proposal_text,
 )
 from jobpilot.config import AppConfig, Language, Settings, get_settings
+from jobpilot.documents.cover import CoverLetterError, generate_cover_letter_body
 from jobpilot.documents.render import (
-    MAX_COVER_WORDS,
     CoverLetterTooLongError,
     CvTooLongError,
     DocumentContentError,
-    count_words,
     render_cover_letter,
     render_cv,
 )
@@ -247,35 +247,37 @@ def generate_documents(
     storage: FileStorage,
     *,
     language: Language,
-    cover_letter_body: str,
     instruction: str | None = None,
 ) -> GeneratedDocuments:
-    """Select content, render the CV + cover letter, and upload both.
+    """Select content, compose + render the CV + cover letter, and upload both.
 
-    The LLM only selects which existing profile ids to use (validated in code); the
-    cover-letter body is enforced to be <= 200 words before rendering. An optional
-    ``instruction`` (the owner's free-text Ajustar note) is passed to the selector
-    as re-selection guidance, so the regenerated CV reflects the request without the
-    instruction text ever appearing in a document. The rendered PDFs are uploaded
-    through the swappable :class:`FileStorage`, and the returned ``web_view_link``
-    values are what a later phase persists on the application. Raises on invalid
-    selection or an over-length cover letter so the caller can mark the job
-    ``error`` rather than sending an invented document.
+    The LLM only selects which existing profile ids to use for the CV (validated in
+    code) and composes the cover-letter body from approved facts only (validated in
+    code: <= 200 words, profile-only technologies, no instruction echo). An optional
+    ``instruction`` (the owner's free-text Ajustar note) guides BOTH the CV
+    re-selection and the cover-letter wording, so a tone/emphasis request such as
+    "hazla más formal" changes the actual letter while the instruction text never
+    appears in a document. The rendered PDFs are uploaded through the swappable
+    :class:`FileStorage`, and the returned ``web_view_link`` values are what a later
+    phase persists on the application. Raises on invalid selection or a
+    non-compliant cover letter so the caller can mark the job ``error`` rather than
+    sending an invented document.
     """
     import tempfile  # noqa: PLC0415 - only needed when documents are generated
 
     if job.analysis is None:
         raise ValueError("generate_documents requires an analysed job")
 
-    # Enforce the cover-letter word limit before any (WeasyPrint) rendering, so an
-    # over-length letter never reaches the PDF step regardless of document order.
-    if count_words(cover_letter_body) > MAX_COVER_WORDS:
-        raise CoverLetterTooLongError(
-            f"cover letter has {count_words(cover_letter_body)} words, "
-            f"the limit is {MAX_COVER_WORDS}"
-        )
-
     selection = select_content(job.analysis, profile, llm, language, instruction=instruction)
+    cover_letter_body = generate_cover_letter_body(
+        profile,
+        job.analysis,
+        selection,
+        llm,
+        language=language,
+        company=job.company,
+        instruction=instruction,
+    )
     cv = render_cv(profile, selection, company=job.company, role=job.title)
     cover = render_cover_letter(
         profile,
@@ -334,35 +336,6 @@ class ProposalRepository(Protocol):
     def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool: ...
 
 
-def _cover_letter_body(
-    profile: ProfileModel,
-    *,
-    language: Language,
-    company: str,
-) -> str:
-    """Compose a deterministic cover-letter body from the profile summary.
-
-    The body is built in code from an existing profile summary variant (never
-    invented) and kept within the 200-word limit. The owner's Ajustar instruction
-    is NOT written into the letter: it is handled by the content selector as
-    re-selection guidance, so the instruction text never reaches a document.
-    """
-    variant = next(iter(profile.summary_variants.values()))
-    summary = variant.text(language)
-    if language is Language.es:
-        greeting = f"Estimado equipo de {company}:"
-        closing = f"Quedo atento a sus comentarios.\n\n{profile.basics.name}"
-    else:
-        greeting = f"Dear {company} team,"
-        closing = f"I look forward to hearing from you.\n\n{profile.basics.name}"
-    parts = [greeting, summary, closing]
-    body = "\n\n".join(p for p in parts if p)
-    words = body.split()
-    if len(words) > MAX_COVER_WORDS:
-        body = " ".join(words[:MAX_COVER_WORDS])
-    return body
-
-
 def tailor_and_send_proposal(
     job: Job,
     repo: ProposalRepository,
@@ -389,14 +362,12 @@ def tailor_and_send_proposal(
     job_id = job.id
     if job_id is None:
         raise ValueError("tailor_and_send_proposal requires a persisted job with an id")
-    body = _cover_letter_body(profile, language=language, company=job.company)
     documents = generate_documents(
         job,
         profile,
         llm,
         storage,
         language=language,
-        cover_letter_body=body,
         instruction=instruction,
     )
     # Persist the resolved language on the job we render the proposal text from, but
@@ -467,36 +438,43 @@ def propose_scored_jobs(
             log.info("proposal_skipped_duplicate", job_id=job.id, company=job.company)
             continue
 
+        job_id = job.id
+        # ``partial`` binds this job eagerly, so the per-job actions below are not
+        # affected by the loop variable advancing on the next iteration.
+        mark_error = partial(repo.set_status, job_id, JobStatus.error)
         if job.language is None:
             # Send the Español/Inglés/Descartar prompt FIRST; only mark the job
             # proposed (awaiting the choice) once the prompt was delivered, so a
             # rejected prompt leaves the job 'scored' to retry rather than stranding
-            # it as proposed with no message sent.
-            try:
-                _ask_language_and_mark(repo, notifier, job)
-            except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:  # pragma: no cover - no docs here
-                log.error("proposal_generation_failed", job_id=job.id, error=str(exc))
-                repo.set_status(job.id, JobStatus.error)
-            except TelegramDeliveryError as exc:
-                log.warning("proposal_delivery_failed", job_id=job.id, error=str(exc))
-            else:
+            # it as proposed with no message sent. Any failure is isolated per job
+            # (delivery/transport retryable; a selection/content error marks error).
+            if _try_proposal(
+                job_id,
+                partial(_ask_language_and_mark, repo, notifier, job),
+                on_unrecoverable=mark_error,
+            ):
                 summary.language_prompts += 1
                 summary.proposed += 1
             continue
 
-        # Generate + deliver + persist. A selection/validation failure is
-        # unrecoverable and marks the job 'error'; a delivery failure is retryable
-        # and leaves the job 'scored'. Either way the batch continues with the rest.
-        try:
-            tailor_and_send_proposal(
-                job, repo, notifier, profile, llm, storage, language=job.language
-            )
-        except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:
-            log.error("proposal_generation_failed", job_id=job.id, error=str(exc))
-            repo.set_status(job.id, JobStatus.error)
-        except TelegramDeliveryError as exc:
-            log.warning("proposal_delivery_failed", job_id=job.id, error=str(exc))
-        else:
+        # Generate + deliver + persist. A selection/validation/content failure is
+        # unrecoverable and marks the job 'error'; a delivery, storage or render
+        # failure is retryable and leaves the job 'scored'. Either way the batch
+        # continues with the rest, and later Telegram update processing still runs.
+        if _try_proposal(
+            job_id,
+            partial(
+                tailor_and_send_proposal,
+                job,
+                repo,
+                notifier,
+                profile,
+                llm,
+                storage,
+                language=job.language,
+            ),
+            on_unrecoverable=mark_error,
+        ):
             summary.proposed += 1
 
     log.info(
@@ -514,6 +492,7 @@ def propose_scored_jobs(
 # retryable condition (the job keeps its prior state).
 _UNRECOVERABLE_DOCUMENT_ERRORS = (
     SelectionError,
+    CoverLetterError,
     CoverLetterTooLongError,
     CvTooLongError,
     DocumentContentError,
@@ -541,10 +520,19 @@ def _try_proposal(
 ) -> bool:
     """Run a proposal ``action`` for one job, isolating its failure from the batch.
 
-    Returns ``True`` when the action completed. An unrecoverable selection/validation
-    failure runs ``on_unrecoverable`` (used to mark the job ``error``); a retryable
-    Telegram delivery failure is logged and left for a later run. Either way the
-    exception never aborts processing of the remaining jobs.
+    Returns ``True`` when the action completed. Three failure classes are handled so
+    one bad job never aborts the rest of the batch (or the later Telegram update
+    processing):
+
+    * an unrecoverable selection/validation/content failure runs
+      ``on_unrecoverable`` (used to mark the job ``error``) — the selection can never
+      produce a valid document, so retrying is pointless;
+    * a retryable Telegram delivery failure is logged and the job keeps its prior
+      state for a later run;
+    * any OTHER failure (a Drive/storage API error, a transient WeasyPrint render
+      failure, an unexpected transport error) is treated as retryable too: it is
+      logged and the job keeps its prior state, so a single transient upload/render
+      error does not stop later proposals or queued approvals.
     """
     try:
         action()
@@ -555,6 +543,9 @@ def _try_proposal(
         return False
     except TelegramDeliveryError as exc:
         log.warning("proposal_delivery_failed", job_id=job_id, error=str(exc))
+        return False
+    except Exception as exc:  # noqa: BLE001 - keep prior state, isolate from the batch
+        log.warning("proposal_retryable_failure", job_id=job_id, error=str(exc))
         return False
     return True
 
@@ -589,10 +580,19 @@ def process_telegram_updates(
     replayed update (for example after a crash between the effect and the checkpoint)
     finds the job already in its new state and makes no further change.
 
-    Each handled owner update advances ``last_update_id`` before the next. After the
-    batch, the cursor is advanced to the highest *raw* update id Telegram returned —
-    including ignored non-owner updates — so a batch made only of unauthorized
-    messages still moves forward and can never starve a later owner update.
+    The checkpoint is advanced to the current update's id BEFORE its handler runs
+    (a durable claim), so every update's external effects — document uploads and
+    Telegram sends included — happen at most once. This is what makes the free-text
+    Ajustar path idempotent: it changes documents and sends messages without
+    changing the job status, so re-running it would NOT be a no-op; claiming the
+    update first guarantees a crash after delivery never replays that adjustment.
+    Status-changing actions remain idempotent on their own via the eligible-state
+    guard, so a Telegram-side replay before the claim persisted is still safe.
+
+    After the batch, the cursor is advanced to the highest *raw* update id Telegram
+    returned — including ignored non-owner updates — so a batch made only of
+    unauthorized messages still moves forward and can never starve a later owner
+    update.
     """
     summary = TelegramRunSummary()
     last_raw = repo.get_state(LAST_UPDATE_ID_KEY)
@@ -604,10 +604,14 @@ def process_telegram_updates(
     for update in updates:
         if last_update_id is not None and update.update_id <= last_update_id:
             continue
-        intent = parse_intent(update)
-        _handle_intent(intent, repo, notifier, profile, llm, storage, config, summary)
+        # Claim the update durably BEFORE running its effects: advancing the cursor
+        # first makes each update_id processed at most once, so a crash after a
+        # delivery (notably a free-text adjustment, which does not change status)
+        # never regenerates, re-uploads, or re-sends on the next run.
         last_update_id = update.update_id
         repo.set_state(LAST_UPDATE_ID_KEY, str(last_update_id))
+        intent = parse_intent(update)
+        _handle_intent(intent, repo, notifier, profile, llm, storage, config, summary)
         summary.processed += 1
 
     # Advance past ignored non-owner updates so they are never re-fetched forever.
@@ -775,8 +779,33 @@ def _handle_adjust_request(
     repo: ProposalRepository,
     notifier: Notifier,
 ) -> None:
+    """Arm a pending free-text adjustment, but only for a valid target job.
+
+    Like the other callbacks, this validates the job state before mutating any
+    state: only an existing, language-resolved ``proposed`` job can be adjusted.
+    A stale or crafted ``adjust:<id>`` for an applied, discarded, scored, missing,
+    or unresolved-language job is rejected WITHOUT touching ``PENDING_ADJUST_KEY``,
+    so it can never overwrite a valid pending adjustment or arm an adjustment for an
+    ineligible job.
+    """
     if intent.job_id is None:
         notifier.send_message("No pude identificar la oferta a ajustar.")
+        return
+    job = repo.get_job(intent.job_id)
+    if job is None:
+        notifier.send_message(f"No encontré la oferta {intent.job_id}.")
+        return
+    if job.status is not JobStatus.proposed or job.language is None:
+        log.info(
+            "telegram_stale_adjust_ignored",
+            job_id=intent.job_id,
+            current=job.status.value,
+            language=job.language.value if job.language else None,
+        )
+        notifier.send_message(
+            f"La oferta {intent.job_id} no está lista para ajustes "
+            f"(estado actual: {_STATUS_LABELS[job.status]})."
+        )
         return
     repo.set_state(PENDING_ADJUST_KEY, str(intent.job_id))
     notifier.send_message(

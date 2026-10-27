@@ -23,10 +23,25 @@ from jobpilot.models import JobAnalysis, JobScore
 __all__ = [
     "ConfirmLanguage",
     "ConfirmedLanguage",
+    "CoverLetterDraft",
     "CvImportResult",
     "JobAnalysis",
     "JobScore",
 ]
+
+
+class CoverLetterDraft(BaseModel):
+    """A cover-letter body the LLM composes from approved profile facts only.
+
+    The LLM only rewrites/arranges facts already present in the profile summary and
+    selected achievements; it never invents a new fact or technology. The resulting
+    ``body`` is validated in code (word limit, profile-only technologies, and that
+    the owner's free-text instruction is never echoed) before it reaches a document,
+    so an ``Ajustar`` instruction such as "make it more formal" can change the
+    wording without leaking the instruction text or fabricating content.
+    """
+
+    body: str = Field(min_length=1)
 
 
 class ConfirmedLanguage(StrEnum):

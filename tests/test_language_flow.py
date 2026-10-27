@@ -5,6 +5,7 @@ from __future__ import annotations
 from jobpilot.channels.telegram import CallbackAction, encode_callback
 from jobpilot.config import AppConfig, Language, Settings
 from jobpilot.interfaces import Update
+from jobpilot.llm.schemas import CoverLetterDraft
 from jobpilot.models import ContentSelection, Job, JobAnalysis, JobStatus
 from jobpilot.pipeline.run import (
     PENDING_ADJUST_KEY,
@@ -38,6 +39,12 @@ def _selection(language: Language) -> ContentSelection:
         project_ids=[],
         highlighted_skill_ids=[],
         language=language,
+    )
+
+
+def _cover() -> CoverLetterDraft:
+    return CoverLetterDraft(
+        body="Me entusiasma postularme y aportar mi experiencia en Java a su equipo."
     )
 
 
@@ -81,7 +88,7 @@ def test_choosing_language_advances_and_generates_documents(
     notifier = FakeNotifier(
         [Update(update_id=5, chat_id="1", callback_data=encode_callback(CallbackAction.lang_es, 1))]
     )
-    llm = ScriptedFakeLlmClient([_selection(Language.es)])
+    llm = ScriptedFakeLlmClient([_selection(Language.es), _cover()])
     storage = FakeFileStorage()
 
     process_telegram_updates(repo, notifier, example_profile, llm, storage, AppConfig())
@@ -109,7 +116,7 @@ def test_adjust_captures_instruction_then_regenerates(example_profile: ProfileMo
             Update(update_id=8, chat_id="1", text="usa un tono más formal"),
         ]
     )
-    llm = ScriptedFakeLlmClient([_selection(Language.es)])
+    llm = ScriptedFakeLlmClient([_selection(Language.es), _cover()])
     storage = FakeFileStorage()
 
     process_telegram_updates(repo, notifier, example_profile, llm, storage, AppConfig())

@@ -306,8 +306,25 @@ class TelegramNotifier:
             ]
         }
 
+    def _request(self, method: str, **kwargs: Any) -> Any:
+        """POST to a Bot API method, normalising any transport error.
+
+        A raw transport failure (timeout, connection reset, non-2xx raised by the
+        HTTP client) is caught and re-raised as :class:`TelegramDeliveryError`, the
+        single retryable-delivery signal the pipeline understands. Without this a
+        transient network error would escape the proposal boundary and abort the
+        whole run, blocking every later proposal and all queued approvals/commands.
+        """
+        try:
+            return self._http.post(self._url(method), **kwargs)
+        except TelegramDeliveryError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalise every transport failure
+            log.warning("telegram_transport_error", method=method, error=str(exc))
+            raise TelegramDeliveryError(f"Telegram {method} transport error: {exc}") from exc
+
     def _post(self, method: str, payload: dict[str, Any]) -> None:
-        resp = self._http.post(self._url(method), json=payload)
+        resp = self._request(method, json=payload)
         data = resp.json()
         if not data.get("ok", False):
             log.warning("telegram_api_error", method=method, response=data)
@@ -323,8 +340,8 @@ class TelegramNotifier:
         files = {
             "document": (attachment.filename, attachment.content, attachment.mime_type),
         }
-        resp = self._http.post(
-            self._url("sendDocument"),
+        resp = self._request(
+            "sendDocument",
             data={k: v for k, v in payload.items() if k != "document"},
             files=files,
         )
@@ -371,7 +388,13 @@ class TelegramNotifier:
         payload: dict[str, Any] = {}
         if offset is not None:
             payload["offset"] = offset
-        resp = self._http.post(self._url("getUpdates"), json=payload)
+        try:
+            resp = self._request("getUpdates", json=payload)
+        except TelegramDeliveryError as exc:
+            # A transient getUpdates transport failure yields no updates this run
+            # instead of aborting it; the cursor is untouched so the next run retries.
+            log.warning("telegram_get_updates_transport_error", error=str(exc))
+            return UpdateBatch(updates=[], highest_update_id=None)
         data = resp.json()
         if not data.get("ok", False):
             log.warning("telegram_get_updates_error", response=data)
