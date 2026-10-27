@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from jobpilot.config import Language, LanguageConfig
 from jobpilot.language import detect_language
-from jobpilot.llm.schemas import ConfirmLanguage
+from jobpilot.llm.schemas import ConfirmedLanguage, ConfirmLanguage
 from tests.fakes import ScriptedFakeLlmClient
 
 _CONFIG = LanguageConfig(min_confidence=0.80)
@@ -71,7 +71,7 @@ def test_clear_english_detected_without_llm() -> None:
 
 def test_low_confidence_calls_llm_and_accepts() -> None:
     detector = _FakeDetector([_Conf(_lingua_spanish(), 0.55), _Conf(_lingua_english(), 0.45)])
-    llm = ScriptedFakeLlmClient([ConfirmLanguage(language=Language.es, confidence=0.95)])
+    llm = ScriptedFakeLlmClient([ConfirmLanguage(language=ConfirmedLanguage.es, confidence=0.95)])
     result = detect_language("ambiguous text", _CONFIG, llm, detector=detector)
     assert result is Language.es
     assert len(llm.prompts) == 1
@@ -79,8 +79,25 @@ def test_low_confidence_calls_llm_and_accepts() -> None:
 
 def test_low_confidence_llm_still_ambiguous_returns_none() -> None:
     detector = _FakeDetector([_Conf(_lingua_english(), 0.52), _Conf(_lingua_spanish(), 0.48)])
-    llm = ScriptedFakeLlmClient([ConfirmLanguage(language=Language.en, confidence=0.40)])
+    llm = ScriptedFakeLlmClient([ConfirmLanguage(language=ConfirmedLanguage.en, confidence=0.40)])
     result = detect_language("ambiguous text", _CONFIG, llm, detector=detector)
+    assert result is None
+    assert len(llm.prompts) == 1
+
+
+def test_low_confidence_unsupported_llm_answers_other_returns_none() -> None:
+    """A low-confidence unsupported result reaches the LLM, which answers 'other'.
+
+    The LLM must be allowed to decline es/en; its 'other' answer maps to None so the
+    offer is never forced into a supported language.
+    """
+    # lingua's best is an unsupported language at sub-threshold confidence (mapped to
+    # None by _detect_with_confidence), so the LLM confirmation is consulted.
+    detector = _FakeDetector([_Conf(_Lang("GERMAN"), 0.62), _Conf(_lingua_english(), 0.20)])
+    llm = ScriptedFakeLlmClient(
+        [ConfirmLanguage(language=ConfirmedLanguage.other, confidence=0.99)]
+    )
+    result = detect_language("Softwareentwickler Java", _CONFIG, llm, detector=detector)
     assert result is None
     assert len(llm.prompts) == 1
 

@@ -66,3 +66,5 @@ def test_confirm_language_prompt_has_anti_invention_and_text() -> None:
     prompt = build_confirm_language_prompt(text="Buscamos ingeniero backend", schema_json="{}")
     assert _ANCHOR in prompt
     assert "Buscamos ingeniero backend" in prompt
+    # The model may decline es/en with "other" so unsupported offers are not forced.
+    assert '"other"' in prompt

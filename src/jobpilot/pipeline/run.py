@@ -117,8 +117,10 @@ def score_new_jobs(
     :func:`jobpilot.language.detect_language` (lingua, with the LLM confirmation
     step on low-confidence offers), so the deterministic detector and the
     configured ``language.min_confidence`` threshold drive the persisted language.
-    A ``None`` result is preserved — the job keeps whatever language the source
-    declared and stays ambiguous for the later Telegram language-choice flow.
+    A ``None`` result is persisted as the unresolved state (the language is cleared,
+    even when the source declared one), leaving the job ambiguous for the later
+    Telegram Español/Inglés/Descartar choice flow rather than silently committing to
+    a possibly wrong source-declared language.
 
     A job that scores at or above ``MIN_SCORE`` becomes ``scored``; one below the
     threshold is still persisted as ``scored`` but flagged (its score is below
@@ -139,15 +141,16 @@ def score_new_jobs(
             continue
 
         summary.analyzed += 1
+        # The detector (lingua + optional LLM confirmation) is authoritative here.
+        # A None result means the language is unresolved; persist it as None so the
+        # offer reaches the Telegram choice flow, instead of restoring a possibly
+        # wrong source-declared language.
         detected = detect_language(_offer_text(job), config.language, llm)
-        # Preserve None (ambiguous) for the Telegram choice flow; only overwrite the
-        # stored language when detection resolved it to a supported language.
-        language = detected if detected is not None else job.language
         above = passes_threshold(score.score, active_settings.min_score)
         updated = job.model_copy(
             update={
                 "analysis": analysis,
-                "language": language,
+                "language": detected,
                 "score": score.score,
                 "score_reason": "; ".join(score.reasons) or None,
                 "missing_requirements": score.missing_requirements,

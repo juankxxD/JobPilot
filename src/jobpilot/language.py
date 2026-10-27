@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from jobpilot.config import Language, LanguageConfig
 from jobpilot.llm.prompts import build_confirm_language_prompt
-from jobpilot.llm.schemas import ConfirmLanguage
+from jobpilot.llm.schemas import ConfirmedLanguage, ConfirmLanguage
 from jobpilot.logging import get_logger
 
 if TYPE_CHECKING:
@@ -24,8 +24,12 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# Only Spanish and English are supported offer languages.
-_SUPPORTED = (Language.es, Language.en)
+# Maps the confirmation LLM's answer to a supported language, or ``None`` when the
+# model says the offer is written in neither Spanish nor English ("other").
+_CONFIRMED_TO_LANGUAGE: dict[ConfirmedLanguage, Language] = {
+    ConfirmedLanguage.es: Language.es,
+    ConfirmedLanguage.en: Language.en,
+}
 
 
 def _build_detector() -> object:
@@ -118,15 +122,22 @@ def detect_language(
         log.warning("language_confirm_failed", error=str(exc))
         return None
 
-    if confirmed.language in _SUPPORTED and confirmed.confidence >= config.min_confidence:
+    mapped = _CONFIRMED_TO_LANGUAGE.get(confirmed.language)
+    if mapped is not None and confirmed.confidence >= config.min_confidence:
         log.info(
             "language_confirmed_by_llm",
-            language=confirmed.language.value,
+            language=mapped.value,
             confidence=round(confirmed.confidence, 3),
         )
-        return confirmed.language
+        return mapped
 
-    log.info("language_ambiguous", llm_confidence=round(confirmed.confidence, 3))
+    # The LLM answered "other" (unsupported), or was not confident enough: stay
+    # ambiguous so the Telegram Español/Inglés/Descartar choice flow takes over.
+    log.info(
+        "language_ambiguous",
+        llm_answer=confirmed.language.value,
+        llm_confidence=round(confirmed.confidence, 3),
+    )
     return None
 
 

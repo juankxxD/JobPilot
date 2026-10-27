@@ -67,6 +67,20 @@ def test_compute_weighted_score_partial() -> None:
     assert compute_weighted_score(dims, weights) == 60
 
 
+def _dims(**overrides: float) -> ScoreDimensions:
+    """Build ScoreDimensions with every field defaulting to 0, overriding some."""
+    base: dict[str, float] = {
+        "required_stack": 0.0,
+        "seniority_and_years": 0.0,
+        "modality_and_timezone": 0.0,
+        "language": 0.0,
+        "salary_and_conditions": 0.0,
+        "other": 0.0,
+    }
+    base.update(overrides)
+    return ScoreDimensions(**base)
+
+
 def test_custom_weights_change_result() -> None:
     weights = ScoringWeights(
         required_stack=10,
@@ -76,7 +90,7 @@ def test_custom_weights_change_result() -> None:
         salary_and_conditions=10,
         other=50,
     )
-    dims = ScoreDimensions(other=100)
+    dims = _dims(other=100)
     assert compute_weighted_score(dims, weights) == 50
 
 
@@ -107,7 +121,7 @@ def test_analyze_and_score_uses_configured_weights(example_profile: ProfileModel
     # The LLM reports a misleading aggregate of 100; only "other" scores highly.
     score = JobScore(
         score=100,
-        dimensions=ScoreDimensions(other=80),
+        dimensions=_dims(other=80),
         met_requirements=[MetRequirement(requirement="Java", achievement_id="ach_acme_latency")],
         recommendation=Recommendation.apply,
     )
@@ -133,11 +147,13 @@ def test_analyze_and_score_retries_on_invalid_id(example_profile: ProfileModel) 
     analysis = JobAnalysis(normalized_title="Backend", language=None)
     bad = JobScore(
         score=80,
+        dimensions=_dims(),
         met_requirements=[MetRequirement(requirement="Java", achievement_id="ach_made_up")],
         recommendation=Recommendation.apply,
     )
     good = JobScore(
         score=80,
+        dimensions=_dims(),
         met_requirements=[MetRequirement(requirement="Java", achievement_id="ach_acme_latency")],
         recommendation=Recommendation.apply,
     )
@@ -159,6 +175,7 @@ def test_analyze_and_score_raises_after_retry(example_profile: ProfileModel) -> 
     analysis = JobAnalysis(normalized_title="Backend", language=None)
     bad = JobScore(
         score=80,
+        dimensions=_dims(),
         met_requirements=[MetRequirement(requirement="Java", achievement_id="ach_nope")],
         recommendation=Recommendation.apply,
     )

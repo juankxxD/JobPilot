@@ -6,9 +6,9 @@ needs the CV-import schema; later phases add analyze/score/select/cover schemas.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from enum import StrEnum
 
-from jobpilot.config import Language
+from pydantic import BaseModel, Field
 
 # The analysis and scoring LLM calls reuse the domain models in ``models.py``
 # (``JobAnalysis`` and ``JobScore``), which are already shaped as the structured
@@ -22,16 +22,31 @@ from jobpilot.models import JobAnalysis, JobScore
 
 __all__ = [
     "ConfirmLanguage",
+    "ConfirmedLanguage",
     "CvImportResult",
     "JobAnalysis",
     "JobScore",
 ]
 
 
+class ConfirmedLanguage(StrEnum):
+    """What the confirmation LLM may answer: a supported language or ``other``.
+
+    ``other`` lets the model say the offer is written in neither Spanish nor
+    English, so an unsupported offer is never forced into es/en. It maps to a
+    ``None`` detection result, which routes the offer to the Telegram
+    language-choice flow instead of persisting a wrong language.
+    """
+
+    es = "es"
+    en = "en"
+    other = "other"
+
+
 class ConfirmLanguage(BaseModel):
     """LLM confirmation of an offer's language when detection is low-confidence."""
 
-    language: Language
+    language: ConfirmedLanguage
     confidence: float = Field(ge=0.0, le=1.0)
 
 

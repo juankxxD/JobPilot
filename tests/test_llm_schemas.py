@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from jobpilot.config import Language
-from jobpilot.llm.schemas import ConfirmLanguage, JobAnalysis, JobScore
+from jobpilot.llm.schemas import ConfirmedLanguage, ConfirmLanguage, JobAnalysis, JobScore
 from jobpilot.models import Recommendation
 
 Fixture = Callable[[str], Any]
@@ -34,15 +34,37 @@ def test_job_score_parses_fixture(load_fixture: Fixture) -> None:
     assert score.met_requirements[0].achievement_id == "ach_acme_latency"
 
 
-def test_job_score_rejects_out_of_range() -> None:
+def test_job_score_rejects_out_of_range(load_fixture: Fixture) -> None:
+    payload = load_fixture("llm_score_en.json")
+    payload["score"] = 150
     with pytest.raises(ValidationError):
-        JobScore.model_validate({"score": 150, "recommendation": "apply"})
+        JobScore.model_validate(payload)
+
+
+def test_job_score_rejects_missing_dimensions() -> None:
+    """A response without a dimension breakdown must not validate (no silent zeros)."""
+    with pytest.raises(ValidationError):
+        JobScore.model_validate({"score": 99, "recommendation": "apply"})
+
+
+def test_job_score_rejects_partial_dimensions(load_fixture: Fixture) -> None:
+    """A partial breakdown (a dimension omitted) must be rejected, not zero-filled."""
+    payload = load_fixture("llm_score_en.json")
+    del payload["dimensions"]["other"]
+    with pytest.raises(ValidationError):
+        JobScore.model_validate(payload)
 
 
 def test_confirm_language_parses() -> None:
     confirmed = ConfirmLanguage.model_validate({"language": "es", "confidence": 0.9})
-    assert confirmed.language is Language.es
+    assert confirmed.language is ConfirmedLanguage.es
     assert confirmed.confidence == 0.9
+
+
+def test_confirm_language_accepts_other() -> None:
+    """The confirmation LLM may answer 'other' for an unsupported language."""
+    confirmed = ConfirmLanguage.model_validate({"language": "other", "confidence": 0.9})
+    assert confirmed.language is ConfirmedLanguage.other
 
 
 def test_confirm_language_rejects_bad_confidence() -> None:

@@ -149,7 +149,10 @@ You are identifying the natural language a job offer is written in.
 {anti_invention}
 
 Instructions:
-- Answer with the dominant language of the text: "es" (Spanish) or "en" (English).
+- Answer with the dominant language of the text: "es" (Spanish), "en" (English),
+  or "other" if the text is written in neither Spanish nor English.
+- Never force an offer written in another language into "es" or "en"; answer
+  "other" in that case so it is routed to a manual choice.
 - "confidence" is a number between 0 and 1 reflecting how sure you are.
 - Decide only from the text below; do not guess from the company or location.
 

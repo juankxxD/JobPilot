@@ -102,15 +102,16 @@ class ScoreDimensions(BaseModel):
     These map one-to-one to :class:`~jobpilot.config.ScoringWeights`. The persisted
     aggregate score is computed in code from these values and the configured
     weights, so the weighting is deterministic and never trusts an LLM-provided
-    aggregate.
+    aggregate. Every dimension is required: an omitted or partial breakdown must be
+    rejected so the scorer never silently weights missing fields as zero.
     """
 
-    required_stack: float = Field(ge=0.0, le=100.0, default=0.0)
-    seniority_and_years: float = Field(ge=0.0, le=100.0, default=0.0)
-    modality_and_timezone: float = Field(ge=0.0, le=100.0, default=0.0)
-    language: float = Field(ge=0.0, le=100.0, default=0.0)
-    salary_and_conditions: float = Field(ge=0.0, le=100.0, default=0.0)
-    other: float = Field(ge=0.0, le=100.0, default=0.0)
+    required_stack: float = Field(ge=0.0, le=100.0)
+    seniority_and_years: float = Field(ge=0.0, le=100.0)
+    modality_and_timezone: float = Field(ge=0.0, le=100.0)
+    language: float = Field(ge=0.0, le=100.0)
+    salary_and_conditions: float = Field(ge=0.0, le=100.0)
+    other: float = Field(ge=0.0, le=100.0)
 
 
 class JobScore(BaseModel):
@@ -120,10 +121,13 @@ class JobScore(BaseModel):
     ``score`` is computed in code from those dimensions and the configured weights
     (see :func:`jobpilot.scoring.scorer.compute_weighted_score`). ``score`` defaults
     to 0 and is overwritten by the scorer, so the LLM's own aggregate is never used.
+    ``dimensions`` is required: a response that omits it (or any dimension field) is
+    rejected by Pydantic and enters the ``complete_json`` schema-retry/fallback path
+    rather than being silently scored as zero.
     """
 
     score: int = Field(ge=0, le=100, default=0)
-    dimensions: ScoreDimensions = Field(default_factory=ScoreDimensions)
+    dimensions: ScoreDimensions
     reasons: list[str] = Field(default_factory=list)
     met_requirements: list[MetRequirement] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)

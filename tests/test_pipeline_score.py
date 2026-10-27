@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from jobpilot.config import AppConfig, Language, LanguageConfig, Settings
-from jobpilot.llm.schemas import ConfirmLanguage
+from jobpilot.llm.schemas import ConfirmedLanguage, ConfirmLanguage
 from jobpilot.models import (
     Job,
     JobAnalysis,
@@ -85,7 +85,7 @@ def test_low_confidence_offer_invokes_language_confirmation(
         [
             JobAnalysis.model_validate(load_fixture("llm_analysis_en.json")),
             JobScore.model_validate(load_fixture("llm_score_en.json")),
-            ConfirmLanguage(language=Language.en, confidence=1.0),
+            ConfirmLanguage(language=ConfirmedLanguage.en, confidence=1.0),
         ]
     )
 
@@ -139,6 +139,14 @@ def test_unrecoverable_llm_failure_marks_error(
     analysis = JobAnalysis.model_validate(load_fixture("llm_analysis_en.json"))
     bad = JobScore(
         score=80,
+        dimensions=ScoreDimensions(
+            required_stack=0,
+            seniority_and_years=0,
+            modality_and_timezone=0,
+            language=0,
+            salary_and_conditions=0,
+            other=0,
+        ),
         met_requirements=[MetRequirement(requirement="Java", achievement_id="ach_unknown")],
         recommendation=Recommendation.apply,
     )
@@ -165,3 +173,83 @@ def test_non_new_jobs_are_skipped(example_profile: ProfileModel, load_fixture: F
     assert summary.scored == 0
     assert summary.analyzed == 0
     assert llm.prompts == []
+
+
+def test_low_confidence_unsupported_offer_stays_unresolved(
+    example_profile: ProfileModel, load_fixture: Fixture
+) -> None:
+    """A terse offer in an unsupported language must not be forced into es/en.
+
+    lingua gives only a weak (sub-threshold) signal for the short text, so the
+    confirmation LLM is consulted; it answers ``other`` (unsupported), which maps to
+    ``None`` so the job reaches the Telegram choice flow instead of persisting es/en.
+    """
+    repo = FakeJobRepository()
+    raw = {
+        "source": "remoteok",
+        "external_id": "rok-de-001",
+        "url": "https://remoteok.com/remote-jobs/softwareentwickler-de-001",
+        "title": "Softwareentwickler Java",
+        "company": "Terse GmbH",
+        "remote": True,
+        "language": None,
+        "description": "",
+    }
+    job = _persist_raw(repo, raw)
+
+    config = AppConfig(language=LanguageConfig(min_confidence=0.80))
+    llm = ScriptedFakeLlmClient(
+        [
+            JobAnalysis.model_validate(load_fixture("llm_analysis_en.json")),
+            JobScore.model_validate(load_fixture("llm_score_en.json")),
+            ConfirmLanguage(language=ConfirmedLanguage.other, confidence=0.95),
+        ]
+    )
+
+    summary = score_new_jobs([job], repo, example_profile, llm, config, Settings(min_score=70))
+    assert summary.scored == 1
+    stored = repo.get_job(job.id)  # type: ignore[arg-type]
+    assert stored is not None
+    # Unsupported -> unresolved: language stays None for the Telegram choice flow.
+    assert stored.language is None
+    assert any("identifying the natural language" in p for p in llm.prompts)
+
+
+def test_unresolved_detection_clears_source_declared_language(
+    example_profile: ProfileModel, load_fixture: Fixture
+) -> None:
+    """A None detection result is persisted as unresolved even if the source declared one.
+
+    The source said 'es', but the detector cannot resolve the terse text (LLM answers
+    'other'); the pipeline must persist None, not restore the source-declared language,
+    so the Telegram guard still fires.
+    """
+    repo = FakeJobRepository()
+    raw = {
+        "source": "remoteok",
+        "external_id": "rok-conflict-001",
+        "url": "https://remoteok.com/remote-jobs/conflict-001",
+        "title": "Softwareentwickler Java",
+        "company": "Conflict Co",
+        "remote": True,
+        "language": "es",  # source declared Spanish
+        "description": "",
+    }
+    job = _persist_raw(repo, raw)
+    assert job.language is Language.es  # source-declared language persisted on collect
+
+    config = AppConfig(language=LanguageConfig(min_confidence=0.80))
+    llm = ScriptedFakeLlmClient(
+        [
+            JobAnalysis.model_validate(load_fixture("llm_analysis_en.json")),
+            JobScore.model_validate(load_fixture("llm_score_en.json")),
+            ConfirmLanguage(language=ConfirmedLanguage.other, confidence=0.95),
+        ]
+    )
+
+    summary = score_new_jobs([job], repo, example_profile, llm, config, Settings(min_score=70))
+    assert summary.scored == 1
+    stored = repo.get_job(job.id)  # type: ignore[arg-type]
+    assert stored is not None
+    # The unresolved detection clears the source-declared 'es'; no silent commit.
+    assert stored.language is None
