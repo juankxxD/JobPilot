@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from datetime import date
 from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel
 
-from jobpilot.models import Application, Job, JobStatus, RawJob, StoredFile
+from jobpilot.interfaces import Button, Update
+from jobpilot.models import Application, Attachment, Job, JobStatus, RawJob, StoredFile
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -162,6 +164,48 @@ class FakeJobRepository:
     def set_state(self, key: str, value: str) -> None:
         self._state[key] = value
 
+    # Proposal guards (mirror NeonJobRepository helpers, assumption A3) -- #
+    def count_applications_on(self, day: date) -> int:
+        """Count applications whose ``applied_at`` falls on ``day``."""
+        return sum(
+            1
+            for app in self._applications
+            if app.applied_at is not None and app.applied_at.date() == day
+        )
+
+    def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool:
+        """Return whether a job for the same company+role was already proposed/applied.
+
+        The in-memory fake does not track timestamps per status change, so
+        ``within_days`` is accepted for parity with the concrete repository and the
+        guard treats any proposed/applied/approved job with the same company and
+        role as a recent duplicate.
+        """
+        seen = {JobStatus.proposed, JobStatus.approved, JobStatus.applied}
+        return any(
+            job.company == company and job.title == role and job.status in seen
+            for job in self._jobs.values()
+        )
+
+    def list_proposed(self) -> list[Job]:
+        """Return every job currently in the ``proposed`` status."""
+        return [job for job in self._jobs.values() if job.status is JobStatus.proposed]
+
+    def seed_job(self, job: Job) -> Job:
+        """Insert a fully-formed ``Job`` directly (test helper for later phases).
+
+        Phases after collection start from jobs already scored/proposed; this stores
+        such a job and registers its dedupe keys without going through ``upsert_job``.
+        """
+        if job.id is None:
+            job = job.model_copy(update={"id": self._next_job_id})
+        assert job.id is not None
+        self._jobs[job.id] = job
+        self._by_source_external[(job.source, job.external_id)] = job.id
+        self._by_url[job.url] = job.id
+        self._next_job_id = max(self._next_job_id, job.id + 1)
+        return job
+
     # Test conveniences ------------------------------------------------- #
     @property
     def jobs(self) -> list[Job]:
@@ -213,3 +257,58 @@ class FakeFileStorage:
             name=name,
             web_view_link=f"{self._base_url}/{file_id}",
         )
+
+
+class SentMessage(BaseModel):
+    """A record of one :meth:`FakeNotifier.send_message` call."""
+
+    text: str
+    buttons: list[Button] = []
+    attachments: list[str] = []
+
+
+class FakeNotifier:
+    """A Notifier that records sent messages and returns scripted updates.
+
+    Records each ``send_message`` (text, buttons and attachment filenames) so tests
+    can assert on the Spanish copy and the inline keyboard, and replays a queued
+    list of :class:`Update` objects, honouring the ``offset`` so already-acknowledged
+    updates are not returned twice (mirroring Telegram's ``getUpdates`` contract).
+    """
+
+    def __init__(self, updates: Iterable[Update] = ()) -> None:
+        self.messages: list[SentMessage] = []
+        self._updates: list[Update] = list(updates)
+        self.get_updates_calls: list[int | None] = []
+
+    def queue_updates(self, *updates: Update) -> None:
+        self._updates.extend(updates)
+
+    def send_message(
+        self,
+        text: str,
+        buttons: Sequence[Button] | None = None,
+        attachments: Sequence[Attachment] | None = None,
+    ) -> None:
+        self.messages.append(
+            SentMessage(
+                text=text,
+                buttons=list(buttons or ()),
+                attachments=[a.filename for a in (attachments or ())],
+            )
+        )
+
+    def get_updates(self, offset: int | None = None) -> list[Update]:
+        self.get_updates_calls.append(offset)
+        if offset is None:
+            return list(self._updates)
+        return [u for u in self._updates if u.update_id >= offset]
+
+    # Test conveniences ------------------------------------------------- #
+    @property
+    def callback_values(self) -> list[str]:
+        """Every ``callback_data`` across all buttons sent, in order."""
+        return [b.callback_data for msg in self.messages for b in msg.buttons]
+
+    def last(self) -> SentMessage:
+        return self.messages[-1]
