@@ -1,0 +1,14 @@
+{
+  "normalized_title": "Ingeniero Backend",
+  "seniority": "semi-senior",
+  "required_stack": ["Java", "Spring Boot", "PostgreSQL", "AWS"],
+  "nice_to_have_stack": ["Kafka"],
+  "years_required": 4,
+  "language": "es",
+  "modality": "remote",
+  "timezone": "LATAM",
+  "salary": "USD 4000 - 5000 mensuales",
+  "contact_email": "talento@fintechlatam.example",
+  "apply_platform": null,
+  "red_flags": []
+}

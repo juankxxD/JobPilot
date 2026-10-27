@@ -16,15 +16,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from jobpilot.config import AppConfig
+from jobpilot.config import AppConfig, Settings, get_settings
 from jobpilot.filters.prefilter import prefilter
 from jobpilot.logging import get_logger
-from jobpilot.models import JobStatus
+from jobpilot.models import Job, JobStatus
+from jobpilot.scoring.scorer import analyze_and_score, passes_threshold
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from jobpilot.interfaces import JobRepository, JobSource
+    from jobpilot.interfaces import JobRepository, JobSource, LlmClient
+    from jobpilot.profile.model import ProfileModel
 
 log = get_logger(__name__)
 
@@ -81,5 +83,71 @@ def collect_and_persist(
         filtered_out=summary.filtered_out,
         kept_new=summary.kept_new,
         source_errors=list(summary.source_errors),
+    )
+    return summary
+
+
+@dataclass(slots=True)
+class ScoreSummary:
+    """Counts returned by :func:`score_new_jobs`."""
+
+    analyzed: int = 0
+    scored: int = 0
+    below_threshold: int = 0
+    errors: int = 0
+
+
+def score_new_jobs(
+    jobs: Sequence[Job],
+    repo: JobRepository,
+    profile: ProfileModel,
+    llm: LlmClient,
+    config: AppConfig,
+    settings: Settings | None = None,
+) -> ScoreSummary:
+    """Analyse and score each ``new`` job, persisting analysis, score and status.
+
+    A job that scores at or above ``MIN_SCORE`` becomes ``scored``; one below the
+    threshold is still persisted as ``scored`` but flagged (its score is below
+    ``MIN_SCORE``). An unrecoverable LLM/validation failure marks the job ``error``.
+    Jobs not in ``new`` are skipped so reruns are idempotent.
+    """
+    active_settings = settings or get_settings()
+    summary = ScoreSummary()
+    for job in jobs:
+        if job.id is None or job.status != JobStatus.new:
+            continue
+        try:
+            analysis, score = analyze_and_score(job, profile, llm, config)
+        except Exception as exc:  # noqa: BLE001 - mark job error, continue with the rest
+            log.error("scoring_failed", job_id=job.id, error=str(exc))
+            repo.set_status(job.id, JobStatus.error)
+            summary.errors += 1
+            continue
+
+        summary.analyzed += 1
+        above = passes_threshold(score.score, active_settings.min_score)
+        updated = job.model_copy(
+            update={
+                "analysis": analysis,
+                "language": analysis.language or job.language,
+                "score": score.score,
+                "score_reason": "; ".join(score.reasons) or None,
+                "missing_requirements": score.missing_requirements,
+                "status": JobStatus.scored,
+            }
+        )
+        repo.save_job(updated)
+        summary.scored += 1
+        if not above:
+            summary.below_threshold += 1
+            log.info("job_below_threshold", job_id=job.id, score=score.score)
+
+    log.info(
+        "score_done",
+        analyzed=summary.analyzed,
+        scored=summary.scored,
+        below_threshold=summary.below_threshold,
+        errors=summary.errors,
     )
     return summary

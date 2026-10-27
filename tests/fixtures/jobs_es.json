@@ -1,0 +1,15 @@
+{
+  "source": "getonboard",
+  "external_id": "gob-es-001",
+  "url": "https://www.getonbrd.com/jobs/backend-java-es-001",
+  "apply_url": "https://www.getonbrd.com/jobs/backend-java-es-001/apply",
+  "title": "Ingeniero Backend Java (Remoto)",
+  "company": "Fintech LATAM",
+  "location": "Remote - LATAM",
+  "remote": true,
+  "modality": "remote",
+  "salary_text": "USD 4000 - 5000 mensuales",
+  "contact_email": "talento@fintechlatam.example",
+  "language": null,
+  "description": "Buscamos un ingeniero backend con sólida experiencia en Java y Spring Boot para construir y mantener nuestros servicios de pagos. Requisitos: al menos 4 años de experiencia, dominio de Java, Spring Boot, PostgreSQL y despliegues en AWS. Trabajo 100% remoto para toda LATAM. Valoramos experiencia con arquitecturas orientadas a eventos y Kafka."
+}

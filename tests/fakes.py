@@ -29,6 +29,36 @@ class FakeLlmClient:
         return self._response
 
 
+class ScriptedFakeLlmClient:
+    """An LlmClient that returns queued responses matched by schema type.
+
+    Several Phase 3+ flows need multiple sequential LLM outputs (analyse, then
+    score, then confirm-language). Enqueue responses with :meth:`queue`; each
+    ``complete_json`` call pops the next response whose type matches the requested
+    schema. Every prompt is recorded and asserted to embed the anti-invention
+    rules, so a prompt built without them fails loudly in tests.
+    """
+
+    def __init__(self, responses: Iterable[BaseModel] = ()) -> None:
+        self._responses: list[BaseModel] = list(responses)
+        self.prompts: list[str] = []
+
+    def queue(self, *responses: BaseModel) -> None:
+        self._responses.extend(responses)
+
+    def complete_json(self, prompt: str, schema: type[SchemaT], *, max_retries: int = 1) -> SchemaT:
+        assert "STRICT RULES" in prompt, "prompt is missing the anti-invention block"
+        self.prompts.append(prompt)
+        for index, response in enumerate(self._responses):
+            if isinstance(response, schema):
+                del self._responses[index]
+                return response
+        raise AssertionError(
+            f"ScriptedFakeLlmClient has no queued {schema.__name__} response; "
+            f"queued: {[type(r).__name__ for r in self._responses]}"
+        )
+
+
 class FakeJobRepository:
     """In-memory JobRepository that enforces the idempotency constraints.
 

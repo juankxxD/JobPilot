@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jobpilot.config import ScoringWeights
+
 ANTI_INVENTION_RULES = """\
 STRICT RULES — follow all of them:
 - Use ONLY facts present in the provided source. Never add information that is not
@@ -51,5 +56,153 @@ def build_cv_import_prompt(resume_text: str, schema_json: str) -> str:
     return CV_IMPORT_PROMPT.format(
         anti_invention=ANTI_INVENTION_RULES,
         resume_text=resume_text,
+        schema=schema_json,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — analysis, scoring and language confirmation
+# --------------------------------------------------------------------------- #
+
+ANALYZE_JOB_PROMPT = """\
+You are analysing a single job offer and extracting its structured facts.
+
+{anti_invention}
+
+Instructions:
+- Extract ONLY what the offer text states. Leave a field null when the offer does
+  not state it. Never invent a stack item, seniority, salary, or timezone.
+- "required_stack" lists technologies the offer presents as required; put clearly
+  optional ones in "nice_to_have_stack". Use the exact technology names the offer
+  uses.
+- "years_required" is an integer only when the offer gives a number; otherwise null.
+- "language" is the language the offer is WRITTEN in ("es" or "en").
+- "red_flags" captures concerning signals literally present in the text (e.g. unpaid,
+  vague scope); do not editorialise beyond the text.
+
+Job offer:
+---
+Title: {title}
+Company: {company}
+Location: {location}
+Remote: {remote}
+Salary: {salary}
+---
+{description}
+---
+
+Return JSON for this schema (fields may be null/empty when absent):
+{schema}
+"""
+
+SCORE_JOB_PROMPT = """\
+You are scoring how well a candidate fits a job offer, from 0 to 100.
+
+{anti_invention}
+
+Scoring model — the final score is a weighted sum of these dimensions (weights in
+points, they sum to 100):
+- required stack match: {w_required_stack}
+- seniority and years of experience: {w_seniority_and_years}
+- modality and timezone fit: {w_modality_and_timezone}
+- offer language vs the candidate's accepted languages: {w_language}
+- salary and conditions: {w_salary_and_conditions}
+- other signals: {w_other}
+
+Instructions:
+- Judge fit ONLY from the candidate profile and the analysed offer below. Never
+  credit a technology, role, or achievement the profile does not contain.
+- "met_requirements": for every offer requirement the candidate genuinely meets,
+  add an entry whose "achievement_id" is an EXISTING achievement id from the
+  profile (listed under "Profile achievement ids"). Never invent an id. If you
+  cannot cite a real achievement id for a requirement, do NOT list it as met.
+- "missing_requirements": offer requirements the profile does not support.
+- "recommendation" is one of: apply, apply_with_reservations, discard.
+
+Candidate profile:
+---
+{profile}
+---
+Profile achievement ids (use ONLY these for met_requirements.achievement_id):
+{achievement_ids}
+---
+Analysed offer:
+---
+{analysis}
+---
+
+Return JSON for this schema:
+{schema}
+"""
+
+CONFIRM_LANGUAGE_PROMPT = """\
+You are identifying the natural language a job offer is written in.
+
+{anti_invention}
+
+Instructions:
+- Answer with the dominant language of the text: "es" (Spanish) or "en" (English).
+- "confidence" is a number between 0 and 1 reflecting how sure you are.
+- Decide only from the text below; do not guess from the company or location.
+
+Job offer text:
+---
+{text}
+---
+
+Return JSON for this schema:
+{schema}
+"""
+
+
+def build_analyze_job_prompt(
+    *,
+    title: str,
+    company: str,
+    location: str | None,
+    remote: bool,
+    salary: str | None,
+    description: str,
+    schema_json: str,
+) -> str:
+    return ANALYZE_JOB_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        title=title,
+        company=company,
+        location=location or "unspecified",
+        remote=remote,
+        salary=salary or "unspecified",
+        description=description,
+        schema=schema_json,
+    )
+
+
+def build_score_job_prompt(
+    *,
+    profile_json: str,
+    achievement_ids: list[str],
+    analysis_json: str,
+    weights: ScoringWeights,
+    schema_json: str,
+) -> str:
+    return SCORE_JOB_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        w_required_stack=weights.required_stack,
+        w_seniority_and_years=weights.seniority_and_years,
+        w_modality_and_timezone=weights.modality_and_timezone,
+        w_language=weights.language,
+        w_salary_and_conditions=weights.salary_and_conditions,
+        w_other=weights.other,
+        profile=profile_json,
+        achievement_ids=", ".join(sorted(achievement_ids)) or "(none)",
+        analysis=analysis_json,
+        schema=schema_json,
+    )
+
+
+def build_confirm_language_prompt(*, text: str, schema_json: str) -> str:
+    return CONFIRM_LANGUAGE_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        text=text,
         schema=schema_json,
     )

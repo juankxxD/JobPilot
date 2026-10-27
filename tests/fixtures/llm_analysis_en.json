@@ -1,0 +1,14 @@
+{
+  "normalized_title": "Senior Backend Engineer",
+  "seniority": "senior",
+  "required_stack": ["Java", "Spring Boot", "PostgreSQL", "AWS", "Kafka"],
+  "nice_to_have_stack": [],
+  "years_required": 5,
+  "language": "en",
+  "modality": "remote",
+  "timezone": "US overlap",
+  "salary": "$90k - $120k USD / year",
+  "contact_email": "jobs@globexremote.example",
+  "apply_platform": null,
+  "red_flags": []
+}

@@ -8,6 +8,33 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from jobpilot.config import Language
+
+# The analysis and scoring LLM calls reuse the domain models in ``models.py``
+# (``JobAnalysis`` and ``JobScore``), which are already shaped as the structured
+# outputs we want. They are re-exported here so callers can import every LLM
+# schema from a single module.
+from jobpilot.models import JobAnalysis, JobScore
+
+# --------------------------------------------------------------------------- #
+# Analysis, scoring and language confirmation (Phase 3)
+# --------------------------------------------------------------------------- #
+
+__all__ = [
+    "ConfirmLanguage",
+    "CvImportResult",
+    "JobAnalysis",
+    "JobScore",
+]
+
+
+class ConfirmLanguage(BaseModel):
+    """LLM confirmation of an offer's language when detection is low-confidence."""
+
+    language: Language
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
 # --------------------------------------------------------------------------- #
 # CV import (Phase 1)
 # --------------------------------------------------------------------------- #

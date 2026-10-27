@@ -17,7 +17,7 @@ def test_help_lists_commands() -> None:
         assert command in result.output
 
 
-def test_import_cv_without_api_key_fails_cleanly(monkeypatch) -> None:
+def test_import_cv_without_api_key_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
     # No GROQ_API_KEY -> the command must fail with a clear message, not crash.
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     from jobpilot.config import get_settings
