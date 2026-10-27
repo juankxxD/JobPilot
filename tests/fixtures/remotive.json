@@ -1,0 +1,22 @@
+{
+  "job-count": 2,
+  "jobs": [
+    {
+      "id": 101,
+      "url": "https://remotive.com/remote-jobs/101",
+      "title": "Senior Java Backend Engineer",
+      "company_name": "Globant Remote",
+      "candidate_required_location": "LATAM",
+      "salary": "$80k - $110k USD",
+      "description": "Java and Spring backend role, fully remote."
+    },
+    {
+      "id": 102,
+      "url": "https://remotive.com/remote-jobs/102",
+      "title": "Marketing Manager",
+      "company_name": "AdCorp",
+      "candidate_required_location": "USA",
+      "description": "Marketing leadership role."
+    }
+  ]
+}

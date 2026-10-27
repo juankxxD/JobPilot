@@ -1,0 +1,15 @@
+{
+  "count": 1,
+  "results": [
+    {
+      "id": "adz-1",
+      "title": "Software Developer",
+      "redirect_url": "https://www.adzuna.com/jobs/adz-1",
+      "company": { "display_name": "Adzuna Partner Ltd" },
+      "location": { "display_name": "London, UK" },
+      "salary_min": 50000,
+      "salary_max": 70000,
+      "description": "Backend developer using java and aws."
+    }
+  ]
+}

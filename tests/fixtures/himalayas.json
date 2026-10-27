@@ -1,0 +1,12 @@
+{
+  "jobs": [
+    {
+      "guid": "him-1",
+      "title": "Backend Engineer",
+      "companyName": "Himalaya Labs",
+      "applicationLink": "https://himalayas.app/jobs/him-1",
+      "locationRestrictions": ["Americas", "LATAM"],
+      "description": "Java and python backend role."
+    }
+  ]
+}
