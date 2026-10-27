@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from jobpilot.config import AppConfig, Settings
+from jobpilot.config import AppConfig, Language, LanguageConfig, Settings
+from jobpilot.llm.schemas import ConfirmLanguage
 from jobpilot.models import (
     Job,
     JobAnalysis,
@@ -14,6 +15,7 @@ from jobpilot.models import (
     MetRequirement,
     RawJob,
     Recommendation,
+    ScoreDimensions,
 )
 from jobpilot.pipeline.run import score_new_jobs
 from jobpilot.profile.model import ProfileModel
@@ -51,10 +53,50 @@ def test_score_new_jobs_es_and_en(example_profile: ProfileModel, load_fixture: F
     stored_en = repo.get_job(job_en.id)  # type: ignore[arg-type]
     assert stored_es is not None and stored_en is not None
     assert stored_es.status is JobStatus.scored
+    # Source language is null in both fixtures, so es/en here can only come from
+    # lingua detection in the pipeline (clear text clears the threshold, no LLM).
     assert stored_es.language is not None and stored_es.language.value == "es"
     assert stored_en.language is not None and stored_en.language.value == "en"
     assert stored_es.score == 82
     assert stored_en.score == 88
+
+
+def test_low_confidence_offer_invokes_language_confirmation(
+    example_profile: ProfileModel, load_fixture: Fixture
+) -> None:
+    """A low-confidence offer triggers the LLM confirm_language step in the pipeline."""
+    repo = FakeJobRepository()
+    # A terse offer gives lingua only weak signal (best guess below the 0.80
+    # threshold), so the pipeline must fall back to the LLM confirmation prompt.
+    raw = {
+        "source": "remoteok",
+        "external_id": "rok-lowconf-001",
+        "url": "https://remoteok.com/remote-jobs/backend-lowconf-001",
+        "title": "Backend developer Java Python",
+        "company": "Terse Co",
+        "remote": True,
+        "language": None,
+        "description": "",
+    }
+    job = _persist_raw(repo, raw)
+
+    config = AppConfig(language=LanguageConfig(min_confidence=0.80))
+    llm = ScriptedFakeLlmClient(
+        [
+            JobAnalysis.model_validate(load_fixture("llm_analysis_en.json")),
+            JobScore.model_validate(load_fixture("llm_score_en.json")),
+            ConfirmLanguage(language=Language.en, confidence=1.0),
+        ]
+    )
+
+    summary = score_new_jobs([job], repo, example_profile, llm, config, Settings(min_score=70))
+    assert summary.scored == 1
+    stored = repo.get_job(job.id)  # type: ignore[arg-type]
+    assert stored is not None
+    assert stored.language is Language.en
+    # analyse + score + confirm_language were all consumed.
+    assert len(llm.prompts) == 3
+    assert any("identifying the natural language" in p for p in llm.prompts)
 
 
 def test_below_threshold_is_flagged(example_profile: ProfileModel, load_fixture: Fixture) -> None:
@@ -62,7 +104,15 @@ def test_below_threshold_is_flagged(example_profile: ProfileModel, load_fixture:
     job = _persist_raw(repo, load_fixture("jobs_en.json"))
 
     low_score = JobScore(
-        score=40,
+        # Every dimension at 40 -> computed aggregate 40 under default weights.
+        dimensions=ScoreDimensions(
+            required_stack=40,
+            seniority_and_years=40,
+            modality_and_timezone=40,
+            language=40,
+            salary_and_conditions=40,
+            other=40,
+        ),
         reasons=["weak stack match"],
         met_requirements=[],
         missing_requirements=["Java depth"],

@@ -7,11 +7,17 @@ from typing import Any
 
 import pytest
 
-from jobpilot.config import AppConfig, ScoringWeights
-from jobpilot.models import Job, JobAnalysis, JobScore, MetRequirement, Recommendation
+from jobpilot.config import AppConfig, ScoringConfig, ScoringWeights
+from jobpilot.models import (
+    Job,
+    JobAnalysis,
+    JobScore,
+    MetRequirement,
+    Recommendation,
+    ScoreDimensions,
+)
 from jobpilot.profile.model import ProfileModel
 from jobpilot.scoring.scorer import (
-    DimensionScores,
     ScoringError,
     analyze_and_score,
     compute_weighted_score,
@@ -36,13 +42,20 @@ def _job() -> Job:
 
 def test_compute_weighted_score_full_match() -> None:
     weights = ScoringWeights()
-    perfect = DimensionScores(100, 100, 100, 100, 100, 100)
+    perfect = ScoreDimensions(
+        required_stack=100,
+        seniority_and_years=100,
+        modality_and_timezone=100,
+        language=100,
+        salary_and_conditions=100,
+        other=100,
+    )
     assert compute_weighted_score(perfect, weights) == 100
 
 
 def test_compute_weighted_score_partial() -> None:
     weights = ScoringWeights()  # 40/20/15/10/10/5
-    dims = DimensionScores(
+    dims = ScoreDimensions(
         required_stack=100,
         seniority_and_years=50,
         modality_and_timezone=0,
@@ -63,7 +76,7 @@ def test_custom_weights_change_result() -> None:
         salary_and_conditions=10,
         other=50,
     )
-    dims = DimensionScores(other=100)
+    dims = ScoreDimensions(other=100)
     assert compute_weighted_score(dims, weights) == 50
 
 
@@ -81,9 +94,39 @@ def test_analyze_and_score_valid_ids(example_profile: ProfileModel, load_fixture
 
     got_analysis, got_score = analyze_and_score(_job(), example_profile, llm, config)
     assert got_analysis.normalized_title == "Senior Backend Engineer"
+    # Aggregate computed in code from the fixture dimensions and default weights
+    # (95*40 + 90*20 + 85*15 + 100*10 + 60*10 + 70*5) / 100 = 88.25 -> 88.
     assert got_score.score == 88
     # Two calls: analyse + score.
     assert len(llm.prompts) == 2
+
+
+def test_analyze_and_score_uses_configured_weights(example_profile: ProfileModel) -> None:
+    """The persisted score comes from config weights, never the LLM aggregate."""
+    analysis = JobAnalysis(normalized_title="Backend", language=None)
+    # The LLM reports a misleading aggregate of 100; only "other" scores highly.
+    score = JobScore(
+        score=100,
+        dimensions=ScoreDimensions(other=80),
+        met_requirements=[MetRequirement(requirement="Java", achievement_id="ach_acme_latency")],
+        recommendation=Recommendation.apply,
+    )
+    llm = ScriptedFakeLlmClient([analysis, score])
+    # Put all the weight on "other" so the computed aggregate equals 80, not 100.
+    config = AppConfig(
+        scoring=ScoringConfig(
+            weights=ScoringWeights(
+                required_stack=0,
+                seniority_and_years=0,
+                modality_and_timezone=0,
+                language=0,
+                salary_and_conditions=0,
+                other=100,
+            )
+        )
+    )
+    _, got_score = analyze_and_score(_job(), example_profile, llm, config)
+    assert got_score.score == 80  # fails if the LLM aggregate (100) were trusted
 
 
 def test_analyze_and_score_retries_on_invalid_id(example_profile: ProfileModel) -> None:

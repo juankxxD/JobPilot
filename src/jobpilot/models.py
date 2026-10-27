@@ -96,10 +96,34 @@ class MetRequirement(BaseModel):
     achievement_id: str
 
 
-class JobScore(BaseModel):
-    """Structured LLM scoring result (0-100)."""
+class ScoreDimensions(BaseModel):
+    """Per-dimension fit the LLM returns, each on a 0-100 scale.
 
-    score: int = Field(ge=0, le=100)
+    These map one-to-one to :class:`~jobpilot.config.ScoringWeights`. The persisted
+    aggregate score is computed in code from these values and the configured
+    weights, so the weighting is deterministic and never trusts an LLM-provided
+    aggregate.
+    """
+
+    required_stack: float = Field(ge=0.0, le=100.0, default=0.0)
+    seniority_and_years: float = Field(ge=0.0, le=100.0, default=0.0)
+    modality_and_timezone: float = Field(ge=0.0, le=100.0, default=0.0)
+    language: float = Field(ge=0.0, le=100.0, default=0.0)
+    salary_and_conditions: float = Field(ge=0.0, le=100.0, default=0.0)
+    other: float = Field(ge=0.0, le=100.0, default=0.0)
+
+
+class JobScore(BaseModel):
+    """Structured LLM scoring result.
+
+    The LLM returns per-dimension 0-100 scores in ``dimensions``; the overall
+    ``score`` is computed in code from those dimensions and the configured weights
+    (see :func:`jobpilot.scoring.scorer.compute_weighted_score`). ``score`` defaults
+    to 0 and is overwritten by the scorer, so the LLM's own aggregate is never used.
+    """
+
+    score: int = Field(ge=0, le=100, default=0)
+    dimensions: ScoreDimensions = Field(default_factory=ScoreDimensions)
     reasons: list[str] = Field(default_factory=list)
     met_requirements: list[MetRequirement] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)

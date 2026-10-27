@@ -1,5 +1,13 @@
 {
-  "score": 88,
+  "score": 0,
+  "dimensions": {
+    "required_stack": 95,
+    "seniority_and_years": 90,
+    "modality_and_timezone": 85,
+    "language": 100,
+    "salary_and_conditions": 60,
+    "other": 70
+  },
   "reasons": [
     "Strong Java and Spring Boot match with the required stack.",
     "Event-driven Kafka experience matches a key requirement."

@@ -29,13 +29,17 @@ _SUPPORTED = (Language.es, Language.en)
 
 
 def _build_detector() -> object:
-    """Build a lingua detector restricted to the supported languages."""
-    from lingua import Language as LinguaLanguage
+    """Build a lingua detector over its full language set.
+
+    Detecting across all languages (rather than only Spanish and English) lets
+    unsupported text — e.g. a French offer — surface as its real language instead
+    of being forced into the closest of es/en. When the best match is not a
+    supported language, :func:`detect_language` returns ``None`` so the Telegram
+    language-choice flow can take over.
+    """
     from lingua import LanguageDetectorBuilder
 
-    return LanguageDetectorBuilder.from_languages(
-        LinguaLanguage.SPANISH, LinguaLanguage.ENGLISH
-    ).build()
+    return LanguageDetectorBuilder.from_all_languages().build()
 
 
 def _lingua_to_language(value: object) -> Language | None:
@@ -49,13 +53,17 @@ def _lingua_to_language(value: object) -> Language | None:
 
 
 def _detect_with_confidence(text: str, detector: object) -> tuple[Language | None, float]:
-    """Return lingua's best supported language and its confidence [0, 1]."""
+    """Return lingua's single best language (mapped to es/en or ``None``) and confidence.
+
+    The best language overall is considered. If it is not a supported language the
+    result is ``(None, confidence)``, so unsupported text never clears the
+    threshold as es/en.
+    """
     confidences = detector.compute_language_confidence_values(text)  # type: ignore[attr-defined]
-    for item in confidences:
-        language = _lingua_to_language(item.language)
-        if language is not None:
-            return language, float(item.value)
-    return None, 0.0
+    best = next(iter(confidences), None)
+    if best is None:
+        return None, 0.0
+    return _lingua_to_language(best.language), float(best.value)
 
 
 def detect_language(
@@ -67,8 +75,11 @@ def detect_language(
 ) -> Language | None:
     """Detect the language of ``text``.
 
-    * Run ``lingua``; if its confidence is at least ``config.min_confidence``,
-      return its verdict.
+    * Run ``lingua``; if the best language is a supported one (es/en) and its
+      confidence is at least ``config.min_confidence``, return it.
+    * If the best language is confidently an unsupported one (not es/en), return
+      ``None`` — an unsupported offer must reach the Telegram language-choice flow,
+      never be forced into es/en.
     * Otherwise, if an ``llm`` is provided, ask it to confirm. Accept the LLM's
       answer only when its own confidence clears the threshold.
     * Return ``None`` when the language stays ambiguous.
@@ -83,6 +94,12 @@ def detect_language(
     if language is not None and confidence >= config.min_confidence:
         log.info("language_detected", language=language.value, confidence=round(confidence, 3))
         return language
+
+    if language is None and confidence >= config.min_confidence:
+        # Confidently a language we do not support: stay ambiguous for the
+        # Telegram choice flow instead of guessing es/en.
+        log.info("language_unsupported", confidence=round(confidence, 3))
+        return None
 
     log.info(
         "language_low_confidence",

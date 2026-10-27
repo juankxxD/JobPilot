@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from jobpilot.config import AppConfig, Settings, get_settings
 from jobpilot.filters.prefilter import prefilter
+from jobpilot.language import detect_language
 from jobpilot.logging import get_logger
 from jobpilot.models import Job, JobStatus
 from jobpilot.scoring.scorer import analyze_and_score, passes_threshold
@@ -87,6 +88,11 @@ def collect_and_persist(
     return summary
 
 
+def _offer_text(job: Job) -> str:
+    """Build the text used for language detection: title plus description."""
+    return f"{job.title}\n{job.description}".strip()
+
+
 @dataclass(slots=True)
 class ScoreSummary:
     """Counts returned by :func:`score_new_jobs`."""
@@ -107,6 +113,13 @@ def score_new_jobs(
 ) -> ScoreSummary:
     """Analyse and score each ``new`` job, persisting analysis, score and status.
 
+    Before scoring, the offer language is resolved with
+    :func:`jobpilot.language.detect_language` (lingua, with the LLM confirmation
+    step on low-confidence offers), so the deterministic detector and the
+    configured ``language.min_confidence`` threshold drive the persisted language.
+    A ``None`` result is preserved — the job keeps whatever language the source
+    declared and stays ambiguous for the later Telegram language-choice flow.
+
     A job that scores at or above ``MIN_SCORE`` becomes ``scored``; one below the
     threshold is still persisted as ``scored`` but flagged (its score is below
     ``MIN_SCORE``). An unrecoverable LLM/validation failure marks the job ``error``.
@@ -126,11 +139,15 @@ def score_new_jobs(
             continue
 
         summary.analyzed += 1
+        detected = detect_language(_offer_text(job), config.language, llm)
+        # Preserve None (ambiguous) for the Telegram choice flow; only overwrite the
+        # stored language when detection resolved it to a supported language.
+        language = detected if detected is not None else job.language
         above = passes_threshold(score.score, active_settings.min_score)
         updated = job.model_copy(
             update={
                 "analysis": analysis,
-                "language": analysis.language or job.language,
+                "language": language,
                 "score": score.score,
                 "score_reason": "; ".join(score.reasons) or None,
                 "missing_requirements": score.missing_requirements,

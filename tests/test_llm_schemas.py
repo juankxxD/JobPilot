@@ -25,7 +25,11 @@ def test_job_analysis_parses_fixture(load_fixture: Fixture) -> None:
 
 def test_job_score_parses_fixture(load_fixture: Fixture) -> None:
     score = JobScore.model_validate(load_fixture("llm_score_es.json"))
-    assert score.score == 82
+    # The LLM returns per-dimension scores; the aggregate is computed in code, so
+    # the raw fixture leaves "score" at its default 0.
+    assert score.score == 0
+    assert score.dimensions.required_stack == 90
+    assert score.dimensions.language == 100
     assert score.recommendation is Recommendation.apply
     assert score.met_requirements[0].achievement_id == "ach_acme_latency"
 

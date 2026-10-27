@@ -15,16 +15,14 @@ weighting is deterministic and testable, and ``passes_threshold`` applies
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from jobpilot.config import ScoringWeights
 from jobpilot.llm.prompts import build_analyze_job_prompt, build_score_job_prompt
 from jobpilot.logging import get_logger
-from jobpilot.models import JobAnalysis, JobScore
+from jobpilot.models import JobAnalysis, JobScore, ScoreDimensions
 
 if TYPE_CHECKING:
-    from jobpilot.config import AppConfig
+    from jobpilot.config import AppConfig, ScoringWeights
     from jobpilot.interfaces import LlmClient
     from jobpilot.models import Job
     from jobpilot.profile.model import ProfileModel
@@ -36,23 +34,7 @@ class ScoringError(RuntimeError):
     """Raised when analysis/scoring cannot produce profile-valid output."""
 
 
-@dataclass(slots=True)
-class DimensionScores:
-    """Per-dimension fit, each on a 0-100 scale.
-
-    These map one-to-one to :class:`~jobpilot.config.ScoringWeights`. The weighted
-    overall score is their weight-average (weights sum to 100).
-    """
-
-    required_stack: float = 0.0
-    seniority_and_years: float = 0.0
-    modality_and_timezone: float = 0.0
-    language: float = 0.0
-    salary_and_conditions: float = 0.0
-    other: float = 0.0
-
-
-def compute_weighted_score(dimensions: DimensionScores, weights: ScoringWeights) -> int:
+def compute_weighted_score(dimensions: ScoreDimensions, weights: ScoringWeights) -> int:
     """Combine per-dimension 0-100 scores into a weighted overall 0-100 score."""
     total = weights.total()
     if total <= 0:  # pragma: no cover - config loader guarantees sum == 100
@@ -136,7 +118,11 @@ def analyze_and_score(
         score = score_job(analysis, profile, llm, weights)
         invalid = _invalid_met_ids(score, profile)
         if not invalid:
-            return analysis, score
+            # The persisted aggregate is always computed in code from the
+            # per-dimension scores and the configured weights; the LLM's own
+            # aggregate is never trusted.
+            aggregate = compute_weighted_score(score.dimensions, weights)
+            return analysis, score.model_copy(update={"score": aggregate})
         last_invalid = invalid
         log.warning(
             "score_cited_unknown_achievement_ids",

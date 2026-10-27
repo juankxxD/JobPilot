@@ -100,18 +100,26 @@ You are scoring how well a candidate fits a job offer, from 0 to 100.
 
 {anti_invention}
 
-Scoring model — the final score is a weighted sum of these dimensions (weights in
-points, they sum to 100):
-- required stack match: {w_required_stack}
-- seniority and years of experience: {w_seniority_and_years}
-- modality and timezone fit: {w_modality_and_timezone}
-- offer language vs the candidate's accepted languages: {w_language}
-- salary and conditions: {w_salary_and_conditions}
-- other signals: {w_other}
+Scoring model — rate the candidate's fit for EACH dimension from 0 to 100 in
+"dimensions". The overall score is computed outside this call as a weighted sum of
+your per-dimension scores; the weights (in points, summing to 100) are shown only
+so you understand their relative importance:
+- required stack match ("dimensions.required_stack"): {w_required_stack}
+- seniority and years of experience ("dimensions.seniority_and_years"):
+  {w_seniority_and_years}
+- modality and timezone fit ("dimensions.modality_and_timezone"):
+  {w_modality_and_timezone}
+- offer language vs the candidate's accepted languages ("dimensions.language"):
+  {w_language}
+- salary and conditions ("dimensions.salary_and_conditions"):
+  {w_salary_and_conditions}
+- other signals ("dimensions.other"): {w_other}
 
 Instructions:
 - Judge fit ONLY from the candidate profile and the analysed offer below. Never
   credit a technology, role, or achievement the profile does not contain.
+- Fill every "dimensions" field with a 0-100 score. Do NOT compute an overall
+  score yourself; leave "score" at 0.
 - "met_requirements": for every offer requirement the candidate genuinely meets,
   add an entry whose "achievement_id" is an EXISTING achievement id from the
   profile (listed under "Profile achievement ids"). Never invent an id. If you

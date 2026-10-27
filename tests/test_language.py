@@ -93,3 +93,17 @@ def test_low_confidence_without_llm_returns_none() -> None:
 
 def test_empty_text_returns_none() -> None:
     assert detect_language("   ", _CONFIG, None) is None
+
+
+_FR_TEXT = (
+    "Nous recherchons un ingénieur logiciel expérimenté pour concevoir et "
+    "maintenir nos systèmes distribués en production."
+)
+
+
+def test_unsupported_language_stays_ambiguous() -> None:
+    """A confidently French offer must not be forced into es/en."""
+    llm = ScriptedFakeLlmClient()  # must stay unused: lingua is confident it is French
+    result = detect_language(_FR_TEXT, _CONFIG, llm)
+    assert result is None
+    assert llm.prompts == []

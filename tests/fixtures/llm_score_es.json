@@ -1,5 +1,13 @@
 {
-  "score": 82,
+  "score": 0,
+  "dimensions": {
+    "required_stack": 90,
+    "seniority_and_years": 80,
+    "modality_and_timezone": 85,
+    "language": 100,
+    "salary_and_conditions": 40,
+    "other": 60
+  },
   "reasons": [
     "Experiencia en Java y Spring Boot alineada con el stack requerido.",
     "Migración a microservicios demuestra solidez backend."
