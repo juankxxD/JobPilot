@@ -1,0 +1,51 @@
+name: jobpilot-pipeline
+
+on:
+  schedule:
+    # Every 2 hours (configurable). Adjust together with config.yaml schedule.cron_hours.
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  # Never run two pipeline executions at once (idempotency relies on sequential runs).
+  group: jobpilot-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries for WeasyPrint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libffi-dev
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv pip install --system -e "."
+
+      - name: Run pipeline
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ secrets.GROQ_MODEL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OWNER_CHAT_ID: ${{ secrets.TELEGRAM_OWNER_CHAT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          MAIL_PROVIDER: ${{ secrets.MAIL_PROVIDER }}
+          GRAPH_CLIENT_ID: ${{ secrets.GRAPH_CLIENT_ID }}
+          GRAPH_TENANT_ID: ${{ secrets.GRAPH_TENANT_ID }}
+          GRAPH_REFRESH_TOKEN: ${{ secrets.GRAPH_REFRESH_TOKEN }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+        run: |
+          # Phase 5+ wires this to the real pipeline.
+          python -m jobpilot run

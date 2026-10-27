@@ -1,0 +1,35 @@
+# Secrets and single source of truth
+.env
+profile.yaml
+profile.draft.yaml
+*.secret
+
+# Generated documents and screenshots
+out/
+*.pdf
+screenshots/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# uv
+# keep uv.lock tracked; nothing to ignore here

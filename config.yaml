@@ -1,0 +1,61 @@
+# JobPilot non-secret configuration.
+# Secrets live in .env; this file holds tunable behaviour.
+
+# --- Job sources (feature flags) ---
+sources:
+  getonboard: { enabled: true }
+  remoteok: { enabled: true }
+  remotive: { enabled: true }
+  weworkremotely: { enabled: true }
+  himalayas: { enabled: false }
+  adzuna: { enabled: false }
+  gmail_alerts: { enabled: false } # LinkedIn/Indeed/Google Jobs alerts via Gmail (no scraping)
+
+# --- Deterministic prefilter (applied before any LLM call) ---
+prefilter:
+  # An offer passes if it is remote OR its location matches one of these countries.
+  countries: ["Colombia", "Remote", "LATAM"]
+  remote_ok: true
+  # Offer must contain at least one required keyword and none of the excluded ones.
+  required_keywords: ["java", "spring", "backend", "python", "cloud", "aws"]
+  excluded_keywords: ["unpaid", "internship", "sin remuneración"]
+  # Only accept offers whose detected language is in this list.
+  accepted_languages: ["es", "en"]
+  # Accepted work modalities (empty = any).
+  modalities: ["remote", "hybrid", "onsite"]
+  # If an offer declares a salary and it is below this (monthly USD), drop it.
+  min_salary_usd: 0
+
+# --- Scoring weights (must sum to 100) ---
+scoring:
+  weights:
+    required_stack: 40
+    seniority_and_years: 20
+    modality_and_timezone: 15
+    language: 10
+    salary_and_conditions: 10
+    other: 5
+
+# --- Language handling ---
+language:
+  # Minimum detection confidence to skip the LLM confirmation step.
+  min_confidence: 0.80
+  # If true, when the owner does not answer the language prompt, fall back to
+  # DEFAULT_LANGUAGE after `fallback_after_hours`. If false (default), the offer
+  # stays proposed waiting for the owner's choice; no document is generated.
+  use_default_on_timeout: false
+  fallback_after_hours: 24
+
+# --- Proposal guards ---
+proposals:
+  # Do not propose the same company+role twice within this many days.
+  dedupe_company_role_days: 30
+
+# --- Follow-up ---
+follow_up:
+  reminder_after_days: 7
+  weekly_report_weekday: 1 # 1 = Monday
+
+# --- Pipeline schedule hint (documentation only; actual cron in workflow) ---
+schedule:
+  cron_hours: 2

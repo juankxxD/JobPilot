@@ -1,0 +1,111 @@
+[project]
+name = "jobpilot"
+version = "0.1.0"
+description = "Personal job-hunting bot: fetch, score, tailor CV/cover letter, and apply with human-in-the-loop approval via Telegram."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Juan Hoyos" }]
+
+dependencies = [
+    # Config & models
+    "pydantic[email]>=2.11,<3",
+    "pydantic-settings>=2.7,<3",
+    "pyyaml>=6.0.2,<7",
+    # CLI & logging
+    "typer>=0.15,<1",
+    "structlog>=25.1,<26",
+    # HTTP
+    "httpx>=0.28,<1",
+    # Database
+    "psycopg[binary]>=3.2,<4",
+    # LLM
+    "groq>=0.18,<1",
+    # Language detection
+    "lingua-language-detector>=2.0,<3",
+    # CV import (PDF/DOCX text extraction)
+    "pypdf>=5.1,<6",
+    "python-docx>=1.1,<2",
+    # Documents (HTML -> PDF)
+    "weasyprint>=63,<64",
+    "jinja2>=3.1,<4",
+    # Google Drive + Gmail
+    "google-api-python-client>=2.159,<3",
+    "google-auth>=2.37,<3",
+    "google-auth-oauthlib>=1.2,<2",
+    # Outlook via Microsoft Graph
+    "msal>=1.31,<2",
+    # RSS parsing (We Work Remotely)
+    "feedparser>=6.0.11,<7",
+]
+
+[project.optional-dependencies]
+forms = [
+    # Phase 8, local only
+    "playwright>=1.49,<2",
+]
+dev = [
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+    "pytest>=8.3,<9",
+    "pytest-mock>=3.14,<4",
+    "types-pyyaml>=6.0,<7",
+]
+
+[project.scripts]
+jobpilot = "jobpilot.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jobpilot"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jobpilot"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "weasyprint.*",
+    "feedparser.*",
+    "lingua.*",
+    "googleapiclient.*",
+    "google.*",
+    "google_auth_oauthlib.*",
+    "msal.*",
+]
+ignore_missing_imports = true
+
+# The credential checks call untyped third-party client libraries
+# (Google auth, msal). Relax the strict "untyped call" rule for them only.
+[[tool.mypy.overrides]]
+module = ["jobpilot.checks.drive", "jobpilot.checks.mail"]
+disallow_untyped_calls = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

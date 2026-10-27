@@ -1,0 +1,129 @@
+# JobPilot profile — EXAMPLE with fictional data.
+# Copy the real version to `profile.yaml` (gitignored). Only profile.yaml is the
+# single source of truth. The LLM may only pick ids defined here and rephrase
+# their wording; it must never alter facts, figures, dates, roles or companies.
+
+basics:
+  name: "Jane Doe"
+  email: "jane.doe@example.com"
+  phone: "+57 300 000 0000"
+  location: "Bogotá, Colombia"
+  links:
+    github: "https://github.com/janedoe"
+    linkedin: "https://www.linkedin.com/in/janedoe"
+    website: "https://janedoe.dev"
+
+summary_variants:
+  backend_java:
+    es: "Ingeniera backend con 5 años construyendo servicios en Java y Spring Boot."
+    en: "Backend engineer with 5 years building services in Java and Spring Boot."
+  fullstack:
+    es: "Desarrolladora fullstack con experiencia en Java, React y bases de datos relacionales."
+    en: "Fullstack developer experienced in Java, React and relational databases."
+  cloud:
+    es: "Ingeniera de software enfocada en despliegues en AWS y arquitecturas orientadas a eventos."
+    en: "Software engineer focused on AWS deployments and event-driven architectures."
+
+skills:
+  languages: ["Java", "Python", "TypeScript", "SQL"]
+  frameworks: ["Spring Boot", "React", "FastAPI"]
+  cloud: ["AWS", "Docker", "Kubernetes"]
+  databases: ["PostgreSQL", "Redis", "MongoDB"]
+
+experience:
+  - id: exp_acme_2022
+    company: "ACME Corp"
+    role: "Backend Engineer"
+    start: "2022-01"
+    end: null # null = current
+    achievements:
+      - id: ach_acme_latency
+        tags: ["java", "spring", "performance"]
+        es: "Reduje la latencia p95 del API de pagos en un 40% optimizando consultas y caché."
+        en: "Reduced the payments API p95 latency by 40% by optimizing queries and caching."
+        translation_status: approved
+      - id: ach_acme_events
+        tags: ["aws", "kafka", "architecture"]
+        es: "Diseñé una arquitectura orientada a eventos con Kafka que procesa 2M de mensajes diarios."
+        en: "Designed an event-driven Kafka architecture processing 2M messages per day."
+        translation_status: approved
+  - id: exp_globex_2019
+    company: "Globex"
+    role: "Software Developer"
+    start: "2019-03"
+    end: "2021-12"
+    achievements:
+      - id: ach_globex_migration
+        tags: ["java", "postgresql", "migration"]
+        es: "Lideré la migración de un monolito a microservicios para 8 equipos."
+        en: "Led the migration of a monolith to microservices across 8 teams."
+        translation_status: approved
+
+education:
+  - id: edu_unal_cs
+    institution: "Universidad Nacional de Colombia"
+    degree: "B.Sc. Computer Science"
+    start: "2014-01"
+    end: "2018-12"
+
+certifications:
+  - id: cert_aws_saa
+    name: "AWS Certified Solutions Architect – Associate"
+    issuer: "Amazon Web Services"
+    date: "2023-05"
+
+projects:
+  - id: prj_openbudget
+    name: "OpenBudget"
+    tags: ["python", "fastapi", "postgresql"]
+    es: "App de código abierto para presupuestos personales con API en FastAPI."
+    en: "Open-source personal budgeting app with a FastAPI backend."
+    translation_status: approved
+
+languages_spoken:
+  - language: "Spanish"
+    level: "Native"
+  - language: "English"
+    level: "C1"
+
+answers_bank:
+  - key: salary_expectation
+    question_patterns:
+      ["salary", "expected salary", "pretensión salarial", "aspiración salarial"]
+    sensitive: true
+    es: "Mi expectativa salarial es negociable según el alcance del rol."
+    en: "My salary expectation is negotiable depending on the role scope."
+  - key: work_authorization
+    question_patterns:
+      ["work authorization", "visa", "authorized to work", "autorización de trabajo"]
+    sensitive: true
+    es: "Soy ciudadana colombiana; requeriría patrocinio para trabajar fuera de Colombia."
+    en: "I am a Colombian citizen; I would require sponsorship to work outside Colombia."
+  - key: relocation
+    question_patterns: ["relocation", "relocate", "reubicación", "reubicarse"]
+    sensitive: true
+    es: "Estoy abierta a reubicación con apoyo del empleador."
+    en: "I am open to relocation with employer support."
+  - key: availability
+    question_patterns: ["availability", "start date", "disponibilidad", "fecha de inicio"]
+    sensitive: false
+    es: "Disponible para comenzar con dos semanas de preaviso."
+    en: "Available to start with two weeks' notice."
+  - key: work_modality
+    question_patterns:
+      ["remote", "hybrid", "onsite", "modalidad", "presencial", "remoto"]
+    sensitive: false
+    es: "Prefiero modalidad remota o híbrida."
+    en: "I prefer a remote or hybrid modality."
+  - key: referral_source
+    question_patterns: ["how did you hear", "cómo te enteraste", "source"]
+    sensitive: false
+    es: "Encontré la oferta en un portal de empleo remoto."
+    en: "I found this opening on a remote job board."
+
+preferences:
+  target_roles: ["Backend Engineer", "Software Engineer", "Cloud Engineer"]
+  countries: ["Colombia", "Remote", "LATAM"]
+  remote: true
+  min_salary: 0
+  accepted_languages: ["es", "en"]
