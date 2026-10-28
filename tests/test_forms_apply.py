@@ -28,6 +28,124 @@ def test_lever_matches_only_lever_urls(example_profile: ProfileModel) -> None:
     assert filler.matches("https://boards.greenhouse.io/acme/jobs/1") is False
 
 
+def test_company_domain_dom_dispatches_to_greenhouse(example_profile: ProfileModel) -> None:
+    # An embedded Greenhouse form on a company careers domain: the URL gives nothing
+    # away, but the page DOM identifies the platform and the flow proceeds to submit.
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from jobpilot.config import AppConfig, Language
+    from jobpilot.forms.apply import FormApplyStatus, apply_via_form
+    from jobpilot.forms.base import FormPage
+    from jobpilot.forms.submit import SubmitAction
+    from jobpilot.interfaces import Update
+    from jobpilot.models import Job, JobStatus
+    from tests.fakes import FakeFormPage, FakeJobRepository, FakeNotifier
+
+    gh_present = {
+        "#application_form",
+        "#first_name",
+        "#last_name",
+        "#email",
+        "input#resume",
+        "input#cover_letter",
+        "#submit_app",
+    }
+    dom = '<div id="grnhse_app"></div>'
+    page = FakeFormPage(present=gh_present, dom=dom)
+
+    @contextmanager
+    def factory(url: str, config: AppConfig) -> Iterator[FormPage]:
+        yield page
+
+    job = Job(
+        id=11,
+        source="careers",
+        external_id="e11",
+        url="https://careers.acme.com/apply",
+        apply_url="https://careers.acme.com/apply",
+        title="Backend Engineer",
+        company="ACME Corp",
+        language=Language.en,
+        status=JobStatus.approved,
+    )
+    repo = FakeJobRepository()
+    repo.seed_job(job)
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(update_id=1, chat_id="owner", callback_data=f"{SubmitAction.submit.value}:11:n")
+        ]
+    )
+    filler = GreenhouseFormFiller(example_profile, _StubLlm(), FormsConfig())
+
+    result = apply_via_form(
+        job,
+        filler,
+        notifier,
+        repo,
+        AppConfig(),
+        language=Language.en,
+        cv_path="/tmp/cv_en.pdf",
+        cover_letter_path="/tmp/cover_en.pdf",
+        page_factory=factory,
+        confirmation_nonce="n",
+    )
+
+    assert result.status is FormApplyStatus.submitted
+    assert result.platform == "greenhouse"
+    assert page.clicked == ["#submit_app"]
+
+
+def test_unknown_company_domain_dom_is_unsupported(example_profile: ProfileModel) -> None:
+    # A company domain whose DOM matches no supported platform is rejected safely.
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from jobpilot.config import AppConfig, Language
+    from jobpilot.forms.apply import FormApplyStatus, apply_via_form
+    from jobpilot.forms.base import FormPage
+    from jobpilot.models import Job, JobStatus
+    from tests.fakes import FakeFormPage, FakeJobRepository, FakeNotifier
+
+    page = FakeFormPage(present=set(), dom="<div>nothing here</div>")
+
+    @contextmanager
+    def factory(url: str, config: AppConfig) -> Iterator[FormPage]:
+        yield page
+
+    job = Job(
+        id=12,
+        source="careers",
+        external_id="e12",
+        url="https://careers.acme.com/apply",
+        apply_url="https://careers.acme.com/apply",
+        title="Backend Engineer",
+        company="ACME Corp",
+        language=Language.en,
+        status=JobStatus.approved,
+    )
+    repo = FakeJobRepository()
+    repo.seed_job(job)
+    notifier = FakeNotifier()
+    filler = GreenhouseFormFiller(example_profile, _StubLlm(), FormsConfig())
+
+    result = apply_via_form(
+        job,
+        filler,
+        notifier,
+        repo,
+        AppConfig(),
+        language=Language.en,
+        cv_path="/tmp/cv_en.pdf",
+        cover_letter_path="/tmp/cover_en.pdf",
+        page_factory=factory,
+    )
+
+    assert result.status is FormApplyStatus.unsupported
+    assert page.clicked == []
+    assert repo.applications == []
+
+
 def test_fake_form_filler_records_calls() -> None:
     result = FillResult(filled_fields=["name"], uncertain_fields=[], unanswered_sensitive=[])
     filler = FakeFormFiller(result, handles="greenhouse.io")

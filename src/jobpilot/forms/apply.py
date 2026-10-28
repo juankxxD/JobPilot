@@ -40,6 +40,7 @@ from jobpilot.forms.base import (
     FormStructureError,
     abort_screenshot,
     detect_platform,
+    is_unsupported_url,
 )
 from jobpilot.forms.runtime import open_form_page
 from jobpilot.forms.submit import SubmitDecision, request_submit_confirmation
@@ -111,24 +112,44 @@ def apply_via_form(
     cover_letter_path: str,
     page_factory: Callable[[str, AppConfig], AbstractContextManager[FormPage]] | None = None,
     now: Callable[[], datetime] | None = None,
+    confirmation_nonce: str | None = None,
 ) -> FormApplyResult:
     """Apply to ``job`` through its supported form, with the pre-submit HITL gate.
 
     ``page_factory`` is a context manager yielding a :class:`FormPage`; it defaults
     to the real Playwright runtime but tests pass a factory yielding a fake page, so
-    no browser is launched. The apply URL is validated with :func:`detect_platform`
-    first, so LinkedIn Easy Apply / Indeed / any unknown form returns
-    :attr:`FormApplyStatus.unsupported` before a browser opens.
+    no browser is launched. LinkedIn Easy Apply and Indeed are rejected before any
+    browser opens. When the URL alone identifies a supported platform the flow
+    dispatches directly; otherwise the page is opened and
+    ``detect_platform(url, page.content())`` identifies an embedded Greenhouse/Lever
+    form, returning :attr:`FormApplyStatus.unsupported` for anything still unknown.
     """
     if job.id is None:
         raise ValueError("apply_via_form requires a persisted job with an id")
     url = job.apply_url or job.url
-    platform = detect_platform(url)
-    if platform is None:
-        log.info("form_apply_unsupported", job_id=job.id, url=url)
+
+    # LinkedIn Easy Apply and Indeed are out of scope by policy and must be rejected
+    # before any browser opens, even if their DOM later looked like a supported ATS.
+    if is_unsupported_url(url):
+        log.info("form_apply_unsupported", job_id=job.id, url=url, reason="linkedin_or_indeed")
         notifier.send_message(
-            f"La oferta {job.id} no usa un formulario compatible (o es LinkedIn/Indeed); "
-            "aplícala manualmente."
+            f"La oferta {job.id} es de LinkedIn/Indeed (fuera de alcance); aplícala manualmente."
+        )
+        return FormApplyResult(status=FormApplyStatus.unsupported)
+
+    # A URL match is enough to dispatch; otherwise open the page and let the DOM
+    # identify an embedded Greenhouse/Lever form on a company careers domain.
+    url_platform = detect_platform(url)
+    if url_platform is not None and url_platform != filler.platform.value:
+        log.info(
+            "form_apply_platform_mismatch",
+            job_id=job.id,
+            url_platform=url_platform,
+            filler=filler.platform.value,
+        )
+        notifier.send_message(
+            f"La oferta {job.id} usa {url_platform}, pero el llenador es "
+            f"{filler.platform.value}; aplícala manualmente."
         )
         return FormApplyResult(status=FormApplyStatus.unsupported)
 
@@ -140,6 +161,30 @@ def apply_via_form(
     )
     factory = page_factory or _default_page
     with factory(url, config) as page_obj:
+        if url_platform is None:
+            # DOM-only detection: inspect the rendered page before touching anything.
+            dom_platform = detect_platform(url, page_obj.content())
+            if dom_platform is None:
+                log.info("form_apply_unsupported", job_id=job.id, url=url, reason="unknown_dom")
+                notifier.send_message(
+                    f"La oferta {job.id} no usa un formulario compatible; aplícala manualmente."
+                )
+                return FormApplyResult(status=FormApplyStatus.unsupported)
+            if dom_platform != filler.platform.value:
+                log.info(
+                    "form_apply_platform_mismatch",
+                    job_id=job.id,
+                    dom_platform=dom_platform,
+                    filler=filler.platform.value,
+                )
+                notifier.send_message(
+                    f"La oferta {job.id} usa {dom_platform}, pero el llenador es "
+                    f"{filler.platform.value}; aplícala manualmente."
+                )
+                return FormApplyResult(status=FormApplyStatus.unsupported)
+            platform = dom_platform
+        else:
+            platform = url_platform
         try:
             result = filler.fill_page(page_obj, ctx)
         except CaptchaError as exc:
@@ -150,7 +195,7 @@ def apply_via_form(
             # Unexpected form structure: safe abort with a screenshot, submit nothing.
             return _handle_abort(job, notifier, page_obj, filler, exc)
 
-        decision = request_submit_confirmation(notifier, job.id, result)
+        decision = request_submit_confirmation(notifier, job.id, result, nonce=confirmation_nonce)
         if decision is not SubmitDecision.submit:
             return _handle_not_submitted(job, notifier, result, decision)
 

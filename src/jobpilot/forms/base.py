@@ -70,6 +70,20 @@ class CaptchaError(RuntimeError):
     """
 
 
+class IncompleteFormError(FormStructureError):
+    """Raised when a required visible control is missing or left blank.
+
+    A subclass of :class:`FormStructureError` so it is handled identically — safe
+    abort with a screenshot and notification, never a submit — while carrying the
+    specific labels of the controls that are not complete so the owner is told
+    exactly what is missing (R15.7).
+    """
+
+    def __init__(self, missing: list[str]) -> None:
+        self.missing = missing
+        super().__init__(f"required controls not completed: {missing}")
+
+
 # --------------------------------------------------------------------------- #
 # Platform detection
 # --------------------------------------------------------------------------- #
@@ -117,6 +131,31 @@ _UNSUPPORTED_URL_MARKERS: tuple[str, ...] = (
 def _matches_any(haystack: str, needles: tuple[str, ...]) -> bool:
     lowered = haystack.lower()
     return any(needle.lower() in lowered for needle in needles)
+
+
+def _split_name(full_name: str) -> tuple[str, str]:
+    """Split an owner-approved full name into (first_name, last_name).
+
+    The first whitespace-separated token is the first name; everything after it is
+    the last name. A single-token name yields an empty last name, which the required
+    -field validation flags so the owner completes it rather than the system guessing.
+    No data is invented — only the owner's own ``basics.name`` is partitioned.
+    """
+    parts = full_name.split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def is_unsupported_url(url: str) -> bool:
+    """Return whether ``url`` is an explicitly out-of-scope platform (LinkedIn/Indeed).
+
+    These are never driven even if their DOM later resembles a supported ATS, so the
+    apply flow rejects them before a browser opens.
+    """
+    return _matches_any(url, _UNSUPPORTED_URL_MARKERS)
 
 
 def detect_platform(url: str, dom: str | None = None) -> str | None:
@@ -201,38 +240,130 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "fecha de nacimiento",
 )
 
-# A question is sensitive when it asks for years of experience WITH a named
-# technology (e.g. "How many years of experience do you have with Java?"). We detect
-# the years-of-experience phrasing and require a technology token near it.
+# A question is sensitive when it asks for years of experience (e.g. "How many years
+# of experience do you have with Java?"). We detect the years-of-experience phrasing
+# and, when it names a concrete subject (a technology), always treat it as sensitive —
+# regardless of whether that technology appears in the candidate's profile. R15.5
+# forbids ANY years-in-a-specific-technology question from reaching the LLM, so the
+# detection must not depend on the profile catalogue.
 _YEARS_PATTERNS: tuple[str, ...] = (
     "years of experience",
     "years experience",
+    "year of experience",
+    "yrs of experience",
+    "yrs experience",
     "how many years",
     "años de experiencia",
+    "año de experiencia",
     "cuántos años",
     "cuantos años",
 )
 
+# Words that commonly carry the years-of-experience phrasing WITHOUT naming a concrete
+# technology (generic tenure questions). These are stripped before deciding whether a
+# question names a specific subject, so "How many years of total experience?" is not
+# mistaken for a tech-specific one. A bare generic-tenure question is still routed
+# through the normal (non-sensitive) path unless another sensitive marker matches.
+_YEARS_GENERIC_SUBJECTS: tuple[str, ...] = (
+    "total",
+    "overall",
+    "professional",
+    "relevant",
+    "work",
+    "working",
+    "software",
+    "development",
+    "engineering",
+    "programming",
+    "general",
+    "totales",
+    "profesional",
+    "profesionales",
+    "relevante",
+    "relevantes",
+    "laboral",
+    "desarrollo",
+    "programación",
+    "programacion",
+)
 
-def _asks_years_in_technology(question: str, technologies: set[str]) -> bool:
-    """Return whether a question asks for years of experience in a named technology.
+# Tokens that appear in years-of-experience phrasing itself; dropped when probing for
+# a named technology so the phrasing words are not mistaken for a subject.
+_YEARS_PHRASE_TOKENS: frozenset[str] = frozenset(
+    {
+        "how",
+        "many",
+        "years",
+        "year",
+        "yrs",
+        "of",
+        "experience",
+        "do",
+        "you",
+        "have",
+        "with",
+        "in",
+        "using",
+        "the",
+        "a",
+        "an",
+        "your",
+        "cuantos",
+        "cuántos",
+        "anos",
+        "años",
+        "ano",
+        "año",
+        "de",
+        "experiencia",
+        "tienes",
+        "con",
+        "en",
+        "usando",
+        "tiene",
+        "el",
+        "la",
+        "los",
+        "las",
+        "tu",
+    }
+)
 
-    Sensitive only when the years-of-experience phrasing co-occurs with a concrete
-    technology name from the profile (so the model is never asked to quantify a
-    tech-specific tenure). A bare "years of experience" with no technology is not
-    treated as sensitive here.
+
+def _asks_years_in_technology(question: str) -> bool:
+    """Return whether a question asks for years of experience in a specific subject.
+
+    This looks only at the *shape* of the question, never at the profile catalogue:
+    a years-of-experience phrasing that names any concrete subject (a technology,
+    tool or stack) is sensitive, so it is answered only from the approved
+    ``answers_bank`` or left blank — the LLM is never asked to quantify tech-specific
+    tenure (R15.5). A generic-tenure question ("years of total experience") names no
+    technology and is not treated as sensitive by this rule.
     """
     lowered = question.lower()
     if not any(p in lowered for p in _YEARS_PATTERNS):
         return False
-    return any(re.search(r"\b" + re.escape(tech) + r"\b", lowered) for tech in technologies)
+    # Tokenise and drop the years-phrasing words and the known generic subjects; if
+    # any content token remains, the question names a specific subject (a technology).
+    tokens = re.findall(r"[a-zA-Z0-9.+#]+", lowered)
+    remaining = [
+        tok
+        for tok in tokens
+        if tok not in _YEARS_PHRASE_TOKENS and tok not in _YEARS_GENERIC_SUBJECTS
+    ]
+    return bool(remaining)
 
 
-def is_sensitive_question(question: str, technologies: set[str]) -> bool:
-    """Return whether a form question is SENSITIVE and must never reach the LLM."""
+def is_sensitive_question(question: str) -> bool:
+    """Return whether a form question is SENSITIVE and must never reach the LLM.
+
+    Sensitive questions are answered only from the approved ``answers_bank`` (or left
+    blank and reported) — never by the LLM. The years-of-experience-in-a-technology
+    case is detected from the question shape alone, independent of the profile.
+    """
     if _matches_any(question, _SENSITIVE_PATTERNS):
         return True
-    return _asks_years_in_technology(question, technologies)
+    return _asks_years_in_technology(question)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,16 +436,97 @@ def find_answer_bank_entry(profile: ProfileModel, question: str) -> AnswerBankEn
 
 
 # --------------------------------------------------------------------------- #
+# Custom-question discovery (shared, via the real Playwright element API)
+# --------------------------------------------------------------------------- #
+def _control_selector(control: FormElement) -> str | None:
+    """Build a stable CSS selector for a question's input/textarea control.
+
+    Prefers the control's ``id`` (``#id``) and falls back to its ``name``
+    (``[name="..."]``); a control with neither cannot be reliably targeted, so it is
+    skipped by the caller rather than guessed at.
+    """
+    control_id = control.get_attribute("id")
+    if control_id:
+        return f"#{control_id}"
+    name = control.get_attribute("name")
+    if name:
+        return f'[name="{name}"]'
+    return None
+
+
+def discover_questions(page: FormPage, schema: FormSchema) -> list[OpenQuestion]:
+    """Discover the form's custom questions using the real Playwright element API.
+
+    Each container matched by ``schema.question_container_selector`` is read with
+    ``query_selector_all`` and inspected with ``ElementHandle`` methods
+    (``inner_text`` for the label, ``query_selector`` for the control, ``get_attribute``
+    for a stable selector). Containers whose label or control cannot be resolved are
+    skipped. This is the exact path a local browser run takes, so the mocked tests
+    exercise production behaviour instead of a page-only shortcut.
+    """
+    questions: list[OpenQuestion] = []
+    for container in page.query_selector_all(schema.question_container_selector):
+        control = container.query_selector("textarea, input[type='text'], input:not([type])")
+        if control is None:
+            continue
+        selector = _control_selector(control)
+        if selector is None:
+            continue
+        label = container.inner_text().strip()
+        if not label:
+            continue
+        questions.append(OpenQuestion(selector=selector, label=label))
+    return questions
+
+
+def validate_required_fields(page: FormPage, schema: FormSchema) -> list[str]:
+    """Return the labels of required controls that are missing, hidden or blank.
+
+    A required control must exist, be visible and carry a non-empty value. The
+    returned list is empty when every required control is complete; a non-empty list
+    is the caller's signal to abort safely and never submit (R15.7).
+    """
+    incomplete: list[str] = []
+    for required in schema.required_fields:
+        control = page.query_selector(required.selector)
+        if control is None or not control.is_visible() or not control.input_value().strip():
+            incomplete.append(required.label)
+    return incomplete
+
+
+# --------------------------------------------------------------------------- #
 # Page abstraction (a real Playwright Page satisfies this; tests pass a fake)
 # --------------------------------------------------------------------------- #
 @runtime_checkable
-class FormPage(Protocol):
-    """The minimal page surface a FormFiller drives.
+class FormElement(Protocol):
+    """The minimal element-handle surface the shared driver reads.
 
-    A real Playwright ``Page`` already provides these methods with compatible
-    signatures; tests pass a fake implementing the same shape so no browser is
-    launched. Keeping the surface tiny makes the mock trivial and keeps the
-    platform logic honest about what it touches.
+    A real Playwright ``ElementHandle`` provides these with compatible signatures,
+    so question discovery and required-control validation run against the real API
+    (``query_selector_all`` returns these handles). Tests pass fakes of the same
+    shape, so no browser is launched while still exercising the production path.
+    """
+
+    def get_attribute(self, name: str) -> str | None: ...
+
+    def inner_text(self) -> str: ...
+
+    def input_value(self) -> str: ...
+
+    def is_visible(self) -> bool: ...
+
+    def query_selector(self, selector: str) -> FormElement | None: ...
+
+
+@runtime_checkable
+class FormPage(Protocol):
+    """The page surface a FormFiller drives, mirroring the real Playwright ``Page``.
+
+    Every method here matches a real Playwright ``Page`` signature, so the shared
+    driver's question discovery (:meth:`query_selector_all`) and required-control
+    validation (``input_value``/``is_visible`` on the returned handles) exercise the
+    exact API a local run uses. Tests pass a fake implementing the same shape so no
+    browser is launched, and the production path is the path under test.
     """
 
     def content(self) -> str: ...
@@ -323,7 +535,9 @@ class FormPage(Protocol):
 
     def set_input_files(self, selector: str, files: str) -> None: ...
 
-    def query_selector(self, selector: str) -> object | None: ...
+    def query_selector(self, selector: str) -> FormElement | None: ...
+
+    def query_selector_all(self, selector: str) -> list[FormElement]: ...
 
     def click(self, selector: str) -> None: ...
 
@@ -339,13 +553,28 @@ class OpenQuestion:
 
 
 @dataclass(frozen=True, slots=True)
+class RequiredField:
+    """A control that must be present, visible and non-empty before submit.
+
+    ``selector`` locates the input; ``label`` is the human name reported to the
+    owner when the control is missing or left blank. Required controls are validated
+    both before asking the owner to confirm and again immediately before the final
+    click, so an incomplete form is never submitted (R15.7).
+    """
+
+    selector: str
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
 class FormSchema:
     """Platform-specific selectors and markers the shared driver needs.
 
     Each concrete platform supplies one of these so the field-mapping, file-upload,
-    CAPTCHA-detection and structure-validation logic can live once on the ABC. The
-    ``required_markers`` are selectors that MUST be present for the page to look
-    like this platform; their absence triggers a safe abort (``FormStructureError``).
+    CAPTCHA-detection, question-discovery and structure-validation logic can live
+    once on the ABC. The ``required_markers`` are selectors that MUST be present for
+    the page to look like this platform; their absence triggers a safe abort
+    (``FormStructureError``).
     """
 
     #: Selector -> profile field name for the known text fields to fill.
@@ -360,6 +589,13 @@ class FormSchema:
     captcha_markers: tuple[str, ...]
     #: Selector for the final submit button (clicked only after owner confirmation).
     submit_selector: str
+    #: Selector matching each custom-question container the driver discovers. Each
+    #: matched element must expose a ``label`` (text) and a control (``textarea`` /
+    #: ``input``) with a stable ``id`` or ``name`` the driver turns into a selector.
+    question_container_selector: str
+    #: Controls that must be present, visible and non-empty before the form can be
+    #: submitted. A missing or blank required control aborts safely, never submits.
+    required_fields: tuple[RequiredField, ...] = ()
 
 
 @dataclass(slots=True)
@@ -395,16 +631,6 @@ class FormFiller(ABC):
         self._profile = profile
         self._llm = llm
         self._analysis = analysis
-        self._technologies = {t.lower() for t in self._profile_technologies()}
-
-    def _profile_technologies(self) -> set[str]:
-        techs: set[str] = set(self._profile.skills.all())
-        for exp in self._profile.experience:
-            for ach in exp.achievements:
-                techs.update(ach.tags)
-        for prj in self._profile.projects:
-            techs.update(prj.tags)
-        return techs
 
     def matches(self, url: str) -> bool:
         """Return whether this filler handles the platform ``url`` belongs to."""
@@ -419,13 +645,16 @@ class FormFiller(ABC):
     def schema(self) -> FormSchema:
         """The platform's selectors and markers for the shared driver."""
 
-    @abstractmethod
     def discover_open_questions(self, page: FormPage) -> list[OpenQuestion]:
         """Return the open (free-text) questions present on the form.
 
-        Platform-specific because the DOM differs; the shared driver then routes
-        each through :meth:`resolve_question`, enforcing the sensitive guard.
+        Shared across platforms: the per-platform DOM differences are captured by
+        ``schema.question_container_selector``, and :func:`discover_questions` reads
+        each container with the real Playwright element API. The driver then routes
+        every discovered question through :meth:`resolve_question`, enforcing the
+        sensitive guard.
         """
+        return discover_questions(page, self.schema)
 
     # ------------------------------------------------------------------ #
     # Shared page driver (identical safety behaviour across platforms)
@@ -460,6 +689,15 @@ class FormFiller(ABC):
         self._upload_documents(page, schema, ctx, acc)
         self._answer_open_questions(page, language, acc)
 
+        # Never ask the owner to confirm an incomplete form: every required visible
+        # control must carry a value. A missing or blank one is a safe abort.
+        incomplete = validate_required_fields(page, schema)
+        if incomplete:
+            log.warning(
+                "form_required_incomplete", platform=self.platform.value, missing=incomplete
+            )
+            raise IncompleteFormError(incomplete)
+
         screenshot_path = _take_screenshot(page, ctx.job_id, self.platform.value)
         result = acc.to_result(screenshot_path=screenshot_path)
         log.info(
@@ -485,6 +723,8 @@ class FormFiller(ABC):
             return self.fill_page(page, ctx)
         except CaptchaError as exc:
             return self._abort_result(page, ctx.job_id, "captcha", exc)
+        except IncompleteFormError as exc:
+            return self._abort_result(page, ctx.job_id, "incomplete_form", exc)
         except FormStructureError as exc:
             return self._abort_result(page, ctx.job_id, "unexpected_structure", exc)
 
@@ -496,9 +736,20 @@ class FormFiller(ABC):
         structure the fill step verified), so a missing button here is a
         :class:`FormStructureError` rather than a silent no-op.
         """
-        selector = self.schema.submit_selector
+        schema = self.schema
+        selector = schema.submit_selector
         if page.query_selector(selector) is None:
             raise FormStructureError(f"submit control {selector} not found")
+        # Re-validate immediately before the click: nothing must have become blank or
+        # hidden since the owner confirmed. An incomplete form is never submitted.
+        incomplete = validate_required_fields(page, schema)
+        if incomplete:
+            log.warning(
+                "form_submit_blocked_incomplete",
+                platform=self.platform.value,
+                missing=incomplete,
+            )
+            raise IncompleteFormError(incomplete)
         page.click(selector)
         log.info("form_submitted", platform=self.platform.value)
 
@@ -528,11 +779,21 @@ class FormFiller(ABC):
             acc.known(field_name)
 
     def _known_field_values(self) -> dict[str, str]:
-        """Map known field names to their profile values (empty strings skipped)."""
+        """Map known field names to their profile values (empty strings skipped).
+
+        ``first_name``/``last_name`` are split from the owner-approved full name so a
+        platform that has separate name controls (Greenhouse) gets each half in the
+        right field instead of the whole name in ``first_name``. A single-token name
+        fills only ``first_name`` and leaves ``last_name`` blank, which the required
+        -field validation then flags so the owner completes it before submit.
+        """
         basics = self._profile.basics
         links = basics.links
+        first_name, last_name = _split_name(basics.name)
         values: dict[str, str] = {
             "name": basics.name,
+            "first_name": first_name,
+            "last_name": last_name,
             "email": str(basics.email),
             "phone": basics.phone or "",
             "location": basics.location or "",
@@ -578,7 +839,7 @@ class FormFiller(ABC):
           (or any that looks sensitive after the fact) is kept but marked uncertain
           for the owner to review before submit.
         """
-        if is_sensitive_question(question, self._technologies):
+        if is_sensitive_question(question):
             entry = find_answer_bank_entry(self._profile, question)
             if entry is None:
                 log.info("form_sensitive_unanswered", question=question)

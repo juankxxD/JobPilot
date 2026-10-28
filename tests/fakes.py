@@ -10,6 +10,7 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from jobpilot.channels.telegram import TelegramDeliveryError
+from jobpilot.forms.base import FormElement
 from jobpilot.interfaces import Button, FillContext, FillResult, Update, UpdateBatch
 from jobpilot.models import (
     Application,
@@ -422,27 +423,94 @@ class FakeMailer:
         )
 
 
+class FakeFormQuestion(BaseModel):
+    """One custom question in a :class:`FakeFormPage`'s DOM.
+
+    ``container_selector`` is what the platform's ``question_container_selector``
+    matches; ``control_id``/``control_name`` back the stable selector the driver
+    derives (``#id`` preferred, then ``[name="..."]``); ``label`` is the visible
+    question text the driver reads via ``inner_text``.
+    """
+
+    label: str
+    container_selector: str
+    control_id: str | None = None
+    control_name: str | None = None
+
+    def control_selector(self) -> str:
+        if self.control_id:
+            return f"#{self.control_id}"
+        if self.control_name:
+            return f'[name="{self.control_name}"]'
+        raise ValueError("a question needs a control id or name")
+
+
+class FakeFormElement:
+    """A fake Playwright ``ElementHandle`` with the surface the driver reads."""
+
+    def __init__(
+        self,
+        page: FakeFormPage,
+        *,
+        attributes: dict[str, str] | None = None,
+        inner_text: str = "",
+        value_selector: str | None = None,
+        child: FakeFormElement | None = None,
+        visible: bool = True,
+    ) -> None:
+        self._page = page
+        self._attributes = attributes or {}
+        self._inner_text = inner_text
+        self._value_selector = value_selector
+        self._child = child
+        self._visible = visible
+
+    def get_attribute(self, name: str) -> str | None:
+        return self._attributes.get(name)
+
+    def inner_text(self) -> str:
+        return self._inner_text
+
+    def input_value(self) -> str:
+        if self._value_selector is None:
+            return ""
+        return self._page.filled.get(self._value_selector, "")
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def query_selector(self, selector: str) -> FormElement | None:
+        return self._child
+
+
 class FakeFormPage:
-    """A fake Playwright page implementing the ``FormPage`` surface (no browser).
+    """A fake Playwright page mirroring the real ``Page`` API surface (no browser).
 
     Tests configure which selectors exist (``present``), which custom questions the
-    DOM exposes (``questions`` -> ``query_question_fields``), and the page ``dom``.
-    Every ``fill``/``set_input_files``/``click``/``screenshot`` is recorded so a test
-    can assert what the filler did without launching a browser. A selector is
-    considered present if it is listed in ``present``; anything else returns ``None``
-    from ``query_selector`` so the filler skips it.
+    DOM exposes (``questions``), optional hidden controls (``hidden``), and the page
+    ``dom`` (for DOM-based platform detection). Discovery and required-field
+    validation run through the same :meth:`query_selector_all` / :meth:`query_selector`
+    + ``ElementHandle`` methods a real run uses, so the mocked tests exercise the
+    production path rather than a page-only shortcut. Every ``fill`` /
+    ``set_input_files`` / ``click`` / ``screenshot`` is recorded for assertions.
     """
 
     def __init__(
         self,
         *,
         present: Iterable[str] = (),
-        questions: Iterable[tuple[str, str]] = (),
+        questions: Iterable[FakeFormQuestion] = (),
+        hidden: Iterable[str] = (),
         dom: str = "",
     ) -> None:
         self._present = set(present)
         self._questions = list(questions)
+        self._hidden = set(hidden)
         self._dom = dom
+        # A question's derived control selector is present too, so the driver can
+        # fill it and required-field validation can read its value back.
+        for question in self._questions:
+            self._present.add(question.control_selector())
         self.filled: dict[str, str] = {}
         self.uploaded: dict[str, str] = {}
         self.clicked: list[str] = []
@@ -457,11 +525,31 @@ class FakeFormPage:
     def set_input_files(self, selector: str, files: str) -> None:
         self.uploaded[selector] = files
 
-    def query_selector(self, selector: str) -> object | None:
-        return object() if selector in self._present else None
+    def query_selector(self, selector: str) -> FormElement | None:
+        if selector not in self._present:
+            return None
+        return FakeFormElement(
+            self,
+            attributes={"id": selector.lstrip("#")},
+            value_selector=selector,
+            visible=selector not in self._hidden,
+        )
 
-    def query_question_fields(self) -> list[tuple[str, str]]:
-        return list(self._questions)
+    def query_selector_all(self, selector: str) -> list[FormElement]:
+        elements: list[FormElement] = []
+        for question in self._questions:
+            if question.container_selector != selector:
+                continue
+            attrs: dict[str, str] = {}
+            if question.control_id:
+                attrs["id"] = question.control_id
+            if question.control_name:
+                attrs["name"] = question.control_name
+            control = FakeFormElement(
+                self, attributes=attrs, value_selector=question.control_selector()
+            )
+            elements.append(FakeFormElement(self, inner_text=question.label, child=control))
+        return elements
 
     def click(self, selector: str) -> None:
         self.clicked.append(selector)
@@ -500,15 +588,24 @@ class FakeNotifier:
         *,
         highest_update_id: int | None = None,
         fail_send_after: int | None = None,
+        updates_after_send: Iterable[Update] = (),
     ) -> None:
         self.messages: list[SentMessage] = []
         self._updates: list[Update] = list(updates)
+        # Updates that only become visible once a message has been sent, modelling an
+        # owner who reacts to a prompt (e.g. presses Enviar) after it is shown.
+        self._updates_after_send: list[Update] = list(updates_after_send)
         self._highest_update_id = highest_update_id
         self._fail_send_after = fail_send_after
         self.get_updates_calls: list[int | None] = []
 
     def queue_updates(self, *updates: Update) -> None:
         self._updates.extend(updates)
+
+    def _all_updates(self) -> list[Update]:
+        if self.messages and self._updates_after_send:
+            return [*self._updates, *self._updates_after_send]
+        return list(self._updates)
 
     def send_message(
         self,
@@ -527,9 +624,10 @@ class FakeNotifier:
         )
 
     def _visible(self, offset: int | None) -> list[Update]:
+        updates = self._all_updates()
         if offset is None:
-            return list(self._updates)
-        return [u for u in self._updates if u.update_id >= offset]
+            return updates
+        return [u for u in updates if u.update_id >= offset]
 
     def _highest(self, offset: int | None) -> int | None:
         if self._highest_update_id is not None:

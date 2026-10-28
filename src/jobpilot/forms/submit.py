@@ -16,6 +16,7 @@ the whole flow without Telegram or real waiting.
 
 from __future__ import annotations
 
+import secrets
 import time
 from collections.abc import Callable
 from enum import StrEnum
@@ -33,10 +34,21 @@ log = get_logger(__name__)
 
 
 class SubmitAction(StrEnum):
-    """The owner's decision on a filled form, encoded as ``action:job_id``."""
+    """The owner's decision on a filled form, encoded as ``action:job_id:nonce``."""
 
     submit = "form_submit"
     cancel = "form_cancel"
+
+
+def new_confirmation_nonce() -> str:
+    """Return a short, unguessable nonce identifying one confirmation attempt.
+
+    Each pre-submit prompt gets a fresh nonce bound into both buttons' callback
+    data, so a delayed Enviar/Cancelar from an earlier (timed-out or crashed)
+    attempt for the same job carries a different nonce and is ignored. Only the
+    current attempt's exact token can authorize the final click.
+    """
+    return secrets.token_hex(8)
 
 
 class SubmitDecision(StrEnum):
@@ -47,11 +59,15 @@ class SubmitDecision(StrEnum):
     timeout = "timeout"
 
 
-def submit_buttons(job_id: int) -> list[Button]:
-    """The Enviar / Cancelar inline buttons shown before a form submit."""
+def submit_buttons(job_id: int, nonce: str) -> list[Button]:
+    """The Enviar / Cancelar inline buttons for one confirmation attempt.
+
+    Both callbacks embed ``nonce`` so only this attempt's buttons are honoured; a
+    stale callback from a prior attempt for the same job carries a different nonce.
+    """
     return [
-        Button(text="Enviar", callback_data=f"{SubmitAction.submit.value}:{job_id}"),
-        Button(text="Cancelar", callback_data=f"{SubmitAction.cancel.value}:{job_id}"),
+        Button(text="Enviar", callback_data=f"{SubmitAction.submit.value}:{job_id}:{nonce}"),
+        Button(text="Cancelar", callback_data=f"{SubmitAction.cancel.value}:{job_id}:{nonce}"),
     ]
 
 
@@ -95,37 +111,68 @@ def request_submit_confirmation(
     poll_attempts: int = 60,
     poll_interval_s: float = 2.0,
     sleep: Callable[[float], None] = time.sleep,
+    nonce: str | None = None,
 ) -> SubmitDecision:
     """Ask the owner to confirm a form submit and return their decision.
 
-    Sends the screenshot + the uncertain/sensitive-field summary with Enviar/Cancelar
-    buttons, then polls ``get_update_batch`` for the matching callback. Returns
-    :attr:`SubmitDecision.submit` only on an explicit Enviar for THIS job,
-    :attr:`SubmitDecision.cancel` on Cancelar, and :attr:`SubmitDecision.timeout` if
-    no decision arrives within ``poll_attempts`` polls. A timeout is treated by the
-    caller exactly like a cancel: nothing is submitted.
+    A fresh confirmation nonce is bound into the Enviar/Cancelar callbacks, and any
+    Telegram backlog queued *before* the prompt is drained first (the cursor starts
+    past the highest pending update), so a delayed Enviar from an earlier attempt for
+    the same job — which carries a different nonce and predates this prompt — can
+    never authorize this submission. Only a callback that both arrives after the
+    prompt and matches this attempt's exact nonce counts.
+
+    Returns :attr:`SubmitDecision.submit` only on this attempt's explicit Enviar,
+    :attr:`SubmitDecision.cancel` on its Cancelar, and :attr:`SubmitDecision.timeout`
+    if no matching decision arrives within ``poll_attempts`` polls. A timeout is
+    treated by the caller exactly like a cancel: nothing is submitted.
     """
+    attempt_nonce = nonce or new_confirmation_nonce()
+
+    # Drain any backlog so a stale callback queued before this prompt is skipped: the
+    # cursor begins just past the highest update Telegram currently holds.
+    offset: int | None = None
+    backlog = notifier.get_update_batch(offset=None)
+    if backlog.highest_update_id is not None:
+        offset = backlog.highest_update_id + 1
+
     attachments = screenshot_attachment(result.screenshot_path)
     notifier.send_message(
         render_presubmit_text(job_id, result),
-        buttons=submit_buttons(job_id),
+        buttons=submit_buttons(job_id, attempt_nonce),
         attachments=attachments,
     )
-    submit_cb = f"{SubmitAction.submit.value}:{job_id}"
-    cancel_cb = f"{SubmitAction.cancel.value}:{job_id}"
-    offset: int | None = None
+    submit_cb = f"{SubmitAction.submit.value}:{job_id}:{attempt_nonce}"
+    cancel_cb = f"{SubmitAction.cancel.value}:{job_id}:{attempt_nonce}"
     for _ in range(poll_attempts):
         batch = notifier.get_update_batch(offset=offset)
         for update in sorted(batch.updates, key=lambda u: u.update_id):
             offset = update.update_id + 1
             if update.callback_data == submit_cb:
-                log.info("form_submit_confirmed", job_id=job_id)
+                log.info("form_submit_confirmed", job_id=job_id, nonce=attempt_nonce)
                 return SubmitDecision.submit
             if update.callback_data == cancel_cb:
-                log.info("form_submit_cancelled", job_id=job_id)
+                log.info("form_submit_cancelled", job_id=job_id, nonce=attempt_nonce)
                 return SubmitDecision.cancel
+            if _is_stale_same_job_callback(update.callback_data, job_id, attempt_nonce):
+                log.info(
+                    "form_submit_stale_callback_ignored",
+                    job_id=job_id,
+                    callback=update.callback_data,
+                )
         if batch.highest_update_id is not None:
             offset = batch.highest_update_id + 1
         sleep(poll_interval_s)
     log.warning("form_submit_timeout", job_id=job_id)
     return SubmitDecision.timeout
+
+
+def _is_stale_same_job_callback(callback: str | None, job_id: int, nonce: str) -> bool:
+    """Return whether ``callback`` is a submit/cancel for this job but a different nonce."""
+    if callback is None:
+        return False
+    for action in (SubmitAction.submit.value, SubmitAction.cancel.value):
+        prefix = f"{action}:{job_id}:"
+        if callback.startswith(prefix) and callback != f"{prefix}{nonce}":
+            return True
+    return False

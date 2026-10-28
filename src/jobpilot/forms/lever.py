@@ -9,9 +9,10 @@ every custom question through the shared
 never reach the LLM.
 
 As with Greenhouse, all the safety behaviour (CAPTCHA stop, unexpected-structure
-safe abort, uncertain tracking, screenshot, never-submit boundary) lives on the base
-class; this module only supplies the Lever selectors and its custom-question
-discovery. Playwright is opened lazily via :mod:`jobpilot.forms.runtime`.
+safe abort, uncertain tracking, required-field validation, screenshot, never-submit
+boundary) and the custom-question discovery live on the base class; this module only
+supplies the Lever selectors. Playwright is opened lazily via
+:mod:`jobpilot.forms.runtime`.
 """
 
 from __future__ import annotations
@@ -21,32 +22,42 @@ from typing import TYPE_CHECKING
 from jobpilot.forms.base import (
     FormFiller,
     FormSchema,
-    OpenQuestion,
     Platform,
+    RequiredField,
 )
 from jobpilot.forms.runtime import open_form_page
 
 if TYPE_CHECKING:
     from jobpilot.config import FormsConfig
-    from jobpilot.forms.base import FormPage
     from jobpilot.interfaces import FillContext, FillResult, LlmClient
     from jobpilot.models import JobAnalysis
     from jobpilot.profile.model import ProfileModel
 
 _LEVER_SCHEMA = FormSchema(
     field_map={
+        # Lever uses a single full-name control; the profile's full name belongs here.
         "input[name='name']": "name",
         "input[name='email']": "email",
         "input[name='phone']": "phone",
-        "input[name='org']": "location",
         "input[name='urls[LinkedIn]']": "linkedin",
         "input[name='urls[GitHub]']": "github",
+        # NOTE: input[name='org'] is the candidate's *current company*, which the
+        # profile does not expose as a single field, so it is left blank (never the
+        # location) rather than filled with semantically wrong data.
     },
     cv_selector="input[name='resume']",
     cover_letter_selector="input[name='cover_letter']",
-    required_markers=(".application-form", "input[name='email']"),
+    required_markers=(".application-form", "input[name='name']", "input[name='email']"),
     captcha_markers=("iframe[src*='recaptcha']", ".g-recaptcha", "#px-captcha"),
     submit_selector="button[data-qa='btn-submit']",
+    # Lever renders each "additional information" question inside an
+    # ``.application-question`` card whose label is the question text and whose
+    # control is a ``textarea``/``input`` with a stable ``name``.
+    question_container_selector=".application-question",
+    required_fields=(
+        RequiredField(selector="input[name='name']", label="Nombre completo"),
+        RequiredField(selector="input[name='email']", label="Correo electrónico"),
+    ),
 )
 
 
@@ -68,20 +79,6 @@ class LeverFormFiller(FormFiller):
     @property
     def schema(self) -> FormSchema:
         return _LEVER_SCHEMA
-
-    def discover_open_questions(self, page: FormPage) -> list[OpenQuestion]:
-        """Return the Lever "additional information" questions as open questions.
-
-        Lever renders custom cards whose label is the question text and whose
-        textarea carries a stable name; ``query_question_fields`` (implemented by the
-        real page and the test fake alike) returns ``(selector, label)`` pairs, so
-        this DOM detail stays out of the shared driver.
-        """
-        getter = getattr(page, "query_question_fields", None)
-        if not callable(getter):
-            return []
-        pairs = getter()
-        return [OpenQuestion(selector=selector, label=label) for selector, label in pairs]
 
     def fill(self, url: str, ctx: FillContext) -> FillResult:
         """Open the Lever form at ``url`` and fill it, never submitting.
