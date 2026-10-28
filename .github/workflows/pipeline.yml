@@ -2,8 +2,11 @@ name: jobpilot-pipeline
 
 on:
   schedule:
-    # Every 2 hours (configurable). Adjust together with config.yaml schedule.cron_hours.
+    # Every 2 hours by default. To change the cadence, edit this single cron
+    # expression (e.g. "0 */4 * * *" for every 4 hours) and keep
+    # config.yaml schedule.cron_hours in sync so the docs match reality.
     - cron: "0 */2 * * *"
+  # Manual run from the Actions tab (same job, no schedule wait).
   workflow_dispatch: {}
 
 concurrency:
@@ -46,6 +49,16 @@ jobs:
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          MAIL_FROM_ADDRESS: ${{ secrets.MAIL_FROM_ADDRESS }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          MIN_SCORE: ${{ vars.MIN_SCORE }}
+          DAILY_APPLICATION_LIMIT: ${{ vars.DAILY_APPLICATION_LIMIT }}
+          DEFAULT_LANGUAGE: ${{ vars.DEFAULT_LANGUAGE }}
         run: |
-          # Phase 5+ wires this to the real pipeline.
+          # Apply any pending DB migrations, then run one full pipeline cycle.
+          # Phase 8 (assisted form filling) is LOCAL ONLY: the `forms`/playwright
+          # extra is intentionally not installed and `apply-form` is never invoked
+          # here, so no browser automation runs in CI.
+          python -m jobpilot migrate
           python -m jobpilot run

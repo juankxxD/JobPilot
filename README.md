@@ -339,6 +339,48 @@ local y corren en CI.
 
 ---
 
+---
+
+## Checklist de configuración manual por fase
+
+Las fases se implementan con servicios **fakeados** (ningún servicio real se
+contacta en los tests). Esto es lo que tú, como dueño, debes configurar a mano para
+que cada capa funcione de verdad con tus credenciales. Hazlo una vez; después todo
+corre solo por GitHub Actions.
+
+- **Fase 2 — Recolección**
+  - [ ] `DATABASE_URL` de Neon en `.env`.
+  - [ ] `jobpilot migrate` para crear las tablas (`jobs`, `applications`, `telegram_state`).
+  - [ ] (Opcional) `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` si habilitas Adzuna en `config.yaml`.
+- **Fase 3 — Análisis y scoring**
+  - [ ] `GROQ_API_KEY` en `.env` (modelo por defecto `openai/gpt-oss-120b`).
+  - [ ] (Opcional) Ollama local corriendo si quieres el fallback (`OLLAMA_BASE_URL`, `OLLAMA_MODEL`).
+  - [ ] Ajusta `MIN_SCORE` y los pesos de `scoring` en `config.yaml` a tu gusto.
+- **Fase 4 — Documentos**
+  - [ ] Librerías nativas de WeasyPrint instaladas (ver "Puesta en marcha").
+  - [ ] Cuenta de servicio de Google: `GOOGLE_SERVICE_ACCOUNT_JSON` y `DRIVE_FOLDER_ID`.
+  - [ ] Carpeta de Drive compartida con el correo de la cuenta de servicio.
+- **Fase 5 — Telegram**
+  - [ ] Bot creado con @BotFather: `TELEGRAM_BOT_TOKEN`.
+  - [ ] `TELEGRAM_OWNER_CHAT_ID` con tu chat id (el bot solo te responde a ti).
+- **Fase 6 — Envío**
+  - [ ] `MAIL_PROVIDER` (`outlook` por defecto o `gmail`).
+  - [ ] Outlook/Graph: `GRAPH_CLIENT_ID`, `GRAPH_TENANT_ID`, luego `jobpilot auth-mail`
+        para obtener y guardar `GRAPH_REFRESH_TOKEN`; define `MAIL_FROM_ADDRESS`.
+  - [ ] Gmail (alternativa): `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`.
+- **Fase 7 — Seguimiento**
+  - [ ] Revisa `follow_up.reminder_after_days` y `follow_up.weekly_report_weekday` en `config.yaml`.
+- **Fase 8 — Formularios asistidos (solo local)**
+  - [ ] Instala el extra: `uv pip install -e ".[forms]"` y luego `playwright install`.
+  - [ ] Nunca corre en CI; se invoca a mano con `jobpilot apply-form <id>`.
+- **Fase 9 — Despliegue**
+  - [ ] Carga cada secreto en GitHub (Settings → Secrets and variables → Actions).
+  - [ ] Variables no secretas (`MIN_SCORE`, `DAILY_APPLICATION_LIMIT`, `DEFAULT_LANGUAGE`) como *variables*.
+  - [ ] (Opcional) Ajusta la cadencia del cron en `.github/workflows/pipeline.yml`.
+  - Detalle completo en [docs/deployment.md](docs/deployment.md).
+
+---
+
 ## Documentación
 
 - [docs/architecture.md](docs/architecture.md) — arquitectura detallada
