@@ -31,8 +31,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
       - name: Install dependencies
-        run: uv pip install --system -e "."
+        # Install into the uv venv (not --system: the runner's system Python is
+        # externally managed, PEP 668). Later steps use `uv run` so they pick it up.
+        run: uv pip install -e "."
 
       - name: Materialize profile.yaml
         # profile.yaml is the owner-approved single source of truth. It is
@@ -89,5 +94,5 @@ jobs:
           # Phase 8 (assisted form filling) is LOCAL ONLY: the `forms`/playwright
           # extra is intentionally not installed and `apply-form` is never invoked
           # here, so no browser automation runs in CI.
-          python -m jobpilot migrate
-          python -m jobpilot run
+          uv run jobpilot migrate
+          uv run jobpilot run
