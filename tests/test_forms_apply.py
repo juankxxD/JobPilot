@@ -52,7 +52,10 @@ def test_company_domain_dom_dispatches_to_greenhouse(example_profile: ProfileMod
         "#submit_app",
     }
     dom = '<div id="grnhse_app"></div>'
-    page = FakeFormPage(present=gh_present, dom=dom)
+    # The confirmation marker appears only after a successful submit click.
+    page = FakeFormPage(
+        present=gh_present, dom=dom, present_after_click={"#application_confirmation"}
+    )
 
     @contextmanager
     def factory(url: str, config: AppConfig) -> Iterator[FormPage]:
@@ -87,6 +90,9 @@ def test_company_domain_dom_dispatches_to_greenhouse(example_profile: ProfileMod
         language=Language.en,
         cv_path="/tmp/cv_en.pdf",
         cover_letter_path="/tmp/cover_en.pdf",
+        cv_variant="backend_en",
+        cv_url="https://drive.example/cv_en.pdf",
+        cover_letter_url="https://drive.example/cover_en.pdf",
         page_factory=factory,
         confirmation_nonce="n",
     )
@@ -138,6 +144,9 @@ def test_unknown_company_domain_dom_is_unsupported(example_profile: ProfileModel
         language=Language.en,
         cv_path="/tmp/cv_en.pdf",
         cover_letter_path="/tmp/cover_en.pdf",
+        cv_variant="backend_en",
+        cv_url="https://drive.example/cv_en.pdf",
+        cover_letter_url="https://drive.example/cover_en.pdf",
         page_factory=factory,
     )
 

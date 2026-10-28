@@ -44,6 +44,17 @@ _GH_PRESENT = {
     "#submit_app",
 }
 
+#: The Greenhouse confirmation marker the platform reveals after a successful submit;
+#: a submit-success test's page exposes it only once the submit button is clicked.
+_GH_SUCCESS = "#application_confirmation"
+
+
+def _gh_success_page(**kwargs: object) -> FakeFormPage:
+    """A Greenhouse page that reveals its confirmation marker on a successful click."""
+    kwargs.setdefault("present", _GH_PRESENT)
+    return FakeFormPage(present_after_click={_GH_SUCCESS}, **kwargs)  # type: ignore[arg-type]
+
+
 # A fixed confirmation nonce so a test can predict the Enviar/Cancelar callback data.
 _NONCE = "testnonce"
 
@@ -78,9 +89,9 @@ def _apply(
     notifier: FakeNotifier,
     repo: FakeJobRepository,
     *,
-    cv_variant: str = "",
-    cv_url: str | None = None,
-    cover_letter_url: str | None = None,
+    cv_variant: str = "backend_en",
+    cv_url: str = "https://drive.example/cv_en.pdf",
+    cover_letter_url: str = "https://drive.example/cover_en.pdf",
 ) -> FormApplyResult:
     repo.seed_job(_job())
     filler = GreenhouseFormFiller(profile, _StubLlm(), FormsConfig())
@@ -167,7 +178,7 @@ def test_captcha_stops_and_notifies_never_evades(example_profile: ProfileModel) 
 
 
 def test_final_click_only_on_enviar(example_profile: ProfileModel) -> None:
-    page = FakeFormPage(present=_GH_PRESENT)
+    page = _gh_success_page()
     # The owner presses Enviar for job 7.
     notifier = FakeNotifier(
         updates_after_send=[
@@ -334,6 +345,9 @@ def test_unsupported_url_rejected_before_browser(example_profile: ProfileModel) 
         language=Language.en,
         cv_path="/tmp/cv_en.pdf",
         cover_letter_path="/tmp/cover_en.pdf",
+        cv_variant="backend_en",
+        cv_url="https://drive.example/cv_en.pdf",
+        cover_letter_url="https://drive.example/cover_en.pdf",
         page_factory=_page_factory(page),
     )
 
@@ -425,7 +439,7 @@ def test_checked_required_checkbox_allows_submit(example_profile: ProfileModel) 
         required=True,
         checked=True,
     )
-    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+    page = _gh_success_page(questions=[question])
     notifier = FakeNotifier(
         updates_after_send=[
             Update(
@@ -566,10 +580,178 @@ def test_hcaptcha_detected_at_fill(example_profile: ProfileModel) -> None:
 # --------------------------------------------------------------------------- #
 # P8-009: a confirmed submit records the CV variant and both document URLs
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# P8-007: the final gate verifies files remain ATTACHED, not just the selectors
+# --------------------------------------------------------------------------- #
+class _FilesClearedBeforeSubmitPage(FakeFormPage):
+    """A page whose uploaded files are cleared after the preview (DOM re-render).
+
+    The upload selectors stay present, so a selector-only gate would still click.
+    The attachment-state gate must notice the file inputs are now empty and abort.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(present=_GH_PRESENT, present_after_click={_GH_SUCCESS})
+
+    def screenshot(self, *, path: str) -> None:
+        super().screenshot(path=path)
+        self.uploaded.clear()  # the file inputs lose their attachments
+
+
+def test_cleared_file_inputs_before_submit_abort_no_submit(
+    example_profile: ProfileModel,
+) -> None:
+    page = _FilesClearedBeforeSubmitPage()
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:7:{_NONCE}",
+            )
+        ]
+    )
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    # Both document selectors are still present, but the files were cleared during
+    # the Telegram review, so the submit gate aborts: screenshot + notify, no click.
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+    assert page.screenshots  # a safe-abort screenshot was taken
+    assert any("segura" in m.text for m in notifier.messages)
+
+
+# --------------------------------------------------------------------------- #
+# P8-008: click-time, post-click and persistence failures are safely reconciled
+# --------------------------------------------------------------------------- #
+def _enviar_notifier() -> FakeNotifier:
+    return FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:7:{_NONCE}",
+            )
+        ]
+    )
+
+
+def test_click_timeout_is_safe_abort_not_crash(example_profile: ProfileModel) -> None:
+    # A Playwright click failure (timeout / detached control) must not escape as an
+    # unhandled crash: it becomes a safe abort with a screenshot and notification.
+    page = FakeFormPage(present=_GH_PRESENT, click_raises=RuntimeError("click timeout"))
+    notifier = _enviar_notifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert repo.applications == []
+    # The click was attempted but failed; nothing was recorded and the claim released.
+    assert repo.form_claim_state(7) is None
+    assert any("segura" in m.text for m in notifier.messages)
+
+
+class _NoSuccessMarkerPage(FakeFormPage):
+    """A page that clicks successfully but never reveals a confirmation marker."""
+
+    def __init__(self) -> None:
+        super().__init__(present=_GH_PRESENT)  # no present_after_click
+
+
+def test_post_click_unconfirmed_is_ambiguous_and_blocks_retry(
+    example_profile: ProfileModel,
+) -> None:
+    # The click returns but no success marker appears: the outcome is AMBIGUOUS. The
+    # claim stays in place so a retry cannot resubmit, and nothing is recorded.
+    page = _NoSuccessMarkerPage()
+    notifier = _enviar_notifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.ambiguous
+    assert repo.applications == []
+    assert repo.form_claim_state(7) == "in_progress"  # claim retained for reconciliation
+
+
+class _ErrorBannerPage(FakeFormPage):
+    """A page that reveals a validation error banner after the click (rejected)."""
+
+    def __init__(self) -> None:
+        super().__init__(present=_GH_PRESENT, present_after_click={"#error_box"})
+
+
+def test_post_click_validation_error_is_safe_abort(example_profile: ProfileModel) -> None:
+    page = _ErrorBannerPage()
+    notifier = _enviar_notifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert repo.applications == []
+    assert repo.form_claim_state(7) is None  # rejection releases the claim for retry
+
+
+def test_database_finalize_failure_leaves_claim_and_no_record(
+    example_profile: ProfileModel,
+) -> None:
+    # The platform accepted the submission, but recording it fails. Nothing is
+    # recorded and the claim stays in place so a later Enviar cannot resubmit.
+    page = _gh_success_page()
+    notifier = _enviar_notifier()
+    repo = FakeJobRepository()
+    repo.fail_finalize = True
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.ambiguous
+    assert repo.applications == []
+    assert repo.form_claim_state(7) == "in_progress"
+    assert any("base de datos" in m.text for m in notifier.messages)
+
+
+def test_repeat_invocation_after_claim_does_not_resubmit(
+    example_profile: ProfileModel,
+) -> None:
+    # A durable claim already exists (a prior attempt in progress/done): a second
+    # confirmed Enviar must submit nothing and record nothing.
+    page = _gh_success_page()
+    notifier = _enviar_notifier()
+    repo = FakeJobRepository()
+    repo.seed_job(_job())
+    repo.claim_form_submit(7)  # a prior attempt already claimed the submit
+
+    filler = GreenhouseFormFiller(example_profile, _StubLlm(), FormsConfig())
+    result = apply_via_form(
+        _job(),
+        filler,
+        notifier,
+        repo,
+        AppConfig(),
+        language=Language.en,
+        cv_path="/tmp/cv_en.pdf",
+        cover_letter_path="/tmp/cover_en.pdf",
+        cv_variant="backend_en",
+        cv_url="https://drive.example/cv_en.pdf",
+        cover_letter_url="https://drive.example/cover_en.pdf",
+        page_factory=_page_factory(page),
+        confirmation_nonce=_NONCE,
+    )
+
+    assert result.status is FormApplyStatus.already_claimed
+    assert page.clicked == []
+    assert repo.applications == []
+
+
 def test_confirmed_submit_records_document_metadata(example_profile: ProfileModel) -> None:
     from jobpilot.forms.submit import SubmitAction
 
-    page = FakeFormPage(present=_GH_PRESENT)
+    page = _gh_success_page()
     notifier = FakeNotifier(
         updates_after_send=[
             Update(

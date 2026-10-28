@@ -58,6 +58,7 @@ def _ctx(profile: ProfileModel) -> FillContext:
         language=Language.en.value,
         cv_path="/tmp/cv_en.pdf",
         cover_letter_path="/tmp/cover_en.pdf",
+        cover_letter_text="Dear hiring team, I am excited to apply for this role.",
     )
 
 
@@ -229,6 +230,9 @@ _LEVER_PRESENT = {
     "input[name='name']",
     "input[name='email']",
     "input[name='resume']",
+    # Lever has no dedicated cover-letter upload; the approved cover-letter TEXT goes
+    # into its "additional information" textarea, so that control must be present.
+    "textarea[name='comments']",
     "button[data-qa='btn-submit']",
 }
 
@@ -247,6 +251,66 @@ def test_lever_known_fields_mapped(example_profile: ProfileModel) -> None:
     assert not result.aborted
     # The organization control is never filled with the candidate's location.
     assert "input[name='org']" not in page.filled
+
+
+def test_lever_cover_letter_text_placed_in_additional_info(
+    example_profile: ProfileModel,
+) -> None:
+    # P8-011: with no dedicated cover-letter upload, Lever places the APPROVED cover
+    # letter TEXT into its additional-information control — never a letter the LLM
+    # regenerated — so the application carries the cover letter.
+    from tests.fakes import FakeFormPage
+
+    filler = LeverFormFiller(example_profile, TrackingLlm(), FormsConfig())
+    page = FakeFormPage(present=_LEVER_PRESENT)
+
+    result = filler.fill_page(page, _ctx(example_profile))
+
+    assert (
+        page.filled["textarea[name='comments']"]
+        == "Dear hiring team, I am excited to apply for this role."
+    )
+    assert "cover_letter" in result.filled_fields
+    assert not result.aborted
+
+
+def test_lever_without_cover_letter_destination_safe_aborts(
+    example_profile: ProfileModel,
+) -> None:
+    # P8-011: if Lever exposes neither a dedicated upload nor the additional-info
+    # control, there is no safe destination for the cover letter, so the form aborts
+    # rather than submitting a CV-only application.
+    from tests.fakes import FakeFormPage
+
+    present = set(_LEVER_PRESENT)
+    present.discard("textarea[name='comments']")
+    filler = LeverFormFiller(example_profile, TrackingLlm(), FormsConfig())
+    page = FakeFormPage(present=present)
+
+    result = filler.fill_with_safe_abort(page, _ctx(example_profile))
+
+    assert result.aborted
+    assert "Carta de presentación" in (result.abort_reason or "")
+
+
+def test_lever_without_cover_letter_text_safe_aborts(example_profile: ProfileModel) -> None:
+    # P8-011: the additional-info control exists but no approved cover-letter text was
+    # supplied, so there is nothing safe to place — abort rather than submit CV-only.
+    from tests.fakes import FakeFormPage
+
+    filler = LeverFormFiller(example_profile, TrackingLlm(), FormsConfig())
+    page = FakeFormPage(present=_LEVER_PRESENT)
+    ctx = FillContext(
+        job_id=1,
+        language=Language.en.value,
+        cv_path="/tmp/cv_en.pdf",
+        cover_letter_path="/tmp/cover_en.pdf",
+        cover_letter_text=None,
+    )
+
+    result = filler.fill_with_safe_abort(page, ctx)
+
+    assert result.aborted
 
 
 # --------------------------------------------------------------------------- #
@@ -273,6 +337,13 @@ _PROTECTED_CATEGORY_QUESTIONS: list[tuple[str, str]] = [
     ("years_in_tech_parenthetical", "Python experience (years)"),
     ("years_in_tech_state", "Please state years of Java experience"),
     ("years_in_tech_es", "¿Cuántos años de experiencia tienes con SAP?"),
+    # P8-006 regression: the exact review spot-check phrasings that previously slipped
+    # past the guard and reached the LLM. Each must now classify as sensitive.
+    ("work_auth_lawful", "Are you lawfully permitted to work in the United States?"),
+    ("relocation_moving", "Are you open to moving to New York?"),
+    ("legal_arrested", "Have you ever been arrested?"),
+    ("demographics_origin", "Are you of Hispanic or Latino origin?"),
+    ("years_in_tech_dash", "Java - years"),
 ]
 
 
@@ -348,3 +419,196 @@ def test_sensitive_question_from_bank_never_reaches_llm(example_profile: Profile
     assert page.filled["#q_reloc"] == bank.text(Language.en)
     assert llm.prompts == []
     assert not result.unanswered_sensitive
+
+
+# --------------------------------------------------------------------------- #
+# P8-010: non-text sensitive controls are answered only by an exact bank match,
+# otherwise left blank and reported — never routed to the LLM.
+# --------------------------------------------------------------------------- #
+def _profile_with_bank(
+    example_profile: ProfileModel, key: str, patterns: list[str], value: str
+) -> ProfileModel:
+    """Return a copy of the profile carrying one extra approved bank entry."""
+    from jobpilot.profile.model import AnswerBankEntry
+
+    entry = AnswerBankEntry(key=key, question_patterns=patterns, sensitive=True, es=value, en=value)
+    # Only the single tailored entry is present, so no other approved pattern (e.g.
+    # the example profile's broad "visa" entry) intercepts the question first.
+    return example_profile.model_copy(update={"answers_bank": [entry]})
+
+
+def test_sensitive_select_answered_from_exact_bank_option(example_profile: ProfileModel) -> None:
+    # A work-authorization <select> whose approved bank answer exactly matches one of
+    # its options is selected from the bank; the LLM is never consulted (R15.5).
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    profile = _profile_with_bank(
+        example_profile,
+        key="visa_select",
+        patterns=["visa sponsorship"],
+        value="No sponsorship required",
+    )
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="Do you require visa sponsorship?",
+        container_selector=".field.custom-question",
+        control_id="q_visa_select",
+        kind="select",
+        required=True,
+        options=["Yes, sponsorship required", "No sponsorship required"],
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(profile))
+
+    assert page.filled["#q_visa_select"] == "No sponsorship required"
+    assert llm.prompts == []
+    assert not result.unanswered_sensitive
+    assert not result.aborted
+
+
+def test_optional_sensitive_select_without_bank_is_blank_and_reported(
+    example_profile: ProfileModel,
+) -> None:
+    # An OPTIONAL sensitive <select> with no approved answer is left blank and
+    # reported in unanswered_sensitive — not routed to the LLM, not aborted.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    stripped = example_profile.model_copy(update={"answers_bank": []})
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(stripped, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="What is your gender?",
+        container_selector=".field.custom-question",
+        control_id="q_gender",
+        kind="select",
+        required=False,
+        options=["Male", "Female", "Prefer not to say"],
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(stripped))
+
+    assert "#q_gender" not in page.filled
+    assert llm.prompts == []
+    assert result.unanswered_sensitive == ["What is your gender?"]
+    assert not result.aborted
+
+
+def test_sensitive_select_without_matching_option_is_blank_and_reported(
+    example_profile: ProfileModel,
+) -> None:
+    # A bank answer that matches no offered option must NOT be force-fit; the control
+    # stays blank and is reported, never guessed.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    profile = _profile_with_bank(
+        example_profile,
+        key="visa_select",
+        patterns=["visa sponsorship"],
+        value="It depends on the contract",
+    )
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="Do you require visa sponsorship?",
+        container_selector=".field.custom-question",
+        control_id="q_visa_select",
+        kind="select",
+        required=False,
+        options=["Yes", "No"],
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(profile))
+
+    assert "#q_visa_select" not in page.filled
+    assert llm.prompts == []
+    assert result.unanswered_sensitive == ["Do you require visa sponsorship?"]
+
+
+def test_sensitive_number_answered_from_numeric_bank(example_profile: ProfileModel) -> None:
+    # A years-in-tech number input with a numeric approved answer is filled from the
+    # bank; the LLM is never consulted.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    profile = _profile_with_bank(
+        example_profile,
+        key="years_sap",
+        patterns=["years of experience do you have with sap"],
+        value="4",
+    )
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="How many years of experience do you have with SAP?",
+        container_selector=".field.custom-question",
+        control_id="q_sap_num",
+        kind="number",
+        required=True,
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(profile))
+
+    assert page.filled["#q_sap_num"] == "4"
+    assert llm.prompts == []
+    assert not result.unanswered_sensitive
+    assert not result.aborted
+
+
+def test_sensitive_radio_answered_from_exact_bank_option(example_profile: ProfileModel) -> None:
+    # A demographic radio whose approved answer matches the control's value is checked
+    # from the bank; the LLM is never consulted.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    profile = _profile_with_bank(
+        example_profile,
+        key="veteran_status",
+        patterns=["protected veteran"],
+        value="I am not a protected veteran",
+    )
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="Are you a protected veteran?",
+        container_selector=".field.custom-question",
+        control_id="q_vet",
+        kind="radio",
+        required=True,
+        options=["I am not a protected veteran", "I am a protected veteran"],
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(profile))
+
+    assert "#q_vet" in page._checked  # the radio was checked from the bank
+    assert llm.prompts == []
+    assert not result.unanswered_sensitive
+    assert not result.aborted
+
+
+def test_lever_sensitive_select_without_bank_is_blank_and_reported(
+    example_profile: ProfileModel,
+) -> None:
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    stripped = example_profile.model_copy(update={"answers_bank": []})
+    llm = TrackingLlm()
+    filler = LeverFormFiller(stripped, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="Will you require sponsorship now or in the future?",
+        container_selector=".application-question",
+        control_name="cards[sponsorship]",
+        kind="select",
+        required=False,
+        options=["Yes", "No"],
+    )
+    page = FakeFormPage(present=_LEVER_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(stripped))
+
+    assert llm.prompts == []
+    assert result.unanswered_sensitive == ["Will you require sponsorship now or in the future?"]
+    assert not result.aborted

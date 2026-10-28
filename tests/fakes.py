@@ -87,6 +87,7 @@ class FakeJobRepository:
         self._applications: list[Application] = []
         self._state: dict[str, str] = {}
         self._email_send_claims: dict[int, str] = {}
+        self._form_submit_claims: dict[int, str] = {}
         self._next_job_id = 1
         self._next_app_id = 1
         self.upsert_calls = 0
@@ -217,6 +218,37 @@ class FakeJobRepository:
     def email_claim_state(self, job_id: int) -> str | None:
         """Return the stored email-send claim state for ``job_id`` (test helper)."""
         return self._email_send_claims.get(job_id)
+
+    # Assisted-form submit idempotency (mirrors NeonJobRepository, P8-008) #
+    def claim_form_submit(self, job_id: int) -> bool:
+        """Create a unique in-progress form-submit claim; False if one exists."""
+        if job_id in self._form_submit_claims:
+            return False
+        self._form_submit_claims[job_id] = "in_progress"
+        return True
+
+    def release_form_submit(self, job_id: int) -> None:
+        """Drop an in-progress form claim (not submitted; safe to retry)."""
+        if self._form_submit_claims.get(job_id) == "in_progress":
+            del self._form_submit_claims[job_id]
+
+    def finalize_form_submit(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark applied and close the form claim.
+
+        ``fail_finalize`` lets a test simulate a database failure AFTER the platform
+        accepted the submission: nothing is recorded, the job stays as-is, and the
+        claim is left ``in_progress`` so a later Enviar cannot resubmit.
+        """
+        if self.fail_finalize:
+            raise RuntimeError("simulated database failure after platform acceptance")
+        stored = self.create_application(app)
+        self.set_status(job_id, JobStatus.applied)
+        self._form_submit_claims[job_id] = "done"
+        return stored
+
+    def form_claim_state(self, job_id: int) -> str | None:
+        """Return the stored form-submit claim state for ``job_id`` (test helper)."""
+        return self._form_submit_claims.get(job_id)
 
     def get_state(self, key: str) -> str | None:
         return self._state.get(key)
@@ -472,6 +504,9 @@ class FakeFormQuestion(BaseModel):
     kind: FakeControlKind = "text"
     required: bool = False
     checked: bool = False
+    #: Selectable option values for a ``select``/``radio`` control, so a sensitive
+    #: answer from the bank is applied only when it exactly matches one offered choice.
+    options: list[str] = []
 
     def control_selector(self) -> str:
         if self.control_id:
@@ -501,6 +536,7 @@ class FakeFormElement:
         visible: bool = True,
         checked: bool = False,
         children: dict[str, FakeFormElement] | None = None,
+        options: list[str] | None = None,
     ) -> None:
         self._page = page
         self._attributes = attributes or {}
@@ -512,6 +548,9 @@ class FakeFormElement:
         # Optional CSS-selector -> child element map so a container can expose
         # different controls to different selectors (free-text vs. non-text).
         self._children = children or {}
+        # Selectable <option> values for a select/radio control, exposed through
+        # ``query_selector_all("option")`` so the driver can match a bank answer.
+        self._options = options or []
 
     def get_attribute(self, name: str) -> str | None:
         return self._attributes.get(name)
@@ -537,6 +576,11 @@ class FakeFormElement:
         return self._child
 
     def query_selector_all(self, selector: str) -> list[FormElement]:
+        if _selector_matches(selector, "option"):
+            return [
+                FakeFormElement(self._page, attributes={"value": value}, inner_text=value)
+                for value in self._options
+            ]
         return [
             element for css, element in self._children.items() if _selector_matches(selector, css)
         ]
@@ -561,11 +605,18 @@ class FakeFormPage:
         questions: Iterable[FakeFormQuestion] = (),
         hidden: Iterable[str] = (),
         dom: str = "",
+        present_after_click: Iterable[str] = (),
+        click_raises: Exception | None = None,
     ) -> None:
         self._present = set(present)
         self._questions = list(questions)
         self._hidden = set(hidden)
         self._dom = dom
+        # Markers that only appear once the submit button is clicked (a platform
+        # confirmation page) and an optional exception a click should raise, so tests
+        # can model a successful submit, a post-click challenge, or a click failure.
+        self._present_after_click = set(present_after_click)
+        self._click_raises = click_raises
         # A question's derived control selector is present too, so the driver can
         # fill it and required-field validation can read its value back.
         for question in self._questions:
@@ -574,6 +625,13 @@ class FakeFormPage:
         self.uploaded: dict[str, str] = {}
         self.clicked: list[str] = []
         self.screenshots: list[str] = []
+        # Selectors the driver has checked (radio/checkbox) during this run, unioned
+        # with each question's initial ``checked`` state so the completeness gate sees
+        # a control answered from the bank as complete.
+        self._checked: set[str] = set()
+        self._questions_by_selector: dict[str, FakeFormQuestion] = {
+            q.control_selector(): q for q in self._questions
+        }
 
     def content(self) -> str:
         return self._dom
@@ -584,14 +642,40 @@ class FakeFormPage:
     def set_input_files(self, selector: str, files: str) -> None:
         self.uploaded[selector] = files
 
+    def file_input_value(self, selector: str) -> str:
+        # Mirrors a real file input's ``input_value`` (the attached file path), so the
+        # completeness gate sees the live attachment state, not just a selector.
+        return self.uploaded.get(selector, "")
+
+    def select_option(self, selector: str, value: str) -> None:
+        # Selecting an option records the chosen value so the control reads complete.
+        self.filled[selector] = value
+
+    def check(self, selector: str) -> None:
+        self._checked.add(selector)
+
+    def _is_checked(self, selector: str, question: FakeFormQuestion | None) -> bool:
+        if selector in self._checked:
+            return True
+        return bool(question and question.checked)
+
     def query_selector(self, selector: str) -> FormElement | None:
         if selector not in self._present:
             return None
+        question = self._questions_by_selector.get(selector)
+        attrs: dict[str, str] = {"id": selector.lstrip("#")}
+        options: list[str] = []
+        if question is not None and question.kind in {"select", "radio"}:
+            options = list(question.options)
+            if question.kind == "radio" and options:
+                attrs["value"] = options[0]
         return FakeFormElement(
             self,
-            attributes={"id": selector.lstrip("#")},
+            attributes=attrs,
             value_selector=selector,
             visible=selector not in self._hidden,
+            checked=self._is_checked(selector, question),
+            options=options,
         )
 
     def _question_control(self, question: FakeFormQuestion) -> FakeFormElement:
@@ -610,11 +694,15 @@ class FakeFormPage:
             attrs["type"] = "text"
         if question.required:
             attrs["required"] = "required"
+        options: list[str] = []
+        if question.kind in {"select", "radio"}:
+            options = list(question.options)
         return FakeFormElement(
             self,
             attributes=attrs,
             value_selector=question.control_selector(),
-            checked=question.checked,
+            checked=self._is_checked(question.control_selector(), question),
+            options=options,
         )
 
     def query_selector_all(self, selector: str) -> list[FormElement]:
@@ -639,6 +727,11 @@ class FakeFormPage:
 
     def click(self, selector: str) -> None:
         self.clicked.append(selector)
+        if self._click_raises is not None:
+            raise self._click_raises
+        # Model the platform's post-click response: a successful submit reveals the
+        # configured success markers so the post-submit verification can confirm it.
+        self._present.update(self._present_after_click)
 
     def screenshot(self, *, path: str) -> None:
         self.screenshots.append(path)

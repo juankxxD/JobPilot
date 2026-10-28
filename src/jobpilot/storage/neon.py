@@ -430,6 +430,81 @@ class NeonJobRepository:
             raise RuntimeError("finalize_email_send did not return a row")
         return _row_to_application(row)
 
+    # ------------------------------------------------------------------ #
+    # Assisted-form submit idempotency (R11.6 / P8-008) — reuses the
+    # ``email_send_claims`` table keyed by (job_id, channel='form_assisted').
+    # ------------------------------------------------------------------ #
+    def claim_form_submit(self, job_id: int) -> bool:
+        """Durably and uniquely claim the assisted-form submit for ``job_id``.
+
+        Atomically inserts an ``in_progress`` row whose ``(job_id, channel)`` primary
+        key enforces one assisted-form operation per job, so a second confirmed
+        Enviar can never click submit again. Returns ``True`` when this call created
+        the claim, ``False`` when one already exists (in progress, ambiguous or done).
+        """
+        import psycopg
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO email_send_claims (job_id, channel, state) "
+                    "VALUES (%s, 'form_assisted', 'in_progress')",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except psycopg.errors.UniqueViolation:
+            self._conn.rollback()
+            log.info("form_submit_claim_exists", job_id=job_id)
+            return False
+        except Exception:
+            self._conn.rollback()
+            raise
+        return True
+
+    def release_form_submit(self, job_id: int) -> None:
+        """Drop an ``in_progress`` form claim so a NOT-submitted attempt can retry.
+
+        Only called when the click never happened or the platform clearly rejected
+        the submission (nothing was accepted). An AMBIGUOUS outcome (the click
+        returned but success could not be confirmed) must NOT be released: the claim
+        stays and blocks any automatic resubmission until the owner reconciles it.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM email_send_claims "
+                "WHERE job_id = %s AND channel = 'form_assisted' AND state = 'in_progress'",
+                (job_id,),
+            )
+        self._conn.commit()
+
+    def finalize_form_submit(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark applied and close the form claim.
+
+        The application row, the job's ``applied`` status and the claim's ``done``
+        state commit together or not at all. A failure here leaves the claim
+        ``in_progress`` (ambiguous), which keeps a later Enviar from re-submitting.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                self._insert_application(cur, app)
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE jobs SET status = %s, status_changed_at = now() WHERE id = %s",
+                    (JobStatus.applied.value, job_id),
+                )
+                cur.execute(
+                    "UPDATE email_send_claims SET state = 'done', updated_at = now() "
+                    "WHERE job_id = %s AND channel = 'form_assisted'",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if row is None:  # pragma: no cover - RETURNING always yields a row
+            raise RuntimeError("finalize_form_submit did not return a row")
+        return _row_to_application(row)
+
     def get_state(self, key: str) -> str | None:
         with self._conn.cursor() as cur:
             cur.execute("SELECT value FROM telegram_state WHERE key = %s", (key,))

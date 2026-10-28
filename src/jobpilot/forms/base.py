@@ -70,6 +70,19 @@ class CaptchaError(RuntimeError):
     """
 
 
+class SubmitAmbiguousError(RuntimeError):
+    """Raised when a submit click returns but success cannot be confirmed.
+
+    After the final click the platform must present a recognised success state and
+    no new anti-bot / validation challenge. When neither a success nor a clear
+    failure can be established — a timeout, a silent validation error, or a changed
+    page — the attempt is AMBIGUOUS: the remote site may or may not have accepted it,
+    so nothing is recorded and the owner is told to reconcile it manually. It is a
+    stop condition distinct from a clean safe abort because a submission may already
+    have been accepted (P8-008).
+    """
+
+
 class IncompleteFormError(FormStructureError):
     """Raised when a required visible control is missing or left blank.
 
@@ -217,6 +230,12 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "eligible for employment",
     "legal right to work",
     "right to work",
+    "lawfully permitted to work",
+    "lawfully authorized",
+    "lawfully authorised",
+    "permitted to work",
+    "permanently authorized",
+    "permanently authorised",
     "require sponsorship",
     "need sponsorship",
     "visa",
@@ -241,7 +260,12 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "willing to relocate",
     "able to relocate",
     "open to relocation",
+    "open to moving",
+    "open to move",
     "move to",
+    "moving to",
+    "move for",
+    "moving for",
     "commute to",
     "reubicar",
     "reubicación",
@@ -255,8 +279,18 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "background check",
     "criminal",
     "felony",
+    "misdemeanor",
+    "misdemeanour",
     "conviction",
     "convicted",
+    "arrest",
+    "arrested",
+    "charged with",
+    "offense",
+    "offence",
+    "incarcerat",
+    "probation",
+    "parole",
     "legal status",
     "non-compete",
     "noncompete",
@@ -278,6 +312,13 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "race",
     "ethnicity",
     "ethnic",
+    "ethnic origin",
+    "national origin",
+    "hispanic",
+    "latino",
+    "latina",
+    "latinx",
+    "latin origin",
     "disability",
     "veteran",
     "sexual orientation",
@@ -325,6 +366,14 @@ _YEARS_PATTERNS: tuple[str, ...] = (
     "(years)",
     "(yrs)",
     "in years",
+    "- years",
+    "– years",
+    "— years",
+    ": years",
+    "years:",
+    "years experience",
+    " years",
+    "years ",
     "años de experiencia",
     "año de experiencia",
     "años usando",
@@ -588,6 +637,104 @@ def discover_questions(page: FormPage, schema: FormSchema) -> list[OpenQuestion]
     return questions
 
 
+def _control_kind(control: FormElement) -> str:
+    """Classify a non-text control as ``select``/``radio``/``checkbox``/``number``."""
+    control_type = (control.get_attribute("type") or "").lower()
+    if control_type in {"radio", "checkbox", "number"}:
+        return control_type
+    return "select"
+
+
+#: Affirmative tokens that may check a sensitive checkbox from an approved-bank answer.
+_AFFIRMATIVE_TOKENS: frozenset[str] = frozenset({"yes", "y", "true", "sí", "si"})
+
+
+def _is_numeric(value: str) -> bool:
+    """Return whether ``value`` is a plain non-negative number (for a number input)."""
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _control_option_values(page: FormPage, selector: str) -> list[str]:
+    """Return the selectable option values/labels for a select or radio control.
+
+    Reads the control's ``<option>`` children (a select) or the sibling radio inputs
+    sharing its name, so a sensitive answer is only applied when it exactly matches
+    one offered choice. Each option contributes both its ``value`` attribute and its
+    visible text, so an approved answer can match either.
+    """
+    control = page.query_selector(selector)
+    if control is None:
+        return []
+    values: list[str] = []
+    for option in control.query_selector_all("option"):
+        value = option.get_attribute("value")
+        if value:
+            values.append(value)
+        text = option.inner_text().strip()
+        if text:
+            values.append(text)
+    # A radio group exposes its own value directly on the input.
+    own_value = control.get_attribute("value")
+    if own_value:
+        values.append(own_value)
+    return values
+
+
+def _exact_option_match(options: list[str], value: str) -> str | None:
+    """Return the option exactly matching ``value`` (case-insensitive), else ``None``.
+
+    Matching is exact (not substring) so a sensitive answer is never applied to an
+    option it only partially resembles; ambiguity leaves the control blank.
+    """
+    lowered = value.lower()
+    matches = [opt for opt in options if opt.lower() == lowered]
+    if len(matches) == 1 or (matches and len({m.lower() for m in matches}) == 1):
+        return matches[0]
+    return None
+
+
+def discover_nontext_questions(page: FormPage, schema: FormSchema) -> list[NonTextQuestion]:
+    """Discover custom-question controls the driver cannot free-type an answer into.
+
+    Each container matched by ``schema.question_container_selector`` whose control is
+    a select, radio, checkbox or number input is returned with its label, a stable
+    selector, its kind and whether it is marked required. These are routed through
+    :meth:`FormFiller.resolve_nontext_question` so a SENSITIVE non-text question is
+    answered only by an exact approved-bank match, otherwise left blank and reported;
+    the LLM is never consulted for one (R15.5). A required one with no safe answer is
+    caught by :func:`validate_required_controls` and aborts the form (R15.3/R15.7).
+    """
+    questions: list[NonTextQuestion] = []
+    for container in page.query_selector_all(schema.question_container_selector):
+        if container.query_selector(_OPEN_TEXT_CONTROL_SELECTOR) is not None:
+            continue  # answerable free-text question, handled by discover_questions
+        control = container.query_selector(_NON_TEXT_CONTROL_SELECTOR)
+        if control is None:
+            continue
+        selector = _control_selector(control)
+        if selector is None:
+            continue
+        label = container.inner_text().strip()
+        if not label:
+            continue
+        required = control.get_attribute("required") is not None or (
+            container.get_attribute("required") is not None
+        )
+        questions.append(
+            NonTextQuestion(
+                selector=selector,
+                label=label,
+                kind=_control_kind(control),
+                required=required,
+            )
+        )
+    return questions
+
+
 def _control_is_complete(control: FormElement) -> bool:
     """Return whether a single control carries an acceptable, non-empty answer.
 
@@ -749,6 +896,12 @@ class FormPage(Protocol):
 
     def set_input_files(self, selector: str, files: str) -> None: ...
 
+    def file_input_value(self, selector: str) -> str: ...
+
+    def select_option(self, selector: str, value: str) -> None: ...
+
+    def check(self, selector: str) -> None: ...
+
     def query_selector(self, selector: str) -> FormElement | None: ...
 
     def query_selector_all(self, selector: str) -> list[FormElement]: ...
@@ -764,6 +917,22 @@ class OpenQuestion:
 
     selector: str
     label: str
+
+
+@dataclass(slots=True)
+class NonTextQuestion:
+    """One non-free-text question control (select/radio/checkbox/number).
+
+    The driver never authors an answer for these: a SENSITIVE one is answered only
+    by an exact approved-bank match (``kind`` decides how the match is applied), and
+    otherwise left blank and reported. ``required`` tells the completeness gate
+    whether a blank one must abort the form.
+    """
+
+    selector: str
+    label: str
+    kind: str
+    required: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -813,12 +982,21 @@ class FormSchema:
     #: Whether the CV upload control MUST be present (its absence aborts the form).
     #: A CV is always expected on a real application, so this defaults to ``True``.
     cv_required: bool = True
-    #: Whether a dedicated cover-letter upload control MUST be present. Greenhouse
-    #: exposes one, so it is mandatory there; Lever often has no separate cover-letter
-    #: upload (its "additional information" free-text field serves that role), so the
-    #: Lever schema sets this ``False`` and the cover letter is attached only when a
-    #: control exists — never making an otherwise complete Lever form unsubmittable.
-    cover_letter_required: bool = True
+    #: Optional selector for a free-text "additional information" control that serves
+    #: as the cover-letter destination on platforms with no dedicated upload (Lever).
+    #: When set and the dedicated upload is absent, the approved cover-letter *text*
+    #: (``FillContext.cover_letter_text``) is written here — never regenerated by the
+    #: LLM. ``None`` means the platform has no text fallback.
+    cover_letter_text_selector: str | None = None
+    #: Selectors that, after the final click, confirm the platform accepted the
+    #: application (a confirmation banner / "thank you" page). At least one must be
+    #: present post-click for the submit to be recorded; otherwise the attempt is
+    #: AMBIGUOUS and left for manual reconciliation (P8-008).
+    success_markers: tuple[str, ...] = ()
+    #: Selectors that, after the final click, indicate the platform REJECTED the
+    #: submission (a validation summary / error banner). Their presence means the
+    #: click did not succeed, so nothing is recorded.
+    post_submit_error_markers: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -911,12 +1089,13 @@ class FormFiller(ABC):
         self._fill_known_fields(page, schema, acc)
         self._upload_documents(page, schema, ctx, acc)
         self._answer_open_questions(page, language, acc)
+        self._answer_nontext_questions(page, language, acc)
 
         # Never ask the owner to confirm an incomplete form. The full required-control
         # set (static fields, DOM-marked [required], and unanswerable required
         # selects/radios/checkboxes/number inputs) must be complete, and both the CV
-        # and cover-letter uploads must have succeeded. Any gap is a safe abort.
-        self._ensure_complete(page, schema)
+        # and cover-letter documents must be actually attached. Any gap is a safe abort.
+        self._ensure_complete(page, schema, ctx)
 
         screenshot_path = _take_screenshot(page, ctx.job_id, self.platform.value)
         result = acc.to_result(screenshot_path=screenshot_path)
@@ -948,7 +1127,7 @@ class FormFiller(ABC):
         except FormStructureError as exc:
             return self._abort_result(page, ctx.job_id, "unexpected_structure", exc)
 
-    def submit(self, page: FormPage) -> None:
+    def submit(self, page: FormPage, ctx: FillContext) -> None:
         """Click the platform's final submit button, re-running every safety guard.
 
         Called ONLY after the owner's explicit Enviar confirmation; filling never
@@ -960,12 +1139,16 @@ class FormFiller(ABC):
         #. a CAPTCHA / anti-bot challenge raises :class:`CaptchaError` (never evaded);
         #. an unexpected structure or a missing submit control raises
            :class:`FormStructureError`;
-        #. any required control that is now blank/hidden, or a missing document
-           upload, raises :class:`IncompleteFormError`.
+        #. any required control that is now blank/hidden, or a cover letter / CV no
+           longer attached, raises :class:`IncompleteFormError`.
 
-        The caller converts any of these to a stop/safe-abort that records nothing,
-        so a challenge or a changed DOM at the boundary never produces a submit
-        (R15.6/R15.7).
+        Then the click itself is wrapped: a Playwright failure (a detached/disabled
+        control, a timeout) becomes a :class:`FormStructureError` so the caller
+        safe-aborts with a screenshot instead of crashing. After the click the
+        platform's post-submit state is verified — a new CAPTCHA raises
+        :class:`CaptchaError`, a recognised rejection raises :class:`FormStructureError`,
+        and an unconfirmable outcome raises :class:`SubmitAmbiguousError` — so a
+        submission is recorded only when the platform clearly accepted it (P8-008).
         """
         schema = self.schema
         # Re-detect anti-bot and re-validate structure first: a challenge or DOM
@@ -979,9 +1162,43 @@ class FormFiller(ABC):
             raise FormStructureError(f"submit control {selector} not found")
         # Re-validate completeness: nothing must have become blank or hidden and both
         # documents must still be attached. An incomplete form is never submitted.
-        self._ensure_complete(page, schema)
-        page.click(selector)
+        self._ensure_complete(page, schema, ctx)
+        try:
+            page.click(selector)
+        except (CaptchaError, FormStructureError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - any click failure is a safe abort
+            log.warning("form_submit_click_failed", platform=self.platform.value, error=str(exc))
+            raise FormStructureError(f"submit click failed: {exc}") from exc
+        self._verify_post_submit(page, schema)
         log.info("form_submitted", platform=self.platform.value)
+
+    def _verify_post_submit(self, page: FormPage, schema: FormSchema) -> None:
+        """Verify the platform accepted the submission after the final click.
+
+        Raises :class:`CaptchaError` if an anti-bot challenge appeared, a
+        :class:`FormStructureError` if the platform shows a recognised rejection, and
+        :class:`SubmitAmbiguousError` if neither a success marker nor a clear failure
+        can be established. A clean success (a success marker present, no challenge,
+        no error) returns normally so the caller records the application.
+        """
+        if _detect_captcha(page, schema):
+            log.warning("form_post_submit_captcha", platform=self.platform.value)
+            raise CaptchaError(
+                f"CAPTCHA / anti-bot challenge after submit on {self.platform.value}"
+            )
+        errors = schema.post_submit_error_markers
+        if any(page.query_selector(marker) is not None for marker in errors):
+            log.warning("form_post_submit_rejected", platform=self.platform.value)
+            raise FormStructureError(f"{self.platform.value} rejected the submission")
+        if not schema.success_markers:
+            return
+        if any(page.query_selector(marker) is not None for marker in schema.success_markers):
+            return
+        log.warning("form_post_submit_ambiguous", platform=self.platform.value)
+        raise SubmitAmbiguousError(
+            f"could not confirm {self.platform.value} accepted the submission"
+        )
 
     def _abort_result(self, page: FormPage, job_id: int, reason: str, exc: Exception) -> FillResult:
         """Build the ``aborted=True`` result, saving an abort screenshot first."""
@@ -1046,39 +1263,85 @@ class FormFiller(ABC):
         if page.query_selector(schema.cv_selector) is not None:
             page.set_input_files(schema.cv_selector, ctx.cv_path)
             acc.known("cv")
+        self._attach_cover_letter(page, schema, ctx, acc)
+
+    def _attach_cover_letter(
+        self, page: FormPage, schema: FormSchema, ctx: FillContext, acc: FillAccumulator
+    ) -> None:
+        """Place the approved cover letter into the platform's actual destination.
+
+        A dedicated upload control takes the rendered PDF. A platform with no such
+        control (Lever) instead writes the approved cover-letter *text* into its
+        "additional information" control (``cover_letter_text_selector``) — never a
+        letter regenerated by the LLM. If neither destination is usable the cover
+        letter is simply not attached here; :meth:`_missing_documents` then decides
+        whether that is a safe abort (it is, whenever a cover letter is expected).
+        """
         if page.query_selector(schema.cover_letter_selector) is not None:
             page.set_input_files(schema.cover_letter_selector, ctx.cover_letter_path)
             acc.known("cover_letter")
+            return
+        text_selector = schema.cover_letter_text_selector
+        if (
+            text_selector is not None
+            and ctx.cover_letter_text
+            and page.query_selector(text_selector) is not None
+        ):
+            page.fill(text_selector, ctx.cover_letter_text)
+            acc.known("cover_letter")
 
-    def _missing_documents(self, page: FormPage, schema: FormSchema) -> list[str]:
-        """Return labels for any mandatory document upload control that is absent.
+    def _missing_documents(self, page: FormPage, schema: FormSchema, ctx: FillContext) -> list[str]:
+        """Return labels for any mandatory document that is not actually attached.
 
-        Which uploads are mandatory is platform-specific (``cv_required`` /
-        ``cover_letter_required``): a missing CV control aborts every supported form,
-        while a missing cover-letter control aborts only on platforms that expose one
-        (Greenhouse). Lever has no dedicated cover-letter upload, so it is not treated
-        as missing there.
+        This checks the live attachment STATE, not merely that an upload control
+        exists: a DOM re-render during the Telegram review can keep the selectors but
+        clear the file inputs, so a selector-only check would let an incomplete form
+        reach submit (P8-007). A CV must be attached on every supported form. A cover
+        letter must reach a real destination — the dedicated upload's file, or the
+        approved cover-letter *text* in the platform's additional-information control
+        (Lever) — otherwise it is missing and the form aborts, never submitting a
+        CV-only application (P8-011/R15.3).
         """
         missing: list[str] = []
-        if schema.cv_required and page.query_selector(schema.cv_selector) is None:
+        if schema.cv_required and not self._cv_attached(page, schema):
             missing.append("CV (hoja de vida)")
-        if (
-            schema.cover_letter_required
-            and page.query_selector(schema.cover_letter_selector) is None
-        ):
+        if not self._cover_letter_attached(page, schema, ctx):
             missing.append("Carta de presentación")
         return missing
 
-    def _ensure_complete(self, page: FormPage, schema: FormSchema) -> None:
-        """Abort safely unless every required control and both uploads are complete.
+    def _cv_attached(self, page: FormPage, schema: FormSchema) -> bool:
+        """Return whether the CV file input currently holds an attached file."""
+        if page.query_selector(schema.cv_selector) is None:
+            return False
+        return bool(page.file_input_value(schema.cv_selector).strip())
 
-        Unions the required-control gate with the mandatory CV + cover-letter upload
-        check so an incomplete form — a blank/hidden required field, an unanswerable
-        required select/radio/checkbox/number input, or a missing document control —
-        is never shown to the owner for confirmation nor submitted (R15.3/R15.7).
+    def _cover_letter_attached(self, page: FormPage, schema: FormSchema, ctx: FillContext) -> bool:
+        """Return whether the approved cover letter reached a real destination.
+
+        A dedicated upload must currently hold a file; otherwise the additional
+        -information text control must hold the approved cover-letter text. Either is
+        acceptable; neither means the cover letter is not attached and the form must
+        abort (never a CV-only submit).
+        """
+        if page.query_selector(schema.cover_letter_selector) is not None:
+            return bool(page.file_input_value(schema.cover_letter_selector).strip())
+        text_selector = schema.cover_letter_text_selector
+        if text_selector is not None and page.query_selector(text_selector) is not None:
+            control = page.query_selector(text_selector)
+            return control is not None and bool(control.input_value().strip())
+        return False
+
+    def _ensure_complete(self, page: FormPage, schema: FormSchema, ctx: FillContext) -> None:
+        """Abort safely unless every required control and both documents are complete.
+
+        Unions the required-control gate with the mandatory CV + cover-letter
+        attachment check so an incomplete form — a blank/hidden required field, an
+        unanswerable required select/radio/checkbox/number input, or a document not
+        actually attached — is never shown to the owner for confirmation nor
+        submitted (R15.3/R15.7).
         """
         incomplete = [
-            *self._missing_documents(page, schema),
+            *self._missing_documents(page, schema, ctx),
             *validate_required_controls(page, schema),
         ]
         if incomplete:
@@ -1096,6 +1359,75 @@ class FormFiller(ABC):
             if outcome.value is not None and page.query_selector(question.selector) is not None:
                 page.fill(question.selector, outcome.value)
             acc.answered(question.label, outcome)
+
+    def _answer_nontext_questions(
+        self, page: FormPage, language: Language, acc: FillAccumulator
+    ) -> None:
+        """Handle select/radio/checkbox/number questions, enforcing the guard.
+
+        A non-text question is never authored by the LLM. A SENSITIVE one is answered
+        only when an exact approved-bank entry matches and the match can be applied to
+        the control (an option selected, a radio/checkbox checked, a numeric value
+        filled); otherwise it is left blank and reported in ``unanswered_sensitive``.
+        A non-sensitive non-text question is left untouched here — the driver cannot
+        safely author a choice — and a required blank one is caught by the
+        completeness gate (:func:`validate_required_controls`), which aborts the form
+        rather than guessing (R15.3/R15.5/R15.7).
+        """
+        for question in discover_nontext_questions(page, self.schema):
+            if not is_sensitive_question(question.label):
+                # The LLM must never choose an option/radio/checkbox for the owner, so
+                # a non-sensitive non-text control is left as-is; the required-control
+                # gate aborts it when blank-and-required.
+                continue
+            entry = find_answer_bank_entry(self._profile, question.label)
+            applied = False
+            if entry is not None:
+                applied = self._apply_bank_to_nontext(page, question, entry.text(language))
+            if applied:
+                log.info(
+                    "form_sensitive_nontext_from_bank", question=question.label, kind=question.kind
+                )
+                acc.known(question.label)
+            else:
+                log.info("form_sensitive_nontext_unanswered", question=question.label)
+                acc.answered(question.label, _AnswerOutcome(value=None, unanswered_sensitive=True))
+
+    def _apply_bank_to_nontext(self, page: FormPage, question: NonTextQuestion, value: str) -> bool:
+        """Apply an approved-bank ``value`` to a non-text control by exact matching.
+
+        Returns whether the value could be applied. For a select/radio the value must
+        exactly match an available option (case-insensitive); for a checkbox it must
+        be an affirmative token; for a number it must be numeric. Anything that is not
+        an exact, unambiguous match is refused so the control stays blank and is
+        reported rather than guessed (R15.5).
+        """
+        if page.query_selector(question.selector) is None:
+            return False
+        normalized = value.strip()
+        if not normalized:
+            return False
+        if question.kind in {"select", "radio"}:
+            options = _control_option_values(page, question.selector)
+            match = _exact_option_match(options, normalized)
+            if match is None:
+                return False
+            if question.kind == "select":
+                page.select_option(question.selector, match)
+            else:
+                page.check(question.selector)
+            return True
+        if question.kind == "checkbox":
+            if normalized.lower() not in _AFFIRMATIVE_TOKENS:
+                return False
+            page.check(question.selector)
+            return True
+        if question.kind == "number":
+            if not _is_numeric(normalized):
+                return False
+            page.fill(question.selector, normalized)
+            return True
+        return False
 
     # ------------------------------------------------------------------ #
     # Shared answering logic (identical safety behaviour across platforms)

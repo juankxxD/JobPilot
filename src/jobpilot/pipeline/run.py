@@ -265,6 +265,10 @@ class GeneratedDocuments:
     cover_letter: Attachment
     cv_file: StoredFile
     cover_letter_file: StoredFile
+    #: The approved cover-letter plain-text body. Preserved so the assisted-form path
+    #: can place the letter into a platform's additional-information control (Lever)
+    #: without ever regenerating it through the form-answer LLM.
+    cover_letter_body: str = ""
 
 
 def _upload_attachment(storage: FileStorage, attachment: Attachment, tmp_dir: Path) -> StoredFile:
@@ -339,6 +343,7 @@ def generate_documents(
         cover_letter=cover,
         cv_file=cv_file,
         cover_letter_file=cover_file,
+        cover_letter_body=cover_letter_body,
     )
 
 
@@ -376,6 +381,12 @@ class ProposalRepository(Protocol):
     def release_email_send(self, job_id: int) -> None: ...
 
     def finalize_email_send(self, job_id: int, app: Application) -> Application: ...
+
+    def claim_form_submit(self, job_id: int) -> bool: ...
+
+    def release_form_submit(self, job_id: int) -> None: ...
+
+    def finalize_form_submit(self, job_id: int, app: Application) -> Application: ...
 
     def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int: ...
 
@@ -454,6 +465,9 @@ class ProposalArtifacts:
     cover_letter_url: str | None
     cv: Attachment | None = None
     cover_letter: Attachment | None = None
+    #: The approved cover-letter plain-text body, used by the assisted-form path to
+    #: place the letter into a platform's additional-information control (Lever).
+    cover_letter_body: str = ""
 
 
 def _attachment_to_json(attachment: Attachment) -> dict[str, str]:
@@ -488,6 +502,7 @@ def _store_proposal_artifacts(
         "cover_letter_url": documents.cover_letter_file.web_view_link,
         "cv": _attachment_to_json(documents.cv),
         "cover_letter": _attachment_to_json(documents.cover_letter),
+        "cover_letter_body": documents.cover_letter_body,
     }
     repo.set_state(PROPOSAL_ARTIFACTS_PREFIX + str(job_id), json.dumps(payload))
 
@@ -515,6 +530,7 @@ def _load_proposal_artifacts(repo: ProposalRepository, job: Job) -> ProposalArti
                     cover_letter_url=data.get("cover_letter_url"),
                     cv=_attachment_from_json(cv_data) if cv_data else None,
                     cover_letter=_attachment_from_json(cover_data) if cover_data else None,
+                    cover_letter_body=str(data.get("cover_letter_body", "")),
                 )
             except (ValueError, KeyError):  # pragma: no cover - defensive
                 log.warning("telegram_invalid_proposal_artifacts", job_id=job.id)
@@ -1413,6 +1429,12 @@ class RunRepository(Protocol):
     def release_email_send(self, job_id: int) -> None: ...
 
     def finalize_email_send(self, job_id: int, app: Application) -> Application: ...
+
+    def claim_form_submit(self, job_id: int) -> bool: ...
+
+    def release_form_submit(self, job_id: int) -> None: ...
+
+    def finalize_form_submit(self, job_id: int, app: Application) -> Application: ...
 
     def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int: ...
 

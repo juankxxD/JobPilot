@@ -42,7 +42,54 @@ def open_form_page(url: str, config: FormsConfig) -> Iterator[Any]:
             page = browser.new_page()
             log.info("form_page_open", url=url, headless=config.headless)
             page.goto(url)
-            yield page
+            yield _PlaywrightPage(page)
         finally:
             browser.close()
             log.info("form_page_closed", url=url)
+
+
+class _PlaywrightPage:
+    """Adapt a real Playwright ``Page`` to the :class:`~jobpilot.forms.base.FormPage`.
+
+    The real ``Page`` already provides ``content``/``fill``/``set_input_files``/
+    ``select_option``/``check``/``query_selector``/``query_selector_all``/``click``/
+    ``screenshot`` with compatible signatures; only ``file_input_value`` has no direct
+    equivalent, so it is derived from the file input's own ``input_value`` (which a
+    browser reports as the attached file path). Everything else delegates unchanged.
+    """
+
+    def __init__(self, page: Any) -> None:
+        self._page = page
+
+    def content(self) -> str:
+        return str(self._page.content())
+
+    def fill(self, selector: str, value: str) -> None:
+        self._page.fill(selector, value)
+
+    def set_input_files(self, selector: str, files: str) -> None:
+        self._page.set_input_files(selector, files)
+
+    def file_input_value(self, selector: str) -> str:
+        control = self._page.query_selector(selector)
+        if control is None:
+            return ""
+        return str(control.input_value())
+
+    def select_option(self, selector: str, value: str) -> None:
+        self._page.select_option(selector, value)
+
+    def check(self, selector: str) -> None:
+        self._page.check(selector)
+
+    def query_selector(self, selector: str) -> Any:
+        return self._page.query_selector(selector)
+
+    def query_selector_all(self, selector: str) -> list[Any]:
+        return list(self._page.query_selector_all(selector))
+
+    def click(self, selector: str) -> None:
+        self._page.click(selector)
+
+    def screenshot(self, *, path: str) -> None:
+        self._page.screenshot(path=path)

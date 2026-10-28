@@ -57,6 +57,11 @@ _GREENHOUSE_SCHEMA = FormSchema(
         "iframe[title*='captcha' i]",
     ),
     submit_selector="#submit_app",
+    # Greenhouse shows a confirmation ("application submitted") after a successful
+    # submit; at least one must be present post-click for the submit to be recorded.
+    success_markers=("#application_confirmation", ".application--confirmation"),
+    # A validation summary indicates the submission was rejected (nothing accepted).
+    post_submit_error_markers=("#error_box", ".field_with_errors"),
     # Greenhouse renders each custom question inside a ``.field`` wrapper whose label
     # is the visible question text and whose control is a ``textarea``/``input``.
     question_container_selector=".field.custom-question",

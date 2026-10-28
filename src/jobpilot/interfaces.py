@@ -125,12 +125,21 @@ class JobRepository(Protocol):
 
 
 class FillContext(BaseModel):
-    """Everything a FormFiller needs: the job and the chosen documents."""
+    """Everything a FormFiller needs: the job and the chosen documents.
+
+    ``cover_letter_text`` is the approved cover letter's plain-text body. It lets a
+    platform that has no dedicated cover-letter upload (Lever) place the approved
+    letter into its "additional information" text control instead, without ever
+    regenerating it through the form-answer LLM. It is ``None`` when unavailable, in
+    which case a platform that needs a text destination must abort rather than submit
+    without the cover letter (R15.3).
+    """
 
     job_id: int
     language: str
     cv_path: str
     cover_letter_path: str
+    cover_letter_text: str | None = None
 
 
 class FillResult(BaseModel):
