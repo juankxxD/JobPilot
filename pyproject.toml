@@ -107,6 +107,7 @@ module = [
     "jobpilot.checks.drive",
     "jobpilot.checks.mail",
     "jobpilot.fetchers.gmail_alerts",
+    "jobpilot.mail.gmail",
     "jobpilot.storage.drive",
 ]
 disallow_untyped_calls = false

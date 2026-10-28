@@ -13,8 +13,9 @@ Later phases extend this module (analysis, scoring, Telegram, sending, follow-up
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -23,6 +24,7 @@ from jobpilot.channels.telegram import (
     IntentKind,
     TelegramDeliveryError,
     TelegramIntent,
+    applied_button,
     language_buttons,
     parse_intent,
     proposal_buttons,
@@ -42,14 +44,21 @@ from jobpilot.documents.selector import SelectionError, select_content
 from jobpilot.filters.prefilter import prefilter
 from jobpilot.language import detect_language
 from jobpilot.logging import get_logger
-from jobpilot.models import Job, JobStatus
+from jobpilot.models import Application, ApplicationChannel, Attachment, Job, JobStatus
 from jobpilot.scoring.scorer import analyze_and_score, passes_threshold
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from jobpilot.interfaces import FileStorage, JobRepository, JobSource, LlmClient, Notifier
-    from jobpilot.models import Application, Attachment, ContentSelection, RawJob, StoredFile
+    from jobpilot.interfaces import (
+        FileStorage,
+        JobRepository,
+        JobSource,
+        LlmClient,
+        Mailer,
+        Notifier,
+    )
+    from jobpilot.models import ContentSelection, RawJob, StoredFile
     from jobpilot.profile.model import ProfileModel
 
 log = get_logger(__name__)
@@ -59,6 +68,11 @@ log = get_logger(__name__)
 LAST_UPDATE_ID_KEY = "telegram_last_update_id"
 # ``telegram_state`` key holding the job id awaiting a free-text Ajustar instruction.
 PENDING_ADJUST_KEY = "telegram_pending_adjust_job_id"
+# ``telegram_state`` key prefix (``<prefix><job_id>``) under which the stored-document
+# metadata for a proposed job is kept, so the post-approval send flow records the
+# application (language, cv_variant, cv_url, cover_letter_url) without regenerating
+# or re-selecting content it has already shown the owner.
+PROPOSAL_ARTIFACTS_PREFIX = "telegram_proposal_artifacts:"
 
 # Spanish labels for every job status, shown in Telegram responses (R16.2). The
 # internal ``JobStatus`` values stay English; only these labels reach the owner.
@@ -327,6 +341,8 @@ class ProposalRepository(Protocol):
 
     def save_job(self, job: Job) -> Job: ...
 
+    def create_application(self, app: Application) -> Application: ...
+
     def get_state(self, key: str) -> str | None: ...
 
     def set_state(self, key: str, value: str) -> None: ...
@@ -379,8 +395,69 @@ def tailor_and_send_proposal(
         attachments=[documents.cv, documents.cover_letter],
     )
     repo.save_job(proposed)
+    _store_proposal_artifacts(repo, job_id, language, documents)
     log.info("proposal_sent", job_id=job_id, language=language.value)
     return documents
+
+
+@dataclass(slots=True)
+class ProposalArtifacts:
+    """The stored-document metadata needed to record an application later.
+
+    Captured when a proposal is delivered and persisted in ``telegram_state`` so the
+    post-approval send flow records the exact variant and Drive links the owner
+    reviewed, without re-running selection/rendering.
+    """
+
+    language: Language
+    cv_variant: str
+    cv_url: str | None
+    cover_letter_url: str | None
+
+
+def _store_proposal_artifacts(
+    repo: ProposalRepository,
+    job_id: int,
+    language: Language,
+    documents: GeneratedDocuments,
+) -> None:
+    """Persist the document metadata for ``job_id`` so a later send can record it."""
+    payload = {
+        "language": language.value,
+        "cv_variant": documents.selection.summary_variant,
+        "cv_url": documents.cv_file.web_view_link,
+        "cover_letter_url": documents.cover_letter_file.web_view_link,
+    }
+    repo.set_state(PROPOSAL_ARTIFACTS_PREFIX + str(job_id), json.dumps(payload))
+
+
+def _load_proposal_artifacts(repo: ProposalRepository, job: Job) -> ProposalArtifacts:
+    """Return the stored artifacts for ``job``, falling back to job-derived defaults.
+
+    A job proposed in a prior version (or seeded without going through the proposal
+    flow) may have no stored metadata; in that case the application is still
+    recorded with the job's resolved language, an empty variant and no document
+    links, so the owner's action is never lost.
+    """
+    if job.id is not None:
+        raw = repo.get_state(PROPOSAL_ARTIFACTS_PREFIX + str(job.id))
+        if raw:
+            try:
+                data = json.loads(raw)
+                return ProposalArtifacts(
+                    language=Language(data["language"]),
+                    cv_variant=str(data.get("cv_variant", "")),
+                    cv_url=data.get("cv_url"),
+                    cover_letter_url=data.get("cover_letter_url"),
+                )
+            except (ValueError, KeyError):  # pragma: no cover - defensive
+                log.warning("telegram_invalid_proposal_artifacts", job_id=job.id)
+    return ProposalArtifacts(
+        language=job.language or get_settings().default_language,
+        cv_variant="",
+        cv_url=None,
+        cover_letter_url=None,
+    )
 
 
 @dataclass(slots=True)
@@ -570,6 +647,7 @@ def process_telegram_updates(
     llm: LlmClient,
     storage: FileStorage,
     config: AppConfig,
+    mailer: Mailer | None = None,
 ) -> TelegramRunSummary:
     """Read and act on Telegram updates exactly once each (human-in-the-loop).
 
@@ -611,7 +689,7 @@ def process_telegram_updates(
         last_update_id = update.update_id
         repo.set_state(LAST_UPDATE_ID_KEY, str(last_update_id))
         intent = parse_intent(update)
-        _handle_intent(intent, repo, notifier, profile, llm, storage, config, summary)
+        _handle_intent(intent, repo, notifier, profile, llm, storage, config, summary, mailer)
         summary.processed += 1
 
     # Advance past ignored non-owner updates so they are never re-fetched forever.
@@ -641,17 +719,16 @@ def _handle_intent(  # noqa: C901, PLR0912 - a flat dispatch over the intent kin
     storage: FileStorage,
     config: AppConfig,
     summary: TelegramRunSummary,
+    mailer: Mailer | None = None,
 ) -> None:
     kind = intent.kind
     if kind is IntentKind.send:
-        if _transition(repo, notifier, intent.job_id, JobStatus.approved, "Postulación aprobada."):
-            summary.approved += 1
+        _handle_send(intent, repo, notifier, profile, llm, storage, summary, mailer)
     elif kind is IntentKind.discard:
         if _transition(repo, notifier, intent.job_id, JobStatus.discarded, "Oferta descartada."):
             summary.discarded += 1
     elif kind is IntentKind.mark_applied:
-        if _transition(repo, notifier, intent.job_id, JobStatus.applied, "Marcada como aplicada."):
-            summary.applied += 1
+        _handle_mark_applied(intent, repo, notifier, summary)
     elif kind is IntentKind.choose_language:
         if _handle_language_choice(intent, repo, notifier, profile, llm, storage):
             summary.regenerated += 1
@@ -727,6 +804,250 @@ def _transition(
     repo.set_status(job_id, status)
     notifier.send_message(f"{message} ({job.company} — {job.title})")
     return True
+
+
+def _handle_send(
+    intent: TelegramIntent,
+    repo: ProposalRepository,
+    notifier: Notifier,
+    profile: ProfileModel,
+    llm: LlmClient,
+    storage: FileStorage,
+    summary: TelegramRunSummary,
+    mailer: Mailer | None,
+) -> None:
+    """Handle the Enviar button: email when there is a contact, else manual mode.
+
+    The action is valid only for a ``proposed`` job, which makes it idempotent: a
+    second Enviar after the job has moved to ``approved``/``applied`` finds it
+    outside the eligible state and changes nothing, so an application is never sent
+    or recorded twice. When the offer carries a ``contact_email`` the tailored
+    documents are regenerated and sent by email (channel ``email``), the application
+    is recorded with the stored variant/links, and the job becomes ``applied``.
+    Otherwise the owner is handed the offer link plus the stored document links and a
+    "Ya apliqué" button to confirm once they have applied on the portal themselves;
+    the job waits in ``approved`` and the manual application is recorded when they
+    confirm.
+    """
+    job_id = intent.job_id
+    if job_id is None:
+        notifier.send_message("No pude identificar la oferta de esa acción.")
+        return
+    job = repo.get_job(job_id)
+    if job is None:
+        notifier.send_message(f"No encontré la oferta {job_id}.")
+        return
+    if job.status is not JobStatus.proposed:
+        log.info("telegram_stale_send_ignored", job_id=job_id, current=job.status.value)
+        notifier.send_message(
+            f"Esa acción ya no aplica para la oferta {job_id} "
+            f"(estado actual: {_STATUS_LABELS[job.status]})."
+        )
+        return
+
+    if job.contact_email:
+        if _send_by_email(job, repo, notifier, profile, llm, storage, mailer):
+            summary.applied += 1
+        return
+    _send_manual(job, repo, notifier)
+    summary.approved += 1
+
+
+def _send_by_email(
+    job: Job,
+    repo: ProposalRepository,
+    notifier: Notifier,
+    profile: ProfileModel,
+    llm: LlmClient,
+    storage: FileStorage,
+    mailer: Mailer | None,
+) -> bool:
+    """Email the application to ``job.contact_email`` and record it as ``applied``.
+
+    Returns ``True`` once the email was sent and the application recorded. When no
+    mailer is configured, or document regeneration/sending fails, the job keeps its
+    ``proposed`` state so a later run can retry, and nothing is recorded — so a
+    failed send never looks like a successful application.
+    """
+    job_id = job.id
+    if job_id is None:  # pragma: no cover - callers guarantee an id
+        raise ValueError("_send_by_email requires a persisted job with an id")
+    if mailer is None:
+        log.warning("send_email_no_mailer", job_id=job_id)
+        notifier.send_message(
+            f"No pude enviar por correo la oferta {job_id}: el proveedor de correo no "
+            "está configurado."
+        )
+        return False
+    artifacts = _load_proposal_artifacts(repo, job)
+    language = job.language or artifacts.language
+    try:
+        documents = generate_documents(job, profile, llm, storage, language=language)
+    except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:
+        log.error("send_email_generation_failed", job_id=job_id, error=str(exc))
+        repo.set_status(job_id, JobStatus.error)
+        notifier.send_message(f"No pude preparar los documentos para la oferta {job_id}.")
+        return False
+    subject, body = _email_subject_and_body(job, profile, language)
+    try:
+        assert job.contact_email is not None
+        mailer.send(
+            job.contact_email,
+            subject,
+            body,
+            [documents.cv, documents.cover_letter],
+        )
+    except Exception as exc:  # noqa: BLE001 - keep proposed so a later run retries
+        log.warning("send_email_failed", job_id=job_id, error=str(exc))
+        notifier.send_message(
+            f"No pude enviar el correo de la oferta {job_id}. Lo reintentaré más tarde."
+        )
+        return False
+    _record_application(
+        repo,
+        job,
+        ApplicationChannel.email,
+        language=language,
+        cv_variant=documents.selection.summary_variant,
+        cv_url=documents.cv_file.web_view_link,
+        cover_letter_url=documents.cover_letter_file.web_view_link,
+    )
+    repo.set_status(job_id, JobStatus.applied)
+    notifier.send_message(
+        f"Postulación enviada por correo a {job.contact_email} ({job.company} — {job.title})."
+    )
+    log.info("application_emailed", job_id=job_id, to=job.contact_email)
+    return True
+
+
+def _send_manual(job: Job, repo: ProposalRepository, notifier: Notifier) -> None:
+    """Hand the owner the links to apply manually and wait for their confirmation.
+
+    No email is sent; the job moves to ``approved`` and the manual application is
+    recorded only when the owner confirms with the "Ya apliqué" button (which moves
+    it to ``applied``). The stored document links are included so the owner can apply
+    on the portal without re-opening the proposal.
+    """
+    job_id = job.id
+    if job_id is None:  # pragma: no cover - callers guarantee an id
+        raise ValueError("_send_manual requires a persisted job with an id")
+    artifacts = _load_proposal_artifacts(repo, job)
+    lines = [
+        "Esta oferta no tiene correo de contacto; aplícala manualmente en el portal.",
+        f"Empresa: {job.company} — {job.title}",
+        f"Oferta: {job.apply_url or job.url}",
+    ]
+    if artifacts.cv_url:
+        lines.append(f"CV: {artifacts.cv_url}")
+    if artifacts.cover_letter_url:
+        lines.append(f"Carta: {artifacts.cover_letter_url}")
+    lines.append('Cuando termines, pulsa "Ya apliqué".')
+    notifier.send_message(
+        "\n".join(lines),
+        buttons=[applied_button(job_id)],
+    )
+    repo.set_status(job_id, JobStatus.approved)
+    log.info("application_manual_prompt_sent", job_id=job_id)
+
+
+def _handle_mark_applied(
+    intent: TelegramIntent,
+    repo: ProposalRepository,
+    notifier: Notifier,
+    summary: TelegramRunSummary,
+) -> None:
+    """Handle "Ya apliqué": record a manual application and mark the job ``applied``.
+
+    Valid from a ``proposed`` offer (the owner applied on a portal directly) or from
+    an ``approved`` one (the manual-mode path). The eligible-state guard makes it
+    idempotent: a replay once the job is ``applied`` records nothing. The application
+    is recorded as ``manual`` with the stored variant/links, then the status advances.
+    """
+    job_id = intent.job_id
+    if job_id is None:
+        notifier.send_message("No pude identificar la oferta de esa acción.")
+        return
+    job = repo.get_job(job_id)
+    if job is None:
+        notifier.send_message(f"No encontré la oferta {job_id}.")
+        return
+    if job.status not in _ELIGIBLE_SOURCES[JobStatus.applied]:
+        log.info(
+            "telegram_stale_action_ignored",
+            job_id=job_id,
+            current=job.status.value,
+            requested=JobStatus.applied.value,
+        )
+        notifier.send_message(
+            f"Esa acción ya no aplica para la oferta {job_id} "
+            f"(estado actual: {_STATUS_LABELS[job.status]})."
+        )
+        return
+    artifacts = _load_proposal_artifacts(repo, job)
+    _record_application(
+        repo,
+        job,
+        ApplicationChannel.manual,
+        language=job.language or artifacts.language,
+        cv_variant=artifacts.cv_variant,
+        cv_url=artifacts.cv_url,
+        cover_letter_url=artifacts.cover_letter_url,
+    )
+    repo.set_status(job_id, JobStatus.applied)
+    notifier.send_message(f"Marcada como aplicada. ({job.company} — {job.title})")
+    summary.applied += 1
+
+
+def _record_application(
+    repo: ProposalRepository,
+    job: Job,
+    channel: ApplicationChannel,
+    *,
+    language: Language,
+    cv_variant: str,
+    cv_url: str | None,
+    cover_letter_url: str | None,
+) -> Application:
+    """Create the :class:`Application` row for a sent/applied job (applied now)."""
+    if job.id is None:  # pragma: no cover - callers guarantee an id
+        raise ValueError("_record_application requires a persisted job with an id")
+    application = Application(
+        job_id=job.id,
+        language=language,
+        cv_variant=cv_variant,
+        cv_url=cv_url,
+        cover_letter_url=cover_letter_url,
+        channel=channel,
+        applied_at=datetime.now(UTC),
+    )
+    stored = repo.create_application(application)
+    log.info("application_recorded", job_id=job.id, channel=channel.value)
+    return stored
+
+
+def _email_subject_and_body(job: Job, profile: ProfileModel, language: Language) -> tuple[str, str]:
+    """Build the application email subject and body in the offer's language.
+
+    The body is a short cover note; the tailored cover letter and CV travel as PDF
+    attachments. Only the applicant's own name and the offer's role/company appear,
+    so nothing is invented.
+    """
+    name = profile.basics.name
+    if language is Language.es:
+        subject = f"Postulación: {job.title}"
+        body = (
+            f"Hola,\n\nAdjunto mi CV y carta de presentación para la posición de "
+            f"{job.title} en {job.company}. Quedo atento a sus comentarios.\n\n"
+            f"Saludos,\n{name}"
+        )
+    else:
+        subject = f"Application: {job.title}"
+        body = (
+            f"Hello,\n\nPlease find attached my CV and cover letter for the "
+            f"{job.title} position at {job.company}. I look forward to your reply.\n\n"
+            f"Best regards,\n{name}"
+        )
+    return subject, body
 
 
 def _handle_language_choice(
@@ -995,6 +1316,7 @@ def run_once(
     storage: FileStorage,
     config: AppConfig,
     settings: Settings | None = None,
+    mailer: Mailer | None = None,
 ) -> RunSummary:
     """Run the whole pipeline once: collect, score, propose, process approvals.
 
@@ -1021,6 +1343,6 @@ def run_once(
         config,
         active_settings,
     )
-    telegram = process_telegram_updates(repo, notifier, profile, llm, storage, config)
+    telegram = process_telegram_updates(repo, notifier, profile, llm, storage, config, mailer)
     log.info("run_once_done")
     return RunSummary(collect=collect, score=score, propose=propose, telegram=telegram)

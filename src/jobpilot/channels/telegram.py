@@ -113,6 +113,11 @@ def language_buttons(job_id: int) -> list[Button]:
     return _build_buttons(_LANGUAGE_ACTIONS, job_id)
 
 
+def applied_button(job_id: int) -> Button:
+    """The lone "Ya apliqué" button shown with the manual-mode send prompt."""
+    return _build_buttons((CallbackAction.applied,), job_id)[0]
+
+
 # --------------------------------------------------------------------------- #
 # Structured intents parsed from updates
 # --------------------------------------------------------------------------- #

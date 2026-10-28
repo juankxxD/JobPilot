@@ -21,8 +21,6 @@ app = typer.Typer(
 
 log = get_logger(__name__)
 
-_NOT_IMPLEMENTED = "This command is implemented in a later phase."
-
 
 @app.callback()
 def main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logs.")) -> None:
@@ -93,8 +91,33 @@ def import_cv(path: str = typer.Argument(..., help="Path to a PDF or DOCX CV."))
 
 @app.command("auth-mail")
 def auth_mail() -> None:
-    """Run the one-time OAuth consent flow for the mail provider (Phase 6)."""
-    typer.echo(f"auth-mail: {_NOT_IMPLEMENTED}")
+    """Obtain an Outlook/Graph refresh token via the OAuth device-code flow.
+
+    Prints a verification URL and user code, waits for the owner to consent in a
+    browser, then prints the refresh token to store as ``GRAPH_REFRESH_TOKEN``.
+    """
+    from jobpilot.config import get_settings
+    from jobpilot.mail.base import MailConfigurationError
+    from jobpilot.mail.graph import obtain_refresh_token_device_code
+
+    settings = get_settings()
+    if not settings.graph_client_id:
+        typer.echo("Cannot run auth-mail: GRAPH_CLIENT_ID is not set.", err=True)
+        typer.echo("Set GRAPH_CLIENT_ID in your .env and try again.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        refresh_token = obtain_refresh_token_device_code(
+            settings.graph_client_id,
+            tenant_id=settings.graph_tenant_id,
+            prompt=typer.echo,
+        )
+    except MailConfigurationError as exc:
+        typer.echo(f"auth-mail failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("\nAuthentication successful. Store this value as GRAPH_REFRESH_TOKEN:\n")
+    typer.echo(refresh_token)
 
 
 @app.command()
@@ -112,12 +135,12 @@ def run() -> None:
     try:
         config = load_app_config()
         profile = _load_run_profile(PROJECT_ROOT)
-        sources, repo, notifier, llm, storage = _build_run_dependencies(settings, config)
+        sources, repo, notifier, llm, storage, mailer = _build_run_dependencies(settings, config)
     except (FileNotFoundError, ValueError) as exc:
         typer.echo(f"Cannot run: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    summary = run_once(sources, repo, notifier, profile, llm, storage, config, settings)
+    summary = run_once(sources, repo, notifier, profile, llm, storage, config, settings, mailer)
     typer.echo(
         "Run complete: "
         f"{summary.collect.kept_new} new, "
@@ -133,11 +156,12 @@ def _load_run_profile(project_root: Any) -> Any:
     return load_profile(project_root / "profile.yaml")
 
 
-def _build_run_dependencies(settings: Any, config: Any) -> tuple[Any, Any, Any, Any, Any]:
+def _build_run_dependencies(settings: Any, config: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
     """Construct the real external dependencies for a run (composition root)."""
     from jobpilot.channels.telegram import TelegramNotifier
     from jobpilot.fetchers.base import iter_enabled
     from jobpilot.llm.client import build_default_client
+    from jobpilot.mail.base import build_mailer
     from jobpilot.storage.drive import DriveFileStorage
     from jobpilot.storage.neon import NeonJobRepository
 
@@ -146,7 +170,8 @@ def _build_run_dependencies(settings: Any, config: Any) -> tuple[Any, Any, Any, 
     notifier = TelegramNotifier.from_settings(settings)
     llm = build_default_client()
     storage = DriveFileStorage.from_settings(settings)
-    return sources, repo, notifier, llm, storage
+    mailer = build_mailer(settings)
+    return sources, repo, notifier, llm, storage, mailer
 
 
 if __name__ == "__main__":

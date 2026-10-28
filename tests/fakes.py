@@ -283,6 +283,47 @@ class FakeFileStorage:
         )
 
 
+class SentEmail(BaseModel):
+    """A record of one :meth:`FakeMailer.send` call."""
+
+    to: str
+    subject: str
+    body: str
+    attachments: list[str] = []
+
+
+class FakeMailer:
+    """A Mailer that records sends and can simulate a provider rejection.
+
+    Records each ``send`` (recipient, subject, body and attachment filenames) so
+    tests can assert the email path was taken with the right documents. Set
+    ``fail`` to have the next ``send`` raise, exercising the retry-safe path where a
+    failed send must not record an application.
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.sent: list[SentEmail] = []
+        self._fail = fail
+
+    def send(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment],
+    ) -> None:
+        if self._fail:
+            raise RuntimeError("simulated mail provider rejection")
+        self.sent.append(
+            SentEmail(
+                to=to,
+                subject=subject,
+                body=body,
+                attachments=[a.filename for a in attachments],
+            )
+        )
+
+
 class SentMessage(BaseModel):
     """A record of one :meth:`FakeNotifier.send_message` call."""
 
