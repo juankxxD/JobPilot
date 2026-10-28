@@ -226,6 +226,8 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "legally authorized",
     "legally authorised",
     "legally eligible",
+    "legally entitled",
+    "entitled to work",
     "eligible to work",
     "eligible for employment",
     "legal right to work",
@@ -278,11 +280,16 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     # background / legal
     "background check",
     "criminal",
+    "crime",
     "felony",
     "misdemeanor",
     "misdemeanour",
     "conviction",
     "convicted",
+    "guilty",
+    "pled guilty",
+    "plead guilty",
+    "pleaded guilty",
     "arrest",
     "arrested",
     "charged with",
@@ -307,6 +314,8 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "cláusula de no competencia",
     # demographics (EEO and similar)
     "gender",
+    "gender identity",
+    "biological sex",
     "pronoun",
     "pronouns",
     "race",
@@ -471,6 +480,113 @@ _YEARS_PHRASE_TOKENS: frozenset[str] = frozenset(
 )
 
 
+# Whole-word sensitive tokens that are too short or too collision-prone to match as
+# bare substrings (e.g. "sex" would hit "Essex"). Matched on word boundaries so the
+# standalone demographic/legal term is caught without over-matching unrelated words.
+_SENSITIVE_WORD_PATTERNS: tuple[str, ...] = (
+    r"\bsex\b",
+    r"\bsexo\b",
+    r"\bcrime\b",
+    r"\bcrimen\b",
+    r"\bdelito\b",
+)
+_SENSITIVE_WORD_RE = re.compile("|".join(_SENSITIVE_WORD_PATTERNS), re.IGNORECASE)
+
+# Duration phrasings that, like the years-of-experience ones, name a span of time
+# spent with a subject. "How long have you worked with Java?" is a duration-in-a-
+# technology question (R15.5) even though it never says the word "years".
+_DURATION_PATTERNS: tuple[str, ...] = (
+    "how long have you",
+    "how long did you",
+    "how long were you",
+    "how much experience",
+    "length of experience",
+    "duration of experience",
+    "worked with",
+    "worked on",
+    "experience with",
+    "experience in",
+    "experience using",
+    "cuánto tiempo",
+    "cuanto tiempo",
+    "experiencia con",
+    "experiencia en",
+    "experiencia usando",
+    "has trabajado con",
+    "trabajado con",
+)
+
+# Tokens that appear in duration phrasings themselves; dropped when probing for a
+# named technology so the phrasing words are not mistaken for a subject.
+_DURATION_PHRASE_TOKENS: frozenset[str] = frozenset(
+    {
+        "how",
+        "long",
+        "much",
+        "length",
+        "duration",
+        "have",
+        "has",
+        "had",
+        "did",
+        "were",
+        "was",
+        "you",
+        "worked",
+        "work",
+        "working",
+        "experience",
+        "with",
+        "on",
+        "in",
+        "using",
+        "use",
+        "used",
+        "of",
+        "the",
+        "a",
+        "an",
+        "your",
+        "do",
+        "cuánto",
+        "cuanto",
+        "tiempo",
+        "experiencia",
+        "con",
+        "en",
+        "usando",
+        "uso",
+        "trabajado",
+        "trabajaste",
+        "de",
+        "el",
+        "la",
+    }
+)
+
+
+def _asks_duration_in_technology(question: str) -> bool:
+    """Return whether a question asks how long the candidate used a specific subject.
+
+    Like :func:`_asks_years_in_technology` but for phrasings that express a span of
+    time without the word "years" ("how long have you worked with Java?"). It looks
+    only at the question *shape*, never the profile catalogue: a duration phrasing
+    that names any concrete subject is sensitive, so it is answered only from the
+    approved ``answers_bank`` or left blank — never quantified by the LLM (R15.5). A
+    bare generic-tenure duration question that names no subject is not caught here.
+    """
+    lowered = question.lower()
+    if not any(p in lowered for p in _DURATION_PATTERNS):
+        return False
+    tokens = re.findall(r"[a-zA-Z0-9.+#]+", lowered)
+    remaining = [
+        tok
+        for tok in tokens
+        if tok not in _DURATION_PHRASE_TOKENS and tok not in _YEARS_GENERIC_SUBJECTS
+    ]
+    return bool(remaining)
+
+
 def _asks_years_in_technology(question: str) -> bool:
     """Return whether a question asks for years of experience in a specific subject.
 
@@ -499,12 +615,22 @@ def is_sensitive_question(question: str) -> bool:
     """Return whether a form question is SENSITIVE and must never reach the LLM.
 
     Sensitive questions are answered only from the approved ``answers_bank`` (or left
-    blank and reported) — never by the LLM. The years-of-experience-in-a-technology
-    case is detected from the question shape alone, independent of the profile.
+    blank and reported) — never by the LLM. Detection unions three conservative
+    signals so missed phrasings still err toward blocking the LLM (R15.5):
+
+    #. a whole-phrase/keyword marker in any protected category (salary, work
+       authorization/visa, relocation, background/legal, demographics);
+    #. a short collision-prone demographic/legal term matched on word boundaries
+       (``sex``/``crime``/``delito``) that is unsafe as a bare substring;
+    #. a years-of-experience OR duration ("how long have you worked with ...")
+       phrasing that names a concrete technology — detected from the question shape
+       alone, independent of the profile catalogue.
     """
     if _matches_any(question, _SENSITIVE_PATTERNS):
         return True
-    return _asks_years_in_technology(question)
+    if _SENSITIVE_WORD_RE.search(question):
+        return True
+    return _asks_years_in_technology(question) or _asks_duration_in_technology(question)
 
 
 # --------------------------------------------------------------------------- #
@@ -630,11 +756,39 @@ def discover_questions(page: FormPage, schema: FormSchema) -> list[OpenQuestion]
         selector = _control_selector(control)
         if selector is None:
             continue
+        # Never discover the cover-letter destination as an open question: on Lever
+        # the "additional information" textarea holds the APPROVED cover letter, so
+        # treating it as a question would let the LLM overwrite it (P8-011).
+        if _is_cover_letter_destination(selector, schema):
+            continue
         label = container.inner_text().strip()
         if not label:
             continue
         questions.append(OpenQuestion(selector=selector, label=label))
     return questions
+
+
+def _is_cover_letter_destination(selector: str, schema: FormSchema) -> bool:
+    """Return whether ``selector`` targets the platform's cover-letter text control.
+
+    Compared against ``cover_letter_text_selector`` both directly and by the control's
+    name, because the shared discovery derives ``[name="comments"]`` from the control
+    while the schema may declare it as ``textarea[name='comments']`` — both address the
+    same element, so either spelling must be recognised and excluded (P8-011).
+    """
+    text_selector = schema.cover_letter_text_selector
+    if text_selector is None:
+        return False
+    if selector == text_selector:
+        return True
+    name = _selector_name(selector)
+    return name is not None and name == _selector_name(text_selector)
+
+
+def _selector_name(selector: str) -> str | None:
+    """Extract the ``name`` attribute from a ``[name='…']``/``tag[name='…']`` selector."""
+    match = re.search(r"""\[name=['"]?([^'"\]]+)['"]?\]""", selector)
+    return match.group(1) if match else None
 
 
 def _control_kind(control: FormElement) -> str:
@@ -658,41 +812,62 @@ def _is_numeric(value: str) -> bool:
     return True
 
 
-def _control_option_values(page: FormPage, selector: str) -> list[str]:
-    """Return the selectable option values/labels for a select or radio control.
+def _select_options(select: FormElement) -> list[FormOption]:
+    """Build the :class:`FormOption` list for a ``<select>`` from its ``<option>``s.
 
-    Reads the control's ``<option>`` children (a select) or the sibling radio inputs
-    sharing its name, so a sensitive answer is only applied when it exactly matches
-    one offered choice. Each option contributes both its ``value`` attribute and its
-    visible text, so an approved answer can match either.
+    Each ``<option>`` yields its submit ``value`` (the string Playwright's value
+    -based ``select_option`` expects) and its visible label, so an approved answer
+    can match either; the option's selector is the select itself because the select
+    is chosen by value, not by clicking a child.
     """
-    control = page.query_selector(selector)
-    if control is None:
-        return []
-    values: list[str] = []
-    for option in control.query_selector_all("option"):
-        value = option.get_attribute("value")
-        if value:
-            values.append(value)
-        text = option.inner_text().strip()
-        if text:
-            values.append(text)
-    # A radio group exposes its own value directly on the input.
-    own_value = control.get_attribute("value")
-    if own_value:
-        values.append(own_value)
-    return values
+    options: list[FormOption] = []
+    for opt in select.query_selector_all("option"):
+        value = (opt.get_attribute("value") or "").strip()
+        label = opt.inner_text().strip()
+        # Skip an empty placeholder (``<option value="">Select...</option>``).
+        if not value and not label:
+            continue
+        options.append(FormOption(label=label or value, value=value or label, selector=""))
+    return options
 
 
-def _exact_option_match(options: list[str], value: str) -> str | None:
-    """Return the option exactly matching ``value`` (case-insensitive), else ``None``.
+def _radio_options(container: FormElement, name: str) -> list[FormOption]:
+    """Build the :class:`FormOption` list for a radio group inside ``container``.
 
-    Matching is exact (not substring) so a sensitive answer is never applied to an
-    option it only partially resembles; ambiguity leaves the control blank.
+    A radio group is several ``input[type='radio']`` sharing ``name``; each is a
+    distinct control that must be checked individually. For every radio we record
+    its ``value`` (also its label, since a radio has no inner text of its own) and a
+    precise selector ``input[name='…'][value='…']`` that targets THAT radio, so the
+    matching sibling — not merely the first — is the one checked (P8-010).
+    """
+    options: list[FormOption] = []
+    for radio in container.query_selector_all("input[type='radio']"):
+        if (radio.get_attribute("name") or "") != name:
+            continue
+        value = (radio.get_attribute("value") or "").strip()
+        if not value:
+            continue
+        selector = f"input[name='{name}'][value='{value}']"
+        options.append(FormOption(label=value, value=value, selector=selector))
+    return options
+
+
+def _exact_option_match(options: list[FormOption], value: str) -> FormOption | None:
+    """Return the single option whose label or value exactly matches ``value``.
+
+    Matching is exact and case-insensitive (never substring), so a sensitive answer
+    is never applied to an option it only partially resembles. An ambiguous match
+    (two genuinely different options) leaves the control blank; duplicate options
+    that collapse to the same choice are treated as one.
     """
     lowered = value.lower()
-    matches = [opt for opt in options if opt.lower() == lowered]
-    if len(matches) == 1 or (matches and len({m.lower() for m in matches}) == 1):
+    matches = [
+        opt for opt in options if opt.label.lower() == lowered or opt.value.lower() == lowered
+    ]
+    if not matches:
+        return None
+    distinct = {(opt.label.lower(), opt.value.lower()) for opt in matches}
+    if len(distinct) == 1:
         return matches[0]
     return None
 
@@ -721,15 +896,28 @@ def discover_nontext_questions(page: FormPage, schema: FormSchema) -> list[NonTe
         label = container.inner_text().strip()
         if not label:
             continue
+        kind = _control_kind(control)
         required = control.get_attribute("required") is not None or (
             container.get_attribute("required") is not None
         )
+        options: list[FormOption] = []
+        if kind == "select":
+            options = _select_options(control)
+        elif kind == "radio":
+            name = control.get_attribute("name") or ""
+            options = _radio_options(container, name) if name else []
+            # A radio group is required when ANY of its members carries ``required``.
+            required = required or any(
+                radio.get_attribute("required") is not None
+                for radio in container.query_selector_all("input[type='radio']")
+            )
         questions.append(
             NonTextQuestion(
                 selector=selector,
                 label=label,
-                kind=_control_kind(control),
+                kind=kind,
                 required=required,
+                options=options,
             )
         )
     return questions
@@ -919,6 +1107,22 @@ class OpenQuestion:
     label: str
 
 
+@dataclass(frozen=True, slots=True)
+class FormOption:
+    """One selectable choice of a ``<select>`` or a radio group.
+
+    ``label`` is the visible text, ``value`` the submit value, and ``selector`` the
+    CSS that targets the specific control to act on. For a ``<select>`` the selector
+    is empty because the select is chosen by value; for a radio it is the precise
+    ``input[name='…'][value='…']`` of that one option, so the matching sibling is
+    checked rather than the first one in the group (P8-010).
+    """
+
+    label: str
+    value: str
+    selector: str
+
+
 @dataclass(slots=True)
 class NonTextQuestion:
     """One non-free-text question control (select/radio/checkbox/number).
@@ -926,13 +1130,16 @@ class NonTextQuestion:
     The driver never authors an answer for these: a SENSITIVE one is answered only
     by an exact approved-bank match (``kind`` decides how the match is applied), and
     otherwise left blank and reported. ``required`` tells the completeness gate
-    whether a blank one must abort the form.
+    whether a blank one must abort the form. ``options`` holds each selectable choice
+    (label/value/selector) for a select or radio group so the matching option is
+    applied correctly.
     """
 
     selector: str
     label: str
     kind: str
     required: bool
+    options: list[FormOption] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1142,13 +1349,17 @@ class FormFiller(ABC):
         #. any required control that is now blank/hidden, or a cover letter / CV no
            longer attached, raises :class:`IncompleteFormError`.
 
-        Then the click itself is wrapped: a Playwright failure (a detached/disabled
-        control, a timeout) becomes a :class:`FormStructureError` so the caller
-        safe-aborts with a screenshot instead of crashing. After the click the
-        platform's post-submit state is verified — a new CAPTCHA raises
-        :class:`CaptchaError`, a recognised rejection raises :class:`FormStructureError`,
-        and an unconfirmable outcome raises :class:`SubmitAmbiguousError` — so a
-        submission is recorded only when the platform clearly accepted it (P8-008).
+        The click runs only after every pre-dispatch guard above has passed, so the
+        button was valid when clicked. A Playwright failure during the click (a
+        navigation/activity timeout) therefore cannot prove the remote form rejected
+        it — the submission may already have been accepted — so it raises
+        :class:`SubmitAmbiguousError` and the caller KEEPS the durable claim for
+        manual reconciliation rather than releasing it and risking a duplicate
+        (P8-008). After a clean click the platform's post-submit state is verified: a
+        new CAPTCHA raises :class:`CaptchaError`, a recognised rejection raises
+        :class:`FormStructureError` (a pre-acceptance failure, claim released), and an
+        unconfirmable outcome raises :class:`SubmitAmbiguousError` — so a submission
+        is recorded only when the platform clearly accepted it.
         """
         schema = self.schema
         # Re-detect anti-bot and re-validate structure first: a challenge or DOM
@@ -1163,13 +1374,23 @@ class FormFiller(ABC):
         # Re-validate completeness: nothing must have become blank or hidden and both
         # documents must still be attached. An incomplete form is never submitted.
         self._ensure_complete(page, schema, ctx)
+        # Final cover-letter integrity check: on a platform using a text destination
+        # (Lever), the control must STILL hold the exact approved letter. If an LLM
+        # open-question answer or a DOM re-render changed it, abort rather than submit
+        # an unapproved cover letter (P8-011).
+        self._verify_cover_letter_text(page, schema, ctx)
         try:
             page.click(selector)
         except (CaptchaError, FormStructureError):
             raise
-        except Exception as exc:  # noqa: BLE001 - any click failure is a safe abort
-            log.warning("form_submit_click_failed", platform=self.platform.value, error=str(exc))
-            raise FormStructureError(f"submit click failed: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - a dispatched click's outcome is ambiguous
+            # The click passed every pre-dispatch guard, so it was sent to a valid
+            # submit control. A failure now (a navigation/activity timeout) cannot
+            # prove the remote form did NOT accept it — it may already have. Treat it
+            # as AMBIGUOUS so the caller keeps the durable claim for manual
+            # reconciliation instead of releasing it and risking a duplicate (P8-008).
+            log.warning("form_submit_click_ambiguous", platform=self.platform.value, error=str(exc))
+            raise SubmitAmbiguousError(f"submit click outcome unknown: {exc}") from exc
         self._verify_post_submit(page, schema)
         log.info("form_submitted", platform=self.platform.value)
 
@@ -1331,6 +1552,34 @@ class FormFiller(ABC):
             return control is not None and bool(control.input_value().strip())
         return False
 
+    def _verify_cover_letter_text(
+        self, page: FormPage, schema: FormSchema, ctx: FillContext
+    ) -> None:
+        """Abort unless the text cover-letter destination still holds the approved text.
+
+        Only relevant when the platform uses a free-text cover-letter destination
+        (``cover_letter_text_selector``, e.g. Lever's additional-information control)
+        AND the approved letter was placed there (no dedicated upload was used). The
+        control's current value must equal ``ctx.cover_letter_text`` exactly; any
+        drift — an LLM open-question answer that reached the same element, a DOM
+        re-render — is a safe abort, never a submit of an unapproved letter (P8-011).
+        """
+        text_selector = schema.cover_letter_text_selector
+        if text_selector is None or ctx.cover_letter_text is None:
+            return
+        # If a dedicated upload holds the letter, the text destination is not in use.
+        if page.query_selector(schema.cover_letter_selector) is not None and bool(
+            page.file_input_value(schema.cover_letter_selector).strip()
+        ):
+            return
+        control = page.query_selector(text_selector)
+        if control is None:
+            return
+        current = control.input_value().strip()
+        if current != ctx.cover_letter_text.strip():
+            log.warning("form_cover_letter_text_altered", platform=self.platform.value)
+            raise IncompleteFormError(["Carta de presentación (texto alterado antes de enviar)"])
+
     def _ensure_complete(self, page: FormPage, schema: FormSchema, ctx: FillContext) -> None:
         """Abort safely unless every required control and both documents are complete.
 
@@ -1377,8 +1626,13 @@ class FormFiller(ABC):
         for question in discover_nontext_questions(page, self.schema):
             if not is_sensitive_question(question.label):
                 # The LLM must never choose an option/radio/checkbox for the owner, so
-                # a non-sensitive non-text control is left as-is; the required-control
-                # gate aborts it when blank-and-required.
+                # a non-sensitive non-text control is left as-is. A required one is
+                # caught by the completeness gate (which aborts); an OPTIONAL one is
+                # reported as uncertain so the owner sees it in the pre-submit list
+                # rather than it being silently skipped (P8-010).
+                if not question.required:
+                    log.info("form_nontext_optional_uncertain", question=question.label)
+                    acc.answered(question.label, _AnswerOutcome(value=None, uncertain=True))
                 continue
             entry = find_answer_bank_entry(self._profile, question.label)
             applied = False
@@ -1407,15 +1661,22 @@ class FormFiller(ABC):
         normalized = value.strip()
         if not normalized:
             return False
-        if question.kind in {"select", "radio"}:
-            options = _control_option_values(page, question.selector)
-            match = _exact_option_match(options, normalized)
+        if question.kind == "select":
+            match = _exact_option_match(question.options, normalized)
             if match is None:
                 return False
-            if question.kind == "select":
-                page.select_option(question.selector, match)
-            else:
-                page.check(question.selector)
+            # Playwright's ``select_option`` is value-based, so pass the option's
+            # submit value — never its visible label (P8-010).
+            page.select_option(question.selector, match.value)
+            return True
+        if question.kind == "radio":
+            match = _exact_option_match(question.options, normalized)
+            if match is None or not match.selector:
+                return False
+            if page.query_selector(match.selector) is None:
+                return False
+            # Check the exact matching radio (its own selector), not the group's first.
+            page.check(match.selector)
             return True
         if question.kind == "checkbox":
             if normalized.lower() not in _AFFIRMATIVE_TOKENS:

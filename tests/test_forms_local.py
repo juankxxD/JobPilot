@@ -149,6 +149,61 @@ def test_local_form_flow_reaches_submit_for_approved_greenhouse_job(
     assert str(app.cover_letter_url) == "https://drive.example/cover_en.pdf"
 
 
+def test_local_form_flow_handles_dom_only_greenhouse_on_company_domain(
+    example_profile: ProfileModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # P8-012: an approved job whose apply URL is a company careers domain (no ATS in
+    # the URL) but whose rendered DOM embeds a Greenhouse form must still be driven.
+    # The local command opens the page, detects the DOM platform and builds the
+    # matching filler on the SAME guarded page, reaching submit.
+    repo = FakeJobRepository()
+    company_url = "https://careers.acme.example/jobs/42"
+    repo.seed_job(_job().model_copy(update={"url": company_url, "apply_url": company_url}))
+    _seed_artifacts(repo, 42)
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:42:{_NONCE}",
+            )
+        ]
+    )
+    # The URL gives nothing away; the embedded Greenhouse identity is only in the DOM.
+    page = FakeFormPage(
+        present=_GH_PRESENT,
+        present_after_click={"#application_confirmation"},
+        dom='<div id="grnhse_app"></div>',
+    )
+
+    result = _run(repo, notifier, example_profile, page, monkeypatch)
+
+    assert result.status is FormApplyStatus.submitted  # type: ignore[attr-defined]
+    assert result.platform == "greenhouse"  # type: ignore[attr-defined]
+    assert page.clicked == ["#submit_app"]
+    assert len(repo.applications) == 1
+    assert repo.applications[0].channel is ApplicationChannel.form_assisted
+
+
+def test_local_form_flow_rejects_unknown_company_url_after_dom_check(
+    example_profile: ProfileModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # P8-012: an unknown company URL whose DOM reveals no supported ATS is applied
+    # manually — opened, inspected, then safely declined without submitting.
+    repo = FakeJobRepository()
+    company_url = "https://careers.acme.example/jobs/42"
+    repo.seed_job(_job().model_copy(update={"url": company_url, "apply_url": company_url}))
+    _seed_artifacts(repo, 42)
+    notifier = FakeNotifier()
+    page = FakeFormPage(present=_GH_PRESENT, dom="<div>no ats markers here</div>")
+
+    result = _run(repo, notifier, example_profile, page, monkeypatch)
+
+    assert result.status is FormApplyStatus.unsupported  # type: ignore[attr-defined]
+    assert page.clicked == []
+    assert repo.applications == []
+
+
 def test_local_form_flow_rejects_non_approved_job(
     example_profile: ProfileModel, monkeypatch: pytest.MonkeyPatch
 ) -> None:

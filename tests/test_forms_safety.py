@@ -639,20 +639,24 @@ def _enviar_notifier() -> FakeNotifier:
     )
 
 
-def test_click_timeout_is_safe_abort_not_crash(example_profile: ProfileModel) -> None:
-    # A Playwright click failure (timeout / detached control) must not escape as an
-    # unhandled crash: it becomes a safe abort with a screenshot and notification.
+def test_click_timeout_is_ambiguous_and_retains_claim(example_profile: ProfileModel) -> None:
+    # P8-008: a Playwright click failure (timeout / lost navigation) happens AFTER the
+    # click was dispatched to a valid submit control, so it cannot prove the remote
+    # form rejected the application — it may already have accepted it. The outcome is
+    # AMBIGUOUS: nothing is recorded, the owner is told to reconcile manually, and the
+    # durable claim is RETAINED so a retry cannot resubmit and duplicate.
     page = FakeFormPage(present=_GH_PRESENT, click_raises=RuntimeError("click timeout"))
     notifier = _enviar_notifier()
     repo = FakeJobRepository()
 
     result = _apply(example_profile, page, notifier, repo)
 
-    assert result.status is FormApplyStatus.aborted
+    assert result.status is FormApplyStatus.ambiguous
     assert repo.applications == []
-    # The click was attempted but failed; nothing was recorded and the claim released.
-    assert repo.form_claim_state(7) is None
-    assert any("segura" in m.text for m in notifier.messages)
+    # The claim stays ``in_progress`` so a later attempt cannot resubmit (P8-008).
+    assert repo.form_claim_state(7) == "in_progress"
+    assert page.clicked == ["#submit_app"]  # the click was attempted
+    assert any("confirmar" in m.text for m in notifier.messages)
 
 
 class _NoSuccessMarkerPage(FakeFormPage):

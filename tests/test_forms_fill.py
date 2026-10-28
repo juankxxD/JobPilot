@@ -274,6 +274,67 @@ def test_lever_cover_letter_text_placed_in_additional_info(
     assert not result.aborted
 
 
+def test_lever_comments_destination_not_discovered_as_open_question(
+    example_profile: ProfileModel,
+) -> None:
+    # P8-011: Lever renders the cover-letter "additional information" textarea inside
+    # a .application-question container, the same selector open-question discovery
+    # scans. The comments destination must be EXCLUDED from discovery so the LLM
+    # never overwrites the approved cover letter placed there.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    stripped = example_profile.model_copy(update={"answers_bank": []})
+    llm = TrackingLlm()
+    filler = LeverFormFiller(stripped, llm, FormsConfig())
+    # The comments textarea presented as a .application-question (its real markup),
+    # plus a genuine open question the LLM should answer.
+    comments_q = FakeFormQuestion(
+        label="Additional information",
+        container_selector=".application-question",
+        control_name="comments",
+        kind="textarea",
+    )
+    open_q = FakeFormQuestion(
+        label="Why do you want to join us?",
+        container_selector=".application-question",
+        control_name="q_why",
+        kind="textarea",
+    )
+    page = FakeFormPage(present=_LEVER_PRESENT, questions=[comments_q, open_q])
+
+    result = filler.fill_page(page, _ctx(stripped))
+
+    # The approved cover-letter text remains in the comments control untouched by any
+    # LLM answer, and the LLM was asked only the genuine open question.
+    assert (
+        page.filled["textarea[name='comments']"]
+        == "Dear hiring team, I am excited to apply for this role."
+    )
+    assert page.filled['[name="q_why"]']
+    assert all("additional information" not in p.lower() for p in llm.prompts)
+    assert "cover_letter" in result.filled_fields
+    assert not result.aborted
+
+
+def test_lever_submit_aborts_if_cover_letter_text_altered(example_profile: ProfileModel) -> None:
+    # P8-011: if the comments control no longer holds the exact approved cover letter
+    # at submit time, the submit aborts rather than sending an unapproved letter.
+    from tests.fakes import FakeFormPage
+
+    filler = LeverFormFiller(example_profile, TrackingLlm(), FormsConfig())
+    page = FakeFormPage(present=_LEVER_PRESENT)
+    ctx = _ctx(example_profile)
+
+    result = filler.fill_page(page, ctx)
+    assert not result.aborted
+    # Simulate drift: something changed the comments control after the owner reviewed.
+    page.filled["textarea[name='comments']"] = "An LLM-written answer, not the letter."
+
+    with pytest.raises(Exception) as exc_info:  # noqa: PT011 - IncompleteFormError subclass
+        filler.submit(page, ctx)
+    assert "Carta de presentación" in str(exc_info.value)
+
+
 def test_lever_without_cover_letter_destination_safe_aborts(
     example_profile: ProfileModel,
 ) -> None:
@@ -344,6 +405,12 @@ _PROTECTED_CATEGORY_QUESTIONS: list[tuple[str, str]] = [
     ("legal_arrested", "Have you ever been arrested?"),
     ("demographics_origin", "Are you of Hispanic or Latino origin?"),
     ("years_in_tech_dash", "Java - years"),
+    # P8-006 (second pass): the four phrasings a narrow browser-free check still
+    # classified as non-sensitive. Each must now route away from the LLM.
+    ("work_auth_entitled", "Are you legally entitled to work in Canada?"),
+    ("legal_pled_guilty", "Have you ever pled guilty to a crime?"),
+    ("demographics_sex", "What is your sex?"),
+    ("duration_in_tech_how_long", "How long have you worked with Java?"),
 ]
 
 
@@ -567,24 +634,95 @@ def test_sensitive_radio_answered_from_exact_bank_option(example_profile: Profil
         example_profile,
         key="veteran_status",
         patterns=["protected veteran"],
-        value="I am not a protected veteran",
+        value="not_veteran",
     )
     llm = TrackingLlm()
     filler = GreenhouseFormFiller(profile, llm, FormsConfig())
+    # Standard HTML radio group: sibling inputs sharing a name, each a distinct value
+    # whose visible label differs from the submit value. The matching sibling — not
+    # the first — must be the one checked (P8-010).
     question = FakeFormQuestion(
         label="Are you a protected veteran?",
         container_selector=".field.custom-question",
-        control_id="q_vet",
+        control_name="veteran",
         kind="radio",
         required=True,
-        options=["I am not a protected veteran", "I am a protected veteran"],
+        options=["I am a protected veteran", "I am not a protected veteran"],
+        option_values=["veteran", "not_veteran"],
     )
     page = FakeFormPage(present=_GH_PRESENT, questions=[question])
 
     result = filler.fill_page(page, _ctx(profile))
 
-    assert "#q_vet" in page._checked  # the radio was checked from the bank
+    # The exact matching sibling radio (value "not_veteran") was checked, not the
+    # group's first option ("veteran").
+    assert "input[name='veteran'][value='not_veteran']" in page._checked
+    assert "input[name='veteran'][value='veteran']" not in page._checked
     assert llm.prompts == []
+    assert not result.unanswered_sensitive
+    assert not result.aborted
+
+
+def test_sensitive_select_matches_by_value_distinct_from_label(
+    example_profile: ProfileModel,
+) -> None:
+    # P8-010: a <select> whose visible label ("No") differs from its submit value
+    # ("false") must be selected by the VALUE, not the label, when the approved bank
+    # answer matches either. The driver passes the option's value to select_option.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    profile = _profile_with_bank(
+        example_profile,
+        key="visa_select",
+        patterns=["visa sponsorship"],
+        value="No",
+    )
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="Do you require visa sponsorship?",
+        container_selector=".field.custom-question",
+        control_id="q_visa_select",
+        kind="select",
+        required=True,
+        options=["Yes", "No"],
+        option_values=["true", "false"],
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(profile))
+
+    # The submit VALUE "false" was selected (matched via the "No" label), not "No".
+    assert page.filled["#q_visa_select"] == "false"
+    assert llm.prompts == []
+    assert not result.unanswered_sensitive
+    assert not result.aborted
+
+
+def test_optional_non_sensitive_nontext_control_reported_uncertain(
+    example_profile: ProfileModel,
+) -> None:
+    # P8-010: an OPTIONAL, non-sensitive select/radio the driver cannot safely author
+    # must be reported as uncertain (so it appears in the pre-submit list), not
+    # silently skipped. It is never routed to the LLM and never aborts the form.
+    from tests.fakes import FakeFormPage, FakeFormQuestion
+
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(example_profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="How did you hear about us?",
+        container_selector=".field.custom-question",
+        control_id="q_source",
+        kind="select",
+        required=False,
+        options=["LinkedIn", "A friend", "Other"],
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(example_profile))
+
+    assert "#q_source" not in page.filled
+    assert result.uncertain_fields == ["How did you hear about us?"]
     assert not result.unanswered_sensitive
     assert not result.aborted
 
