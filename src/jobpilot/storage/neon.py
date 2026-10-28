@@ -34,6 +34,8 @@ log = get_logger(__name__)
 
 
 class _Cursor(Protocol):
+    rowcount: int
+
     def execute(self, query: str, params: object = ..., /) -> object: ...
 
     def fetchone(self) -> dict[str, Any] | None: ...
@@ -123,6 +125,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         missing_requirements=missing,
         status=JobStatus(row["status"]),
         found_at=row.get("found_at"),
+        status_changed_at=row.get("status_changed_at"),
     )
 
 
@@ -140,6 +143,7 @@ def _row_to_application(row: dict[str, Any]) -> Application:
         outcome=ApplicationOutcome(row["outcome"]),
         notes=row.get("notes"),
         created_at=row.get("created_at"),
+        reminder_sent_at=row.get("reminder_sent_at"),
     )
 
 
@@ -201,7 +205,7 @@ class NeonJobRepository:
                     " title = EXCLUDED.title, company = EXCLUDED.company, "
                     " location = EXCLUDED.location, remote = EXCLUDED.remote, "
                     " modality = EXCLUDED.modality, salary_text = EXCLUDED.salary_text, "
-                    " contact_email = EXCLUDED.contact_email, "
+                    " contact_email = COALESCE(EXCLUDED.contact_email, jobs.contact_email), "
                     " language = COALESCE(jobs.language, EXCLUDED.language), "
                     " description = EXCLUDED.description "
                     "RETURNING *",
@@ -254,7 +258,8 @@ class NeonJobRepository:
             cur.execute(
                 "UPDATE jobs SET "
                 " apply_url = %s, title = %s, company = %s, location = %s, "
-                " remote = %s, modality = %s, salary_text = %s, contact_email = %s, "
+                " remote = %s, modality = %s, salary_text = %s, "
+                " contact_email = COALESCE(%s, contact_email), "
                 " language = COALESCE(language, %s), description = %s "
                 "WHERE url = %s RETURNING *",
                 (
@@ -282,7 +287,7 @@ class NeonJobRepository:
     def set_status(self, job_id: int, status: JobStatus) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "UPDATE jobs SET status = %s WHERE id = %s",
+                "UPDATE jobs SET status = %s, status_changed_at = now() WHERE id = %s",
                 (status.value, job_id),
             )
         self._conn.commit()
@@ -296,12 +301,14 @@ class NeonJobRepository:
         with self._conn.cursor() as cur:
             cur.execute(
                 "UPDATE jobs SET "
-                " language = %s, modality = %s, analysis = %s, score = %s, "
-                " score_reason = %s, missing_requirements = %s, status = %s "
+                " language = %s, modality = %s, contact_email = %s, analysis = %s, "
+                " score = %s, score_reason = %s, missing_requirements = %s, "
+                " status = %s, status_changed_at = now() "
                 "WHERE id = %s RETURNING *",
                 (
                     job.language.value if job.language else None,
                     job.modality.value if job.modality else None,
+                    job.contact_email,
                     analysis_json,
                     job.score,
                     job.score_reason,
@@ -318,28 +325,184 @@ class NeonJobRepository:
 
     def create_application(self, app: Application) -> Application:
         with self._conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO applications "
-                "(job_id, language, cv_variant, cv_url, cover_letter_url, channel, "
-                " applied_at, follow_up_at, outcome, notes) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
-                (
-                    app.job_id,
-                    app.language.value,
-                    app.cv_variant,
-                    str(app.cv_url) if app.cv_url is not None else None,
-                    str(app.cover_letter_url) if app.cover_letter_url is not None else None,
-                    app.channel.value,
-                    app.applied_at,
-                    app.follow_up_at,
-                    app.outcome.value,
-                    app.notes,
-                ),
-            )
+            self._insert_application(cur, app)
             row = cur.fetchone()
         self._conn.commit()
         if row is None:  # pragma: no cover - RETURNING always yields a row
             raise RuntimeError("create_application did not return a row")
+        return _row_to_application(row)
+
+    @staticmethod
+    def _insert_application(cur: _Cursor, app: Application) -> None:
+        cur.execute(
+            "INSERT INTO applications "
+            "(job_id, language, cv_variant, cv_url, cover_letter_url, channel, "
+            " applied_at, follow_up_at, outcome, notes) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+            (
+                app.job_id,
+                app.language.value,
+                app.cv_variant,
+                str(app.cv_url) if app.cv_url is not None else None,
+                str(app.cover_letter_url) if app.cover_letter_url is not None else None,
+                app.channel.value,
+                app.applied_at,
+                app.follow_up_at,
+                app.outcome.value,
+                app.notes,
+            ),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Email-send idempotency (R11.1 no-double-send) — see migration 002.
+    # ------------------------------------------------------------------ #
+    def claim_email_send(self, job_id: int) -> bool:
+        """Durably and uniquely claim the email send for ``job_id`` before sending.
+
+        Atomically inserts an ``in_progress`` row into ``email_send_claims`` whose
+        primary key ``(job_id, channel='email')`` enforces one email operation per
+        job. Returns ``True`` when this call created the claim (the caller may now
+        call the provider), ``False`` when a claim already exists — either a send is
+        in progress / ambiguous or already done — so a second Enviar can never reach
+        the provider again.
+        """
+        import psycopg
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO email_send_claims (job_id, channel, state) "
+                    "VALUES (%s, 'email', 'in_progress')",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except psycopg.errors.UniqueViolation:
+            self._conn.rollback()
+            log.info("email_send_claim_exists", job_id=job_id)
+            return False
+        except Exception:
+            self._conn.rollback()
+            raise
+        return True
+
+    def release_email_send(self, job_id: int) -> None:
+        """Drop an ``in_progress`` claim so a provider-rejected send can be retried.
+
+        Only called when the provider itself rejected the message (nothing was
+        sent), so re-claiming on a later run is safe. An ambiguous outcome (provider
+        accepted, then a database failure) must NOT be released: the claim stays and
+        blocks any automatic resend.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM email_send_claims "
+                "WHERE job_id = %s AND channel = 'email' AND state = 'in_progress'",
+                (job_id,),
+            )
+        self._conn.commit()
+
+    def finalize_email_send(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark the job applied, close the claim.
+
+        All three writes happen in one transaction so the application row, the job's
+        ``applied`` status, and the claim's ``done`` state commit together or not at
+        all. A failure here leaves the claim ``in_progress`` (the ambiguous state),
+        which keeps a later Enviar from re-sending.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                self._insert_application(cur, app)
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE jobs SET status = %s, status_changed_at = now() WHERE id = %s",
+                    (JobStatus.applied.value, job_id),
+                )
+                cur.execute(
+                    "UPDATE email_send_claims SET state = 'done', updated_at = now() "
+                    "WHERE job_id = %s AND channel = 'email'",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if row is None:  # pragma: no cover - RETURNING always yields a row
+            raise RuntimeError("finalize_email_send did not return a row")
+        return _row_to_application(row)
+
+    # ------------------------------------------------------------------ #
+    # Assisted-form submit idempotency (R11.6 / P8-008) — reuses the
+    # ``email_send_claims`` table keyed by (job_id, channel='form_assisted').
+    # ------------------------------------------------------------------ #
+    def claim_form_submit(self, job_id: int) -> bool:
+        """Durably and uniquely claim the assisted-form submit for ``job_id``.
+
+        Atomically inserts an ``in_progress`` row whose ``(job_id, channel)`` primary
+        key enforces one assisted-form operation per job, so a second confirmed
+        Enviar can never click submit again. Returns ``True`` when this call created
+        the claim, ``False`` when one already exists (in progress, ambiguous or done).
+        """
+        import psycopg
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO email_send_claims (job_id, channel, state) "
+                    "VALUES (%s, 'form_assisted', 'in_progress')",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except psycopg.errors.UniqueViolation:
+            self._conn.rollback()
+            log.info("form_submit_claim_exists", job_id=job_id)
+            return False
+        except Exception:
+            self._conn.rollback()
+            raise
+        return True
+
+    def release_form_submit(self, job_id: int) -> None:
+        """Drop an ``in_progress`` form claim so a NOT-submitted attempt can retry.
+
+        Only called when the click never happened or the platform clearly rejected
+        the submission (nothing was accepted). An AMBIGUOUS outcome (the click
+        returned but success could not be confirmed) must NOT be released: the claim
+        stays and blocks any automatic resubmission until the owner reconciles it.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM email_send_claims "
+                "WHERE job_id = %s AND channel = 'form_assisted' AND state = 'in_progress'",
+                (job_id,),
+            )
+        self._conn.commit()
+
+    def finalize_form_submit(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark applied and close the form claim.
+
+        The application row, the job's ``applied`` status and the claim's ``done``
+        state commit together or not at all. A failure here leaves the claim
+        ``in_progress`` (ambiguous), which keeps a later Enviar from re-submitting.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                self._insert_application(cur, app)
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE jobs SET status = %s, status_changed_at = now() WHERE id = %s",
+                    (JobStatus.applied.value, job_id),
+                )
+                cur.execute(
+                    "UPDATE email_send_claims SET state = 'done', updated_at = now() "
+                    "WHERE job_id = %s AND channel = 'form_assisted'",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if row is None:  # pragma: no cover - RETURNING always yields a row
+            raise RuntimeError("finalize_form_submit did not return a row")
         return _row_to_application(row)
 
     def get_state(self, key: str) -> str | None:
@@ -364,19 +527,29 @@ class NeonJobRepository:
     # Query helpers used by later phases (A3) — not part of the Protocol.
     # ------------------------------------------------------------------ #
     def list_proposed(self) -> list[Job]:
+        return self.list_by_status(JobStatus.proposed)
+
+    def list_by_status(self, status: JobStatus) -> list[Job]:
+        """Return every job currently in ``status`` (ordered by id)."""
         with self._conn.cursor() as cur:
-            cur.execute("SELECT * FROM jobs WHERE status = %s ORDER BY id", ("proposed",))
+            cur.execute("SELECT * FROM jobs WHERE status = %s ORDER BY id", (status.value,))
             rows = cur.fetchall()
         return [_row_to_job(row) for row in rows]
 
-    def recent_company_role(self, company: str, role: str, within_days: int) -> bool:
-        """True if a job for the same company+role was proposed within the window."""
+    def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool:
+        """True if a job for the same company+role was proposed within the window.
+
+        The window is measured against ``status_changed_at`` (the last status
+        transition, which for a proposed/approved/applied job is when it reached
+        that state), not ``found_at``: a job collected long ago but only proposed
+        today must still block an identical proposal made right afterwards.
+        """
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM jobs "
                 "WHERE lower(company) = lower(%s) AND lower(title) = lower(%s) "
                 "  AND status IN ('proposed', 'approved', 'applied') "
-                "  AND found_at >= now() - make_interval(days => %s) "
+                "  AND status_changed_at >= now() - make_interval(days => %s) "
                 "LIMIT 1",
                 (company, role, within_days),
             )
@@ -392,13 +565,56 @@ class NeonJobRepository:
         return int(row["n"]) if row is not None else 0
 
     def applications_without_outcome(self, before: dt.datetime) -> list[Application]:
+        """Pending applications due for a first reminder before ``before``.
+
+        Only applications whose ``follow_up_at`` has passed and that have NOT yet
+        been reminded (``reminder_sent_at IS NULL``) are returned, so the reminder is
+        sent exactly once per application (Phase 7).
+        """
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM applications "
                 "WHERE outcome = 'pending' AND follow_up_at IS NOT NULL "
-                "  AND follow_up_at <= %s "
+                "  AND follow_up_at <= %s AND reminder_sent_at IS NULL "
                 "ORDER BY follow_up_at",
                 (before,),
+            )
+            rows = cur.fetchall()
+        return [_row_to_application(row) for row in rows]
+
+    def mark_reminder_sent(self, application_id: int, when: dt.datetime) -> None:
+        """Record that the follow-up reminder for an application was sent."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE applications SET reminder_sent_at = %s WHERE id = %s",
+                (when, application_id),
+            )
+        self._conn.commit()
+
+    def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int:
+        """Set the outcome of every application for ``job_id``; return rows changed.
+
+        The owner's ``/entrevista id`` and ``/rechazo id`` commands reference the
+        job id shown in proposals; a job has at most one application in normal use,
+        but the update targets all of them to stay correct if more than one exists.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE applications SET outcome = %s WHERE job_id = %s",
+                (outcome.value, job_id),
+            )
+            changed = cur.rowcount
+        self._conn.commit()
+        return int(changed)
+
+    def applications_in_period(self, start: dt.datetime, end: dt.datetime) -> list[Application]:
+        """Applications created within ``[start, end)`` (for the weekly report)."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM applications "
+                "WHERE created_at >= %s AND created_at < %s "
+                "ORDER BY created_at",
+                (start, end),
             )
             rows = cur.fetchall()
         return [_row_to_application(row) for row in rows]

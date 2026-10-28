@@ -62,6 +62,20 @@ class Update(BaseModel):
     callback_data: str | None = None
 
 
+class UpdateBatch(BaseModel):
+    """A fetched batch of Telegram updates plus the highest raw ``update_id`` seen.
+
+    ``updates`` only contains the owner's updates (everything else is refused), but
+    ``highest_update_id`` reflects every update returned by Telegram, including the
+    ignored non-owner ones. The pipeline checkpoints ``highest_update_id`` so a
+    batch made entirely of unauthorized messages still advances the cursor and can
+    never starve a later owner update.
+    """
+
+    updates: list[Update]
+    highest_update_id: int | None = None
+
+
 @runtime_checkable
 class Notifier(Protocol):
     """The Telegram-facing channel."""
@@ -74,6 +88,8 @@ class Notifier(Protocol):
     ) -> None: ...
 
     def get_updates(self, offset: int | None = None) -> list[Update]: ...
+
+    def get_update_batch(self, offset: int | None = None) -> UpdateBatch: ...
 
 
 @runtime_checkable
@@ -109,12 +125,21 @@ class JobRepository(Protocol):
 
 
 class FillContext(BaseModel):
-    """Everything a FormFiller needs: the job and the chosen documents."""
+    """Everything a FormFiller needs: the job and the chosen documents.
+
+    ``cover_letter_text`` is the approved cover letter's plain-text body. It lets a
+    platform that has no dedicated cover-letter upload (Lever) place the approved
+    letter into its "additional information" text control instead, without ever
+    regenerating it through the form-answer LLM. It is ``None`` when unavailable, in
+    which case a platform that needs a text destination must abort rather than submit
+    without the cover letter (R15.3).
+    """
 
     job_id: int
     language: str
     cv_path: str
     cover_letter_path: str
+    cover_letter_text: str | None = None
 
 
 class FillResult(BaseModel):

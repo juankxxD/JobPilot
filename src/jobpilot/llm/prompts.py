@@ -244,7 +244,7 @@ Instructions:
   in). Do not choose a different language.
 - Prefer content whose claims the offer actually values; do NOT include content
   just to fill space.
-
+{adjustment}
 Candidate profile:
 ---
 {profile}
@@ -263,6 +263,153 @@ Return JSON for this schema:
 {schema}
 """
 
+_ADJUSTMENT_INSTRUCTION = """\
+- The owner asked for an adjustment to the previous selection. Honour this
+  instruction by RE-SELECTING which existing ids to include and in what order; it
+  changes only your choice of ids, never the wording of any content, and the
+  instruction text must NOT appear in the output: "{instruction}"
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 — cover-letter composition (approved facts only)
+# --------------------------------------------------------------------------- #
+
+COVER_LETTER_PROMPT = """\
+You are writing the BODY of a short cover letter for a single job offer, in
+{language_name}. You compose it ONLY from the approved facts provided below: the
+candidate's summary, their selected achievements, and their known technologies. You
+never add a company, role, number, date, or technology that is not in those facts.
+
+{anti_invention}
+
+Instructions:
+- Write a cohesive body of AT MOST {max_words} words in {language_name}.
+- Use ONLY the approved summary, achievements and technologies below. Do NOT claim
+  any technology that is not in "Known technologies".
+- Do NOT include a greeting ("Dear ...", "Estimado ...") or a sign-off/signature:
+  those are added around your body in code. Write only the message paragraphs.
+- Keep it professional and specific to this offer using the facts given; never
+  invent new facts to sound more impressive.
+{adjustment}
+Approved summary:
+---
+{summary}
+---
+Selected achievements (most relevant first):
+---
+{achievements}
+---
+Known technologies (the ONLY technologies you may mention):
+{technologies}
+---
+Analysed offer:
+---
+{analysis}
+---
+
+Return JSON for this schema (the "body" field holds ONLY the paragraphs):
+{schema}
+"""
+
+_COVER_ADJUSTMENT_INSTRUCTION = """\
+- The owner asked for an adjustment to the previous letter. Honour this instruction
+  by rewriting the TONE/EMPHASIS/ARRANGEMENT of the approved facts only; it must not
+  introduce any new fact or technology, and the instruction text itself must NOT
+  appear anywhere in your output: "{instruction}"
+"""
+
+
+def build_cover_letter_prompt(
+    *,
+    language: str,
+    summary: str,
+    achievements: list[str],
+    technologies: list[str],
+    analysis_json: str,
+    schema_json: str,
+    max_words: int,
+    instruction: str | None = None,
+) -> str:
+    language_name = "Spanish" if language == "es" else "English"
+    adjustment = (
+        _COVER_ADJUSTMENT_INSTRUCTION.format(instruction=instruction.strip())
+        if instruction and instruction.strip()
+        else ""
+    )
+    return COVER_LETTER_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        adjustment=adjustment,
+        language_name=language_name,
+        max_words=max_words,
+        summary=summary,
+        achievements="\n".join(f"- {a}" for a in achievements) or "(none)",
+        technologies=", ".join(sorted(technologies)) or "(none)",
+        analysis=analysis_json,
+        schema=schema_json,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 — assisted-form open-question answers (profile + offer ONLY)
+# --------------------------------------------------------------------------- #
+
+FORM_ANSWER_PROMPT = """\
+You are answering ONE open question on a job-application form, in {language_name}.
+You answer ONLY from the candidate profile and the analysed offer below. You never
+invent a fact, number, date, employer, or technology that is not in them.
+
+{anti_invention}
+
+Instructions:
+- Answer the question concisely and professionally in {language_name}, using ONLY
+  the facts in the candidate profile and the analysed offer.
+- NEVER state a salary figure, a visa/work-authorization status, a relocation
+  commitment, any background/legal/criminal detail, any demographic information, or
+  a specific number of years of experience with a particular technology. If the
+  question asks for any of those, you MUST set "confident" to false and give an
+  empty-intent answer; those are handled elsewhere, never by you.
+- If the profile and offer do not contain enough information to answer truthfully,
+  set "confident" to false so a human reviews it. Never guess to fill the blank.
+- Set "confident" to true ONLY when the answer is fully supported by the facts
+  below and is not one of the forbidden topics above.
+
+Candidate profile:
+---
+{profile}
+---
+Analysed offer:
+---
+{analysis}
+---
+Form question:
+---
+{question}
+---
+
+Return JSON for this schema:
+{schema}
+"""
+
+
+def build_form_answer_prompt(
+    *,
+    question: str,
+    language: str,
+    profile_json: str,
+    analysis_json: str,
+    schema_json: str,
+) -> str:
+    language_name = "Spanish" if language == "es" else "English"
+    return FORM_ANSWER_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        language_name=language_name,
+        profile=profile_json,
+        analysis=analysis_json,
+        question=question,
+        schema=schema_json,
+    )
+
 
 def build_select_content_prompt(
     *,
@@ -274,9 +421,16 @@ def build_select_content_prompt(
     analysis_json: str,
     language: str,
     schema_json: str,
+    instruction: str | None = None,
 ) -> str:
+    adjustment = (
+        _ADJUSTMENT_INSTRUCTION.format(instruction=instruction.strip())
+        if instruction and instruction.strip()
+        else ""
+    )
     return SELECT_CONTENT_PROMPT.format(
         anti_invention=ANTI_INVENTION_RULES,
+        adjustment=adjustment,
         profile=profile_json,
         summary_variants=", ".join(sorted(summary_variants)) or "(none)",
         achievement_ids=", ".join(sorted(achievement_ids)) or "(none)",

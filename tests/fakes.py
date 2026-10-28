@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel
 
-from jobpilot.models import Application, Job, JobStatus, RawJob, StoredFile
+from jobpilot.channels.telegram import TelegramDeliveryError
+from jobpilot.forms.base import FormElement
+from jobpilot.interfaces import Button, FillContext, FillResult, Update, UpdateBatch
+from jobpilot.models import (
+    Application,
+    ApplicationOutcome,
+    Attachment,
+    Job,
+    JobStatus,
+    RawJob,
+    StoredFile,
+)
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -74,9 +86,12 @@ class FakeJobRepository:
         self._by_url: dict[str, int] = {}
         self._applications: list[Application] = []
         self._state: dict[str, str] = {}
+        self._email_send_claims: dict[int, str] = {}
+        self._form_submit_claims: dict[int, str] = {}
         self._next_job_id = 1
         self._next_app_id = 1
         self.upsert_calls = 0
+        self.fail_finalize = False
         self.status_changes: list[tuple[int, JobStatus]] = []
 
     def upsert_job(self, job: RawJob) -> Job:
@@ -97,7 +112,12 @@ class FakeJobRepository:
                     "remote": job.remote,
                     "modality": job.modality,
                     "salary_text": job.salary_text,
-                    "contact_email": job.contact_email,
+                    # Prefer a freshly supplied source email, but preserve a stored
+                    # (e.g. analysis-derived) address when recollection yields None
+                    # (mirrors COALESCE(EXCLUDED.contact_email, jobs.contact_email)).
+                    "contact_email": job.contact_email
+                    if job.contact_email is not None
+                    else current.contact_email,
                     # Only fill language while still unknown so a language established
                     # later by analysis is never overwritten (mirrors the COALESCE in
                     # NeonJobRepository.upsert_job).
@@ -140,27 +160,201 @@ class FakeJobRepository:
 
     def set_status(self, job_id: int, status: JobStatus) -> None:
         job = self._jobs[job_id]
-        self._jobs[job_id] = job.model_copy(update={"status": status})
+        self._jobs[job_id] = job.model_copy(
+            update={"status": status, "status_changed_at": self._now()}
+        )
         self.status_changes.append((job_id, status))
 
     def save_job(self, job: Job) -> Job:
         if job.id is None:
             raise ValueError("save_job requires a job with an id")
-        self._jobs[job.id] = job
-        return job
+        # Mirror the concrete repository, which stamps status_changed_at on every
+        # save_job, so the dedupe window measures from the proposal time.
+        self._jobs[job.id] = job.model_copy(update={"status_changed_at": self._now()})
+        return self._jobs[job.id]
+
+    def _now(self) -> datetime:
+        return datetime.now(UTC)
 
     def create_application(self, app: Application) -> Application:
         app_id = self._next_app_id
         self._next_app_id += 1
-        stored = app.model_copy(update={"id": app_id})
+        # Mirror the DB default (applications.created_at DEFAULT now()) so the
+        # weekly-report period query has a timestamp to filter on.
+        update: dict[str, object] = {"id": app_id}
+        if app.created_at is None:
+            update["created_at"] = self._now()
+        stored = app.model_copy(update=update)
         self._applications.append(stored)
         return stored
+
+    # Email-send idempotency (mirrors NeonJobRepository, migration 002) --- #
+    def claim_email_send(self, job_id: int) -> bool:
+        """Create a unique in-progress email-send claim; False if one exists."""
+        if job_id in self._email_send_claims:
+            return False
+        self._email_send_claims[job_id] = "in_progress"
+        return True
+
+    def release_email_send(self, job_id: int) -> None:
+        """Drop an in-progress claim (provider rejected; safe to retry)."""
+        if self._email_send_claims.get(job_id) == "in_progress":
+            del self._email_send_claims[job_id]
+
+    def finalize_email_send(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark applied and close the claim.
+
+        ``fail_finalize`` lets a test simulate a database failure AFTER the provider
+        accepted the message: nothing is recorded, the job stays proposed, and the
+        claim is left ``in_progress`` so a later Enviar cannot resend.
+        """
+        if self.fail_finalize:
+            raise RuntimeError("simulated database failure after provider acceptance")
+        stored = self.create_application(app)
+        self.set_status(job_id, JobStatus.applied)
+        self._email_send_claims[job_id] = "done"
+        return stored
+
+    def email_claim_state(self, job_id: int) -> str | None:
+        """Return the stored email-send claim state for ``job_id`` (test helper)."""
+        return self._email_send_claims.get(job_id)
+
+    # Assisted-form submit idempotency (mirrors NeonJobRepository, P8-008) #
+    def claim_form_submit(self, job_id: int) -> bool:
+        """Create a unique in-progress form-submit claim; False if one exists."""
+        if job_id in self._form_submit_claims:
+            return False
+        self._form_submit_claims[job_id] = "in_progress"
+        return True
+
+    def release_form_submit(self, job_id: int) -> None:
+        """Drop an in-progress form claim (not submitted; safe to retry)."""
+        if self._form_submit_claims.get(job_id) == "in_progress":
+            del self._form_submit_claims[job_id]
+
+    def finalize_form_submit(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark applied and close the form claim.
+
+        ``fail_finalize`` lets a test simulate a database failure AFTER the platform
+        accepted the submission: nothing is recorded, the job stays as-is, and the
+        claim is left ``in_progress`` so a later Enviar cannot resubmit.
+        """
+        if self.fail_finalize:
+            raise RuntimeError("simulated database failure after platform acceptance")
+        stored = self.create_application(app)
+        self.set_status(job_id, JobStatus.applied)
+        self._form_submit_claims[job_id] = "done"
+        return stored
+
+    def form_claim_state(self, job_id: int) -> str | None:
+        """Return the stored form-submit claim state for ``job_id`` (test helper)."""
+        return self._form_submit_claims.get(job_id)
 
     def get_state(self, key: str) -> str | None:
         return self._state.get(key)
 
     def set_state(self, key: str, value: str) -> None:
         self._state[key] = value
+
+    # Proposal guards (mirror NeonJobRepository helpers, assumption A3) -- #
+    def count_applications_on(self, day: date) -> int:
+        """Count applications whose ``applied_at`` falls on ``day``."""
+        return sum(
+            1
+            for app in self._applications
+            if app.applied_at is not None and app.applied_at.date() == day
+        )
+
+    def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool:
+        """Return whether a job for the same company+role was recently proposed.
+
+        Mirrors the concrete repository: a proposed/approved/applied job for the
+        same company and role counts only when its last status transition
+        (``status_changed_at``) falls within ``within_days``. A job whose proposal
+        is older than the window no longer blocks a new identical proposal.
+        """
+        seen = {JobStatus.proposed, JobStatus.approved, JobStatus.applied}
+        cutoff = self._now() - timedelta(days=within_days)
+        for job in self._jobs.values():
+            if job.company != company or job.title != role or job.status not in seen:
+                continue
+            changed = job.status_changed_at
+            if changed is None or changed >= cutoff:
+                return True
+        return False
+
+    # Follow-up helpers (mirror NeonJobRepository, migration 004) --------- #
+    def applications_without_outcome(self, before: datetime) -> list[Application]:
+        """Pending applications due for a first (not-yet-sent) reminder before ``before``."""
+        return sorted(
+            (
+                app
+                for app in self._applications
+                if app.outcome is ApplicationOutcome.pending
+                and app.follow_up_at is not None
+                and app.follow_up_at <= before
+                and app.reminder_sent_at is None
+            ),
+            key=lambda a: a.follow_up_at or self._now(),
+        )
+
+    def mark_reminder_sent(self, application_id: int, when: datetime) -> None:
+        """Record that the follow-up reminder for an application was sent."""
+        for index, app in enumerate(self._applications):
+            if app.id == application_id:
+                self._applications[index] = app.model_copy(update={"reminder_sent_at": when})
+                return
+
+    def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int:
+        """Set the outcome of every application for ``job_id``; return rows changed."""
+        changed = 0
+        for index, app in enumerate(self._applications):
+            if app.job_id == job_id:
+                self._applications[index] = app.model_copy(update={"outcome": outcome})
+                changed += 1
+        return changed
+
+    def applications_in_period(self, start: datetime, end: datetime) -> list[Application]:
+        """Applications created within ``[start, end)`` (for the weekly report)."""
+        return sorted(
+            (
+                app
+                for app in self._applications
+                if app.created_at is not None and start <= app.created_at < end
+            ),
+            key=lambda a: a.created_at or self._now(),
+        )
+
+    def list_proposed(self) -> list[Job]:
+        """Return every job currently in the ``proposed`` status."""
+        return self.list_by_status(JobStatus.proposed)
+
+    def list_by_status(self, status: JobStatus) -> list[Job]:
+        """Return every job currently in ``status`` (ordered by id)."""
+        return [
+            job
+            for job in sorted(self._jobs.values(), key=lambda j: j.id or 0)
+            if job.status is status
+        ]
+
+    def set_status_changed_at(self, job_id: int, when: datetime) -> None:
+        """Override a job's status-transition timestamp (test helper for dedupe)."""
+        self._jobs[job_id] = self._jobs[job_id].model_copy(update={"status_changed_at": when})
+
+    def seed_job(self, job: Job) -> Job:
+        """Insert a fully-formed ``Job`` directly (test helper for later phases).
+
+        Phases after collection start from jobs already scored/proposed; this stores
+        such a job and registers its dedupe keys without going through ``upsert_job``.
+        """
+        if job.id is None:
+            job = job.model_copy(update={"id": self._next_job_id})
+        assert job.id is not None
+        self._jobs[job.id] = job
+        self._by_source_external[(job.source, job.external_id)] = job.id
+        self._by_url[job.url] = job.id
+        self._next_job_id = max(self._next_job_id, job.id + 1)
+        return job
 
     # Test conveniences ------------------------------------------------- #
     @property
@@ -213,3 +407,447 @@ class FakeFileStorage:
             name=name,
             web_view_link=f"{self._base_url}/{file_id}",
         )
+
+
+class SentEmail(BaseModel):
+    """A record of one :meth:`FakeMailer.send` call."""
+
+    to: str
+    subject: str
+    body: str
+    attachments: list[str] = []
+    attachment_bytes: list[bytes] = []
+
+
+class FakeMailer:
+    """A Mailer that records sends and can simulate a provider rejection.
+
+    Records each ``send`` (recipient, subject, body and attachment filenames) so
+    tests can assert the email path was taken with the right documents. Set
+    ``fail`` to have the next ``send`` raise, exercising the retry-safe path where a
+    failed send must not record an application. Set ``record_bytes`` to also capture
+    the raw attachment bytes, so a test can assert byte identity with the approved
+    proposal documents.
+    """
+
+    def __init__(self, *, fail: bool = False, record_bytes: bool = False) -> None:
+        self.sent: list[SentEmail] = []
+        self._fail = fail
+        self._record_bytes = record_bytes
+
+    def send(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment],
+    ) -> None:
+        if self._fail:
+            raise RuntimeError("simulated mail provider rejection")
+        self.sent.append(
+            SentEmail(
+                to=to,
+                subject=subject,
+                body=body,
+                attachments=[a.filename for a in attachments],
+                attachment_bytes=[a.content for a in attachments] if self._record_bytes else [],
+            )
+        )
+
+
+#: The kind of control a fake question renders. ``text``/``textarea`` are free-text
+#: controls the driver can answer; ``select``/``radio``/``checkbox``/``number`` are
+#: non-text controls it must never guess at (a required one aborts the form).
+FakeControlKind = Literal["text", "textarea", "select", "radio", "checkbox", "number"]
+
+#: How each control kind maps to the CSS group the driver queries containers with.
+_CONTROL_KIND_CSS: dict[str, str] = {
+    "text": "input[type='text']",
+    "textarea": "textarea",
+    "select": "select",
+    "radio": "input[type='radio']",
+    "checkbox": "input[type='checkbox']",
+    "number": "input[type='number']",
+}
+_FREE_TEXT_KINDS = {"text", "textarea"}
+
+
+def _selector_matches(query: str, css: str) -> bool:
+    """Return whether a comma-separated CSS ``query`` includes the exact ``css`` token.
+
+    The fake stores each control under a precise CSS token (e.g. ``select`` or
+    ``input[type='radio']``); the driver queries with comma-separated groups, so a
+    match means the control belongs to that group. ``[required]`` matches any control
+    the test marked required (handled separately by the page), so it is not resolved
+    here.
+    """
+    parts = [part.strip() for part in query.split(",")]
+    return css in parts
+
+
+class FakeFormQuestion(BaseModel):
+    """One custom question in a :class:`FakeFormPage`'s DOM.
+
+    ``container_selector`` is what the platform's ``question_container_selector``
+    matches; ``control_id``/``control_name`` back the stable selector the driver
+    derives (``#id`` preferred, then ``[name="..."]``); ``label`` is the visible
+    question text the driver reads via ``inner_text``. ``kind`` selects the control
+    type the container renders (free-text by default); ``required``/``checked`` model
+    a required and/or already-answered non-text control so the completeness gate can
+    be exercised without a browser.
+    """
+
+    label: str
+    container_selector: str
+    control_id: str | None = None
+    control_name: str | None = None
+    kind: FakeControlKind = "text"
+    required: bool = False
+    checked: bool = False
+    #: Selectable option values for a ``select``/``radio`` control, so a sensitive
+    #: answer from the bank is applied only when it exactly matches one offered choice.
+    options: list[str] = []
+
+    def control_selector(self) -> str:
+        if self.control_id:
+            return f"#{self.control_id}"
+        if self.control_name:
+            return f'[name="{self.control_name}"]'
+        raise ValueError("a question needs a control id or name")
+
+    def control_css(self) -> str:
+        return _CONTROL_KIND_CSS[self.kind]
+
+    def is_free_text(self) -> bool:
+        return self.kind in _FREE_TEXT_KINDS
+
+
+class FakeFormElement:
+    """A fake Playwright ``ElementHandle`` with the surface the driver reads."""
+
+    def __init__(
+        self,
+        page: FakeFormPage,
+        *,
+        attributes: dict[str, str] | None = None,
+        inner_text: str = "",
+        value_selector: str | None = None,
+        child: FakeFormElement | None = None,
+        visible: bool = True,
+        checked: bool = False,
+        children: dict[str, FakeFormElement] | None = None,
+        options: list[str] | None = None,
+    ) -> None:
+        self._page = page
+        self._attributes = attributes or {}
+        self._inner_text = inner_text
+        self._value_selector = value_selector
+        self._child = child
+        self._visible = visible
+        self._checked = checked
+        # Optional CSS-selector -> child element map so a container can expose
+        # different controls to different selectors (free-text vs. non-text).
+        self._children = children or {}
+        # Selectable <option> values for a select/radio control, exposed through
+        # ``query_selector_all("option")`` so the driver can match a bank answer.
+        self._options = options or []
+
+    def get_attribute(self, name: str) -> str | None:
+        return self._attributes.get(name)
+
+    def inner_text(self) -> str:
+        return self._inner_text
+
+    def input_value(self) -> str:
+        if self._value_selector is None:
+            return ""
+        return self._page.filled.get(self._value_selector, "")
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def is_checked(self) -> bool:
+        return self._checked
+
+    def query_selector(self, selector: str) -> FormElement | None:
+        for css, element in self._children.items():
+            if _selector_matches(selector, css):
+                return element
+        return self._child
+
+    def query_selector_all(self, selector: str) -> list[FormElement]:
+        if _selector_matches(selector, "option"):
+            return [
+                FakeFormElement(self._page, attributes={"value": value}, inner_text=value)
+                for value in self._options
+            ]
+        return [
+            element for css, element in self._children.items() if _selector_matches(selector, css)
+        ]
+
+
+class FakeFormPage:
+    """A fake Playwright page mirroring the real ``Page`` API surface (no browser).
+
+    Tests configure which selectors exist (``present``), which custom questions the
+    DOM exposes (``questions``), optional hidden controls (``hidden``), and the page
+    ``dom`` (for DOM-based platform detection). Discovery and required-field
+    validation run through the same :meth:`query_selector_all` / :meth:`query_selector`
+    + ``ElementHandle`` methods a real run uses, so the mocked tests exercise the
+    production path rather than a page-only shortcut. Every ``fill`` /
+    ``set_input_files`` / ``click`` / ``screenshot`` is recorded for assertions.
+    """
+
+    def __init__(
+        self,
+        *,
+        present: Iterable[str] = (),
+        questions: Iterable[FakeFormQuestion] = (),
+        hidden: Iterable[str] = (),
+        dom: str = "",
+        present_after_click: Iterable[str] = (),
+        click_raises: Exception | None = None,
+    ) -> None:
+        self._present = set(present)
+        self._questions = list(questions)
+        self._hidden = set(hidden)
+        self._dom = dom
+        # Markers that only appear once the submit button is clicked (a platform
+        # confirmation page) and an optional exception a click should raise, so tests
+        # can model a successful submit, a post-click challenge, or a click failure.
+        self._present_after_click = set(present_after_click)
+        self._click_raises = click_raises
+        # A question's derived control selector is present too, so the driver can
+        # fill it and required-field validation can read its value back.
+        for question in self._questions:
+            self._present.add(question.control_selector())
+        self.filled: dict[str, str] = {}
+        self.uploaded: dict[str, str] = {}
+        self.clicked: list[str] = []
+        self.screenshots: list[str] = []
+        # Selectors the driver has checked (radio/checkbox) during this run, unioned
+        # with each question's initial ``checked`` state so the completeness gate sees
+        # a control answered from the bank as complete.
+        self._checked: set[str] = set()
+        self._questions_by_selector: dict[str, FakeFormQuestion] = {
+            q.control_selector(): q for q in self._questions
+        }
+
+    def content(self) -> str:
+        return self._dom
+
+    def fill(self, selector: str, value: str) -> None:
+        self.filled[selector] = value
+
+    def set_input_files(self, selector: str, files: str) -> None:
+        self.uploaded[selector] = files
+
+    def file_input_value(self, selector: str) -> str:
+        # Mirrors a real file input's ``input_value`` (the attached file path), so the
+        # completeness gate sees the live attachment state, not just a selector.
+        return self.uploaded.get(selector, "")
+
+    def select_option(self, selector: str, value: str) -> None:
+        # Selecting an option records the chosen value so the control reads complete.
+        self.filled[selector] = value
+
+    def check(self, selector: str) -> None:
+        self._checked.add(selector)
+
+    def _is_checked(self, selector: str, question: FakeFormQuestion | None) -> bool:
+        if selector in self._checked:
+            return True
+        return bool(question and question.checked)
+
+    def query_selector(self, selector: str) -> FormElement | None:
+        if selector not in self._present:
+            return None
+        question = self._questions_by_selector.get(selector)
+        attrs: dict[str, str] = {"id": selector.lstrip("#")}
+        options: list[str] = []
+        if question is not None and question.kind in {"select", "radio"}:
+            options = list(question.options)
+            if question.kind == "radio" and options:
+                attrs["value"] = options[0]
+        return FakeFormElement(
+            self,
+            attributes=attrs,
+            value_selector=selector,
+            visible=selector not in self._hidden,
+            checked=self._is_checked(selector, question),
+            options=options,
+        )
+
+    def _question_control(self, question: FakeFormQuestion) -> FakeFormElement:
+        attrs: dict[str, str] = {}
+        if question.control_id:
+            attrs["id"] = question.control_id
+        if question.control_name:
+            attrs["name"] = question.control_name
+        if question.kind == "radio":
+            attrs["type"] = "radio"
+        elif question.kind == "checkbox":
+            attrs["type"] = "checkbox"
+        elif question.kind == "number":
+            attrs["type"] = "number"
+        elif question.kind == "text":
+            attrs["type"] = "text"
+        if question.required:
+            attrs["required"] = "required"
+        options: list[str] = []
+        if question.kind in {"select", "radio"}:
+            options = list(question.options)
+        return FakeFormElement(
+            self,
+            attributes=attrs,
+            value_selector=question.control_selector(),
+            checked=self._is_checked(question.control_selector(), question),
+            options=options,
+        )
+
+    def query_selector_all(self, selector: str) -> list[FormElement]:
+        if selector == "[required]":
+            return [
+                self._question_control(q)
+                for q in self._questions
+                if q.required and q.control_selector() in self._present
+            ]
+        elements: list[FormElement] = []
+        for question in self._questions:
+            if question.container_selector != selector:
+                continue
+            control = self._question_control(question)
+            container = FakeFormElement(
+                self,
+                inner_text=question.label,
+                children={question.control_css(): control},
+            )
+            elements.append(container)
+        return elements
+
+    def click(self, selector: str) -> None:
+        self.clicked.append(selector)
+        if self._click_raises is not None:
+            raise self._click_raises
+        # Model the platform's post-click response: a successful submit reveals the
+        # configured success markers so the post-submit verification can confirm it.
+        self._present.update(self._present_after_click)
+
+    def screenshot(self, *, path: str) -> None:
+        self.screenshots.append(path)
+        Path(path).write_bytes(b"fake-png")
+
+
+class SentMessage(BaseModel):
+    """A record of one :meth:`FakeNotifier.send_message` call."""
+
+    text: str
+    buttons: list[Button] = []
+    attachments: list[str] = []
+
+
+class FakeNotifier:
+    """A Notifier that records sent messages and returns scripted updates.
+
+    Records each ``send_message`` (text, buttons and attachment filenames) so tests
+    can assert on the Spanish copy and the inline keyboard, and replays a queued
+    list of :class:`Update` objects, honouring the ``offset`` so already-acknowledged
+    updates are not returned twice (mirroring Telegram's ``getUpdates`` contract).
+
+    ``highest_update_id`` is reported over every queued update (including ones a
+    real notifier would drop for not belonging to the owner), so the pipeline can
+    checkpoint an all-ignored batch. ``fail_send_after`` lets a test simulate the
+    Telegram Bot API rejecting a send: once that many ``send_message`` calls have
+    succeeded, the next raises :class:`TelegramDeliveryError`.
+    """
+
+    def __init__(
+        self,
+        updates: Iterable[Update] = (),
+        *,
+        highest_update_id: int | None = None,
+        fail_send_after: int | None = None,
+        updates_after_send: Iterable[Update] = (),
+    ) -> None:
+        self.messages: list[SentMessage] = []
+        self._updates: list[Update] = list(updates)
+        # Updates that only become visible once a message has been sent, modelling an
+        # owner who reacts to a prompt (e.g. presses Enviar) after it is shown.
+        self._updates_after_send: list[Update] = list(updates_after_send)
+        self._highest_update_id = highest_update_id
+        self._fail_send_after = fail_send_after
+        self.get_updates_calls: list[int | None] = []
+
+    def queue_updates(self, *updates: Update) -> None:
+        self._updates.extend(updates)
+
+    def _all_updates(self) -> list[Update]:
+        if self.messages and self._updates_after_send:
+            return [*self._updates, *self._updates_after_send]
+        return list(self._updates)
+
+    def send_message(
+        self,
+        text: str,
+        buttons: Sequence[Button] | None = None,
+        attachments: Sequence[Attachment] | None = None,
+    ) -> None:
+        if self._fail_send_after is not None and len(self.messages) >= self._fail_send_after:
+            raise TelegramDeliveryError("simulated Telegram Bot API rejection")
+        self.messages.append(
+            SentMessage(
+                text=text,
+                buttons=list(buttons or ()),
+                attachments=[a.filename for a in (attachments or ())],
+            )
+        )
+
+    def _visible(self, offset: int | None) -> list[Update]:
+        updates = self._all_updates()
+        if offset is None:
+            return updates
+        return [u for u in updates if u.update_id >= offset]
+
+    def _highest(self, offset: int | None) -> int | None:
+        if self._highest_update_id is not None:
+            return self._highest_update_id
+        visible = self._visible(offset)
+        return max((u.update_id for u in visible), default=None)
+
+    def get_updates(self, offset: int | None = None) -> list[Update]:
+        self.get_updates_calls.append(offset)
+        return self._visible(offset)
+
+    def get_update_batch(self, offset: int | None = None) -> UpdateBatch:
+        self.get_updates_calls.append(offset)
+        return UpdateBatch(updates=self._visible(offset), highest_update_id=self._highest(offset))
+
+    # Test conveniences ------------------------------------------------- #
+    @property
+    def callback_values(self) -> list[str]:
+        """Every ``callback_data`` across all buttons sent, in order."""
+        return [b.callback_data for msg in self.messages for b in msg.buttons]
+
+    def last(self) -> SentMessage:
+        return self.messages[-1]
+
+
+class FakeFormFiller:
+    """A FormFiller that returns a canned FillResult and records its calls.
+
+    Implements the :class:`~jobpilot.interfaces.FormFiller` Protocol
+    (``matches``/``fill``) without any browser, so the pipeline/apply flow can be
+    exercised with a predictable fill outcome.
+    """
+
+    def __init__(self, result: FillResult, *, handles: str = "") -> None:
+        self._result = result
+        self._handles = handles
+        self.fill_calls: list[tuple[str, FillContext]] = []
+
+    def matches(self, url: str) -> bool:
+        return self._handles in url if self._handles else True
+
+    def fill(self, url: str, ctx: FillContext) -> FillResult:
+        self.fill_calls.append((url, ctx))
+        return self._result

@@ -9,6 +9,7 @@ from jobpilot.config import Language
 from jobpilot.profile.model import ProfileModel
 from jobpilot.profile.validation import (
     extract_mentioned_technologies,
+    find_invented_technologies,
     find_unknown_technologies,
     validate_selection,
 )
@@ -86,3 +87,35 @@ def test_extract_mentioned_technologies(example_profile_dict: dict[str, Any]) ->
     assert "java" in mentioned
     assert "aws" in mentioned
     assert "mongodb" not in mentioned
+
+
+def test_find_invented_technologies_flags_absent_catalogue_tech(
+    example_profile_dict: dict[str, Any],
+) -> None:
+    profile = _profile(example_profile_dict)
+    # The example profile has Java/Spring/AWS/Kubernetes but not Rust or Cassandra.
+    text = "Built services in Java and migrated the platform to Rust with Cassandra."
+    invented = find_invented_technologies(profile, text)
+    assert "rust" in invented
+    assert "cassandra" in invented
+    # Technologies that ARE in the profile must never be flagged as invented.
+    assert "java" not in invented
+    assert "kubernetes" not in invented
+
+
+def test_find_invented_technologies_empty_for_profile_only_text(
+    example_profile_dict: dict[str, Any],
+) -> None:
+    profile = _profile(example_profile_dict)
+    text = "Experienced in Java, Spring Boot and AWS building backend services."
+    assert find_invented_technologies(profile, text) == []
+
+
+def test_find_invented_technologies_ignores_substrings(
+    example_profile_dict: dict[str, Any],
+) -> None:
+    profile = _profile(example_profile_dict)
+    # "go" (a catalogue language absent from the profile) must not match inside
+    # ordinary words like "going" or "good".
+    text = "I am going to deliver good, reliable software."
+    assert "go" not in find_invented_technologies(profile, text)

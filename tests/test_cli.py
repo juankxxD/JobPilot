@@ -28,9 +28,14 @@ def test_import_cv_without_api_key_fails_cleanly(monkeypatch: pytest.MonkeyPatch
     assert "GROQ_API_KEY" in result.output
 
 
-def test_run_placeholder() -> None:
+def test_run_without_database_url_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    from jobpilot.config import get_settings
+
+    get_settings.cache_clear()
     result = runner.invoke(app, ["run"])
-    assert result.exit_code == 0
+    assert result.exit_code == 1
+    assert "DATABASE_URL" in result.output
 
 
 def test_migrate_without_database_url_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:

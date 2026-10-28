@@ -28,6 +28,15 @@ DEFAULT_MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>\d+)_.*\.sql$")
 
 
+class DuplicateMigrationVersionError(RuntimeError):
+    """Raised when two migration files share the same numeric version.
+
+    The version is the primary key of ``schema_migrations``, so duplicate versions
+    would make one migration silently skip on an upgraded database and fail on a
+    fresh run. Detecting it at discovery turns a latent data bug into a loud error.
+    """
+
+
 class _Cursor(Protocol):
     def execute(self, query: str, params: object = ..., /) -> object: ...
 
@@ -71,12 +80,19 @@ def _applied_versions(conn: _Connection) -> set[str]:
 def discover_migrations(migrations_dir: Path) -> list[tuple[str, Path]]:
     """Return ``(version, path)`` pairs sorted by version for every migration file."""
     found: list[tuple[str, Path]] = []
+    seen: dict[str, Path] = {}
     for path in sorted(migrations_dir.glob("*.sql")):
         match = _MIGRATION_RE.match(path.name)
         if match is None:
             log.warning("migration_file_ignored", file=path.name)
             continue
-        found.append((match.group("version"), path))
+        version = match.group("version")
+        if version in seen:
+            raise DuplicateMigrationVersionError(
+                f"Duplicate migration version {version!r}: {seen[version].name} and {path.name}"
+            )
+        seen[version] = path
+        found.append((version, path))
     found.sort(key=lambda item: item[0])
     return found
 

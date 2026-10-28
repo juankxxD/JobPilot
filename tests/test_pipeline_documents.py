@@ -1,4 +1,4 @@
-"""Pipeline wiring: select -> render -> upload, with the FileStorage faked.
+"""Pipeline wiring: select -> compose cover -> render -> upload, storage faked.
 
 These tests use the HTML render + fake storage path and do not require WeasyPrint;
 the PDF path itself is covered (and skipped locally) in ``test_pdf_ats.py``.
@@ -9,8 +9,9 @@ from __future__ import annotations
 import pytest
 
 from jobpilot.config import Language
-from jobpilot.documents.render import CoverLetterTooLongError
+from jobpilot.documents.cover import CoverLetterError
 from jobpilot.documents.selector import SelectionError
+from jobpilot.llm.schemas import CoverLetterDraft
 from jobpilot.models import ContentSelection, Job, JobAnalysis
 from jobpilot.pipeline.run import generate_documents
 from jobpilot.profile.model import ProfileModel
@@ -41,9 +42,15 @@ def _selection() -> ContentSelection:
     )
 
 
+def _cover(
+    body: str = "I am excited to apply and bring my backend experience to your team.",
+) -> CoverLetterDraft:
+    return CoverLetterDraft(body=body)
+
+
 @skip_without_weasyprint
 def test_generate_documents_uploads_both(example_profile: ProfileModel) -> None:
-    llm = ScriptedFakeLlmClient([_selection()])
+    llm = ScriptedFakeLlmClient([_selection(), _cover()])
     storage = FakeFileStorage()
     result = generate_documents(
         _job(),
@@ -51,7 +58,6 @@ def test_generate_documents_uploads_both(example_profile: ProfileModel) -> None:
         llm,
         storage,
         language=Language.en,
-        cover_letter_body="Dear team,\n\nI am excited to apply.",
     )
     assert len(storage.uploads) == 2
     assert result.cv_file.web_view_link.startswith("https://drive.example.com/file")
@@ -61,23 +67,27 @@ def test_generate_documents_uploads_both(example_profile: ProfileModel) -> None:
 
 
 def test_generate_documents_rejects_long_cover(example_profile: ProfileModel) -> None:
-    """The 200-word guard fires before any upload (no WeasyPrint needed)."""
-    llm = ScriptedFakeLlmClient([_selection()])
+    """A too-long composed cover is rejected before any upload (no WeasyPrint needed).
+
+    The LLM returns an over-length body on both the attempt and its retry, so the
+    composer raises ``CoverLetterError`` and nothing is rendered or uploaded.
+    """
+    long_body = " ".join(["word"] * 300)
+    llm = ScriptedFakeLlmClient([_selection(), _cover(long_body), _cover(long_body)])
     storage = FakeFileStorage()
-    with pytest.raises(CoverLetterTooLongError):
+    with pytest.raises(CoverLetterError):
         generate_documents(
             _job(),
             example_profile,
             llm,
             storage,
             language=Language.en,
-            cover_letter_body=" ".join(["word"] * 201),
         )
     assert storage.uploads == []
 
 
 def test_generate_documents_rejects_invalid_selection(example_profile: ProfileModel) -> None:
-    """An invalid selection fails before rendering/uploading (no WeasyPrint needed)."""
+    """An invalid selection fails before cover/render/upload (no WeasyPrint needed)."""
     bad = _selection().model_copy(update={"ordered_achievement_ids": ["ach_nope"]})
     llm = ScriptedFakeLlmClient([bad.model_copy(), bad.model_copy()])
     storage = FakeFileStorage()
@@ -88,6 +98,5 @@ def test_generate_documents_rejects_invalid_selection(example_profile: ProfileMo
             llm,
             storage,
             language=Language.en,
-            cover_letter_body="Dear team, I am excited to apply.",
         )
     assert storage.uploads == []

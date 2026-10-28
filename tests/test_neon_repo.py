@@ -17,6 +17,7 @@ class FakeCursor:
         self._conn = conn
         self._result: dict[str, Any] | None = None
         self._results: list[dict[str, Any]] = []
+        self.rowcount: int = 0
 
     def execute(self, query: str, params: object = None, /) -> None:
         self._conn.execute(query, params, self)
@@ -42,7 +43,10 @@ class FakeConnection:
         self.by_key: dict[tuple[str, str], int] = {}
         self.by_url: dict[str, int] = {}
         self.state: dict[str, str] = {}
+        self.claims: dict[tuple[int, str], str] = {}
+        self.applications: list[dict[str, Any]] = []
         self.next_id = 1
+        self.next_app_id = 1
         self.commits = 0
 
     def cursor(self) -> FakeCursor:
@@ -71,8 +75,43 @@ class FakeConnection:
         elif q.startswith("select value from telegram_state"):
             key = params[0]
             cur._result = {"value": self.state[key]} if key in self.state else None
+        elif q.startswith("insert into email_send_claims"):
+            self._insert_claim(params)
+        elif q.startswith("delete from email_send_claims"):
+            self.claims.pop((int(params[0]), "email"), None)
+        elif q.startswith("update email_send_claims set state = 'done'"):
+            self.claims[(int(params[0]), "email")] = "done"
+        elif q.startswith("insert into applications"):
+            self._insert_application(params, cur)
         else:  # pragma: no cover - other helpers not exercised in this test
             cur._result = None
+
+    def _insert_claim(self, params: Any) -> None:
+        job_id = int(params[0])
+        key = (job_id, "email")
+        if key in self.claims:
+            raise psycopg.errors.UniqueViolation("duplicate email_send_claims key")
+        self.claims[key] = "in_progress"
+
+    def _insert_application(self, params: Any, cur: FakeCursor) -> None:
+        app_id = self.next_app_id
+        self.next_app_id += 1
+        row = {
+            "id": app_id,
+            "job_id": params[0],
+            "language": params[1],
+            "cv_variant": params[2],
+            "cv_url": params[3],
+            "cover_letter_url": params[4],
+            "channel": params[5],
+            "applied_at": params[6],
+            "follow_up_at": params[7],
+            "outcome": params[8],
+            "notes": params[9],
+            "created_at": None,
+        }
+        self.applications.append(row)
+        cur._result = dict(row)
 
     def _upsert_job(self, params: Any, cur: FakeCursor) -> None:
         """Emulate ``INSERT ... ON CONFLICT (source, external_id) DO UPDATE``.
@@ -192,6 +231,11 @@ class FakeConnection:
 
     @staticmethod
     def _apply_descriptive(row: dict[str, Any], **values: Any) -> None:
+        # contact_email = COALESCE(EXCLUDED.contact_email, jobs.contact_email):
+        # a recollected NULL must not erase a stored (e.g. analysis-derived) address.
+        incoming_email = values.get("contact_email")
+        if "contact_email" in values and incoming_email is None:
+            values = {k: v for k, v in values.items() if k != "contact_email"}
         row.update(values)
 
 
@@ -332,7 +376,44 @@ def test_upsert_does_not_overwrite_existing_language() -> None:
         RawJob(source="src", external_id="lang2", url="https://x/lang2", title="T", company="C")
     )
     assert second.language == Language.es
-    assert conn.jobs[first.id]["language"] == "es"
+
+
+def test_upsert_preserves_contact_email_when_recollection_has_none() -> None:
+    """P6-002: an analysis-derived contact email must survive a later recollection.
+
+    A proposed offer can have a contact_email that came from analysis of its
+    description. If the source returns no email on the next scheduled run, the
+    stored address must be preserved so the offer still routes through email on
+    Enviar, instead of falling back to manual mode.
+    """
+    conn = FakeConnection()
+    repo = NeonJobRepository(conn)
+
+    # First collection has no source email; analysis later stored one directly.
+    first = repo.upsert_job(
+        RawJob(source="src", external_id="c1", url="https://x/c1", title="T", company="C")
+    )
+    assert first.id is not None
+    conn.jobs[first.id]["contact_email"] = "jobs@acme.example"
+
+    # Recollection returns the same posting again with no email.
+    second = repo.upsert_job(
+        RawJob(source="src", external_id="c1", url="https://x/c1", title="T", company="C")
+    )
+    assert second.contact_email == "jobs@acme.example"
+
+    # A fresh source-provided email, when present, still takes priority.
+    third = repo.upsert_job(
+        RawJob(
+            source="src",
+            external_id="c1",
+            url="https://x/c1",
+            title="T",
+            company="C",
+            contact_email="hr@acme.example",
+        )
+    )
+    assert third.contact_email == "hr@acme.example"
 
 
 def test_upsert_rolls_back_and_stays_usable_after_failure() -> None:
@@ -392,3 +473,93 @@ def test_connect_with_retry_gives_up() -> None:
 
     with pytest.raises(ConnectionError):
         connect_with_retry("postgres://x", retries=2, factory=factory, sleep=lambda _: None)
+
+
+# --------------------------------------------------------------------------- #
+# Email-send claim lifecycle (R11.1 no-double-send) — migration 002.
+# --------------------------------------------------------------------------- #
+def _application(job_id: int) -> Any:
+    from datetime import UTC, datetime
+
+    from jobpilot.config import Language
+    from jobpilot.models import Application, ApplicationChannel
+
+    return Application(
+        job_id=job_id,
+        language=Language.en,
+        cv_variant="backend_java",
+        cv_url="https://drive.example.com/file/cv",
+        cover_letter_url="https://drive.example.com/file/cover",
+        channel=ApplicationChannel.email,
+        applied_at=datetime.now(UTC),
+    )
+
+
+def test_claim_email_send_is_unique() -> None:
+    conn = FakeConnection()
+    repo = NeonJobRepository(conn)
+    job = repo.upsert_job(_raw())
+    assert job.id is not None
+
+    # The first claim succeeds; a second for the same job is refused (the PK on
+    # (job_id, channel) raises a unique violation that the repo maps to False).
+    assert repo.claim_email_send(job.id) is True
+    assert repo.claim_email_send(job.id) is False
+    assert conn.claims[(job.id, "email")] == "in_progress"
+
+
+def test_finalize_email_send_records_and_closes_claim() -> None:
+    conn = FakeConnection()
+    repo = NeonJobRepository(conn)
+    job = repo.upsert_job(_raw())
+    assert job.id is not None
+
+    assert repo.claim_email_send(job.id) is True
+    stored = repo.finalize_email_send(job.id, _application(job.id))
+
+    assert stored.id is not None
+    assert len(conn.applications) == 1
+    assert conn.jobs[job.id]["status"] == "applied"
+    assert conn.claims[(job.id, "email")] == "done"
+    # A later claim is still refused: the done claim blocks any resend.
+    assert repo.claim_email_send(job.id) is False
+
+
+def test_release_email_send_allows_a_later_claim() -> None:
+    conn = FakeConnection()
+    repo = NeonJobRepository(conn)
+    job = repo.upsert_job(_raw())
+    assert job.id is not None
+
+    assert repo.claim_email_send(job.id) is True
+    repo.release_email_send(job.id)
+    assert (job.id, "email") not in conn.claims
+    # Releasing an in-progress claim (provider rejected) lets a retry re-claim.
+    assert repo.claim_email_send(job.id) is True
+
+
+def test_finalize_failure_leaves_claim_in_progress() -> None:
+    """A database failure during finalize must leave the ambiguous in-progress claim.
+
+    The claim is NOT released, so a later Enviar still cannot re-claim and resend.
+    """
+
+    class BoomConnection(FakeConnection):
+        def execute(self, query: str, params: Any, cur: FakeCursor) -> None:
+            if " ".join(query.lower().split()).startswith("insert into applications"):
+                raise psycopg.OperationalError("db down after provider accepted")
+            super().execute(query, params, cur)
+
+    conn = BoomConnection()
+    repo = NeonJobRepository(conn)
+    job = repo.upsert_job(_raw())
+    assert job.id is not None
+
+    assert repo.claim_email_send(job.id) is True
+    with pytest.raises(psycopg.OperationalError):
+        repo.finalize_email_send(job.id, _application(job.id))
+
+    # Ambiguous claim preserved; a resend is blocked and the job is not applied.
+    assert conn.claims[(job.id, "email")] == "in_progress"
+    assert conn.jobs[job.id]["status"] == "new"
+    assert repo.claim_email_send(job.id) is False

@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from jobpilot.storage.migrate import discover_migrations, run_migrations
+from jobpilot.storage.migrate import (
+    DuplicateMigrationVersionError,
+    discover_migrations,
+    run_migrations,
+)
 
 
 class FakeCursor:
@@ -83,3 +87,21 @@ def test_run_migrations_project_sql_parses(project_root: Path) -> None:
     assert "001" in applied
     # The real init SQL must have been executed as one statement.
     assert any("create table" in q.lower() for q, _ in conn.executed)
+
+
+def test_duplicate_version_is_rejected(tmp_path: Path) -> None:
+    # Two files sharing version 002 (the P6-005 bug) must be a loud error, not a
+    # silent skip/overwrite, since version is the schema_migrations primary key.
+    (tmp_path / "001_init.sql").write_text("CREATE TABLE a (id int);", encoding="utf-8")
+    (tmp_path / "002_first.sql").write_text("CREATE TABLE b (id int);", encoding="utf-8")
+    (tmp_path / "002_second.sql").write_text("CREATE TABLE c (id int);", encoding="utf-8")
+    with pytest.raises(DuplicateMigrationVersionError):
+        discover_migrations(tmp_path)
+
+
+def test_project_migrations_have_unique_versions(project_root: Path) -> None:
+    # Guards against reintroducing a colliding version in the real migrations dir.
+    found = discover_migrations(project_root / "migrations")
+    versions = [v for v, _ in found]
+    assert versions == ["001", "002", "003", "004"]
+    assert len(versions) == len(set(versions))

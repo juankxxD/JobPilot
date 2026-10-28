@@ -61,6 +61,79 @@ def test_score_new_jobs_es_and_en(example_profile: ProfileModel, load_fixture: F
     assert stored_en.score == 88
 
 
+def test_analysis_contact_email_is_persisted_on_job(
+    example_profile: ProfileModel, load_fixture: Fixture
+) -> None:
+    """A contact email the source omitted but the analysis extracts reaches the job.
+
+    Real collectors leave ``contact_email`` unset; the LLM analysis returns the
+    address found in the description. Scoring must copy it onto the persisted job so
+    the post-approval send flow routes the offer through email (R5.3/R11.1) instead
+    of manual mode.
+    """
+    repo = FakeJobRepository()
+    raw = {
+        "source": "remoteok",
+        "external_id": "rok-no-email-001",
+        "url": "https://remoteok.com/remote-jobs/backend-no-email-001",
+        "title": "Senior Backend Engineer (Java / Spring Boot)",
+        "company": "Globex Remote",
+        "remote": True,
+        "language": "en",
+        # No contact_email: the source never provides one.
+        "description": "We are hiring a senior backend engineer. Email jobs@globexremote.example.",
+    }
+    job = _persist_raw(repo, raw)
+    assert job.contact_email is None  # source left it unset
+
+    # The analysis fixture carries contact_email = jobs@globexremote.example.
+    llm = ScriptedFakeLlmClient(
+        [
+            JobAnalysis.model_validate(load_fixture("llm_analysis_en.json")),
+            JobScore.model_validate(load_fixture("llm_score_en.json")),
+        ]
+    )
+
+    summary = score_new_jobs([job], repo, example_profile, llm, AppConfig(), Settings(min_score=70))
+    assert summary.scored == 1
+    stored = repo.get_job(job.id)  # type: ignore[arg-type]
+    assert stored is not None
+    assert stored.contact_email == "jobs@globexremote.example"
+
+
+def test_source_contact_email_wins_over_analysis(
+    example_profile: ProfileModel, load_fixture: Fixture
+) -> None:
+    """A source-provided contact email is never overwritten by the analysed one."""
+    repo = FakeJobRepository()
+    raw = {
+        "source": "remoteok",
+        "external_id": "rok-source-email-001",
+        "url": "https://remoteok.com/remote-jobs/backend-source-email-001",
+        "title": "Senior Backend Engineer (Java / Spring Boot)",
+        "company": "Globex Remote",
+        "remote": True,
+        "language": "en",
+        "contact_email": "careers@globexremote.example",
+        "description": "Apply via jobs@globexremote.example.",
+    }
+    job = _persist_raw(repo, raw)
+    assert job.contact_email == "careers@globexremote.example"
+
+    llm = ScriptedFakeLlmClient(
+        [
+            JobAnalysis.model_validate(load_fixture("llm_analysis_en.json")),
+            JobScore.model_validate(load_fixture("llm_score_en.json")),
+        ]
+    )
+
+    score_new_jobs([job], repo, example_profile, llm, AppConfig(), Settings(min_score=70))
+    stored = repo.get_job(job.id)  # type: ignore[arg-type]
+    assert stored is not None
+    # Source address kept; the analysed one did not override it.
+    assert stored.contact_email == "careers@globexremote.example"
+
+
 def test_low_confidence_offer_invokes_language_confirmation(
     example_profile: ProfileModel, load_fixture: Fixture
 ) -> None:
@@ -123,10 +196,12 @@ def test_below_threshold_is_flagged(example_profile: ProfileModel, load_fixture:
     )
 
     summary = score_new_jobs([job], repo, example_profile, llm, AppConfig(), Settings(min_score=70))
-    assert summary.scored == 1
+    # A below-threshold job keeps its analysis/score but does not become 'scored':
+    # it is moved to filtered_out so it never continues to a proposal (R8.6/R10.7).
+    assert summary.scored == 0
     assert summary.below_threshold == 1
     stored = repo.get_job(job.id)  # type: ignore[arg-type]
-    assert stored is not None and stored.status is JobStatus.scored
+    assert stored is not None and stored.status is JobStatus.filtered_out
     assert stored.score == 40
 
 

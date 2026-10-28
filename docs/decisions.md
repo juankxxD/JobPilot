@@ -47,3 +47,71 @@ setting only `GROQ_API_KEY`.
 `answers_bank` and `preferences` are owner-approved content, not facts to extract
 from a resume, so the importer scaffolds them empty rather than letting the LLM
 invent them. Incomplete translations are always marked `pending_review`.
+
+## ADR-010: Cover-letter anti-invention is enforced by a technology catalogue
+The first cover-letter validator only extracted technologies already present in
+the profile and then checked that subset against the profile, so the "unknown" set
+was always empty and an invented technology could never be caught (Phase 5 review
+finding P5-012). The validator now scans the generated body against a curated
+catalogue of common technology names (`find_invented_technologies`) and rejects any
+catalogue technology that appears in the letter but is absent from the profile,
+retrying once and marking the job `error` if it persists. The catalogue is
+deliberately broad; a missing entry only means a fabricated name is not caught, never
+that a legitimate profile technology is rejected.
+
+## ADR-011: Telegram processing is idempotent-by-update_id; full transactional outbox is deferred
+The Telegram flow is idempotent in the normal case: each `update_id` is claimed via
+`telegram_state` before its handler runs and processed once; the happy path for
+propose/approve/adjust works end to end and is covered by tests. Three hardening
+items from the Phase 5 review remain as known technical debt, tracked for a
+dedicated "durable Telegram outbox" iteration rather than resolved here, because the
+automated review loop was not converging on them (each pass surfaced another variant
+of the same transactional-durability gap):
+
+- **P5-013** — a retryable language-choice/adjust failure can be checkpointed as
+  processed (offset advanced before the effect completes), so an interrupted owner
+  action may not be resumed.
+- **P5-014** — a partial proposal delivery (one attachment sent, a later call fails)
+  is not resumed per-part, so a retry can resend attachments / re-upload to Drive.
+- **P5-015** — `DAILY_APPLICATION_LIMIT` counts proposals within a single run; it
+  does not persist a durable daily reservation across the 2-hour cron, so the limit
+  can be exceeded across runs.
+
+Resolution plan: persist a per-`update_id` operation lifecycle and a durable
+document/delivery outbox, claim-then-complete effects atomically, and count prior
+same-day proposals from a persisted timestamp. These do not block the happy-path
+flow or the later phases; they harden behaviour under partial crashes and across
+scheduled runs. Noted in the PR for the owner's review.
+
+## ADR-012: Phase 6 send-path durability — one bug fixed, two transport-atomicity items deferred
+The Phase 6 review surfaced four issues. Two are fixed here; two join the durable
+outbox debt of ADR-011 because they are the same transactional-atomicity concern
+and the automated review loop was not converging on them.
+
+Fixed:
+- **P6-005 (critical, migration collision)** — `002_status_changed_at.sql` (Phase 5)
+  and the new email-claims migration both used version `002`; the runner keys
+  `schema_migrations` by the numeric prefix only, so an upgraded DB would skip the
+  claims table and a fresh run would fail on the duplicate. Renamed the email-claims
+  migration to `003_email_send_claims.sql` and added a `DuplicateMigrationVersionError`
+  guard in `discover_migrations` plus tests (duplicate rejected; real migrations are
+  001/002/003 and unique).
+- **P6-002 (contact email lost on recollection)** — `contact_email` is now preserved
+  with `COALESCE(EXCLUDED.contact_email, jobs.contact_email)` in both upsert paths
+  (and mirrored in the fakes), so an analysis-derived address is not erased when a
+  later source fetch returns null; a fresh source email still takes priority. Tests
+  cover preserve-on-null and prefer-fresh.
+
+Deferred to the durable-outbox iteration (ADR-011):
+- **P6-004** — an ambiguous email-provider transport failure (timeout/reset after
+  the provider may have accepted) currently releases the send claim, so a later
+  Enviar could re-send. Correct fix: release only on a typed outcome proving no
+  acceptance; keep an in-progress/ambiguous claim otherwise.
+- **P6-006** — manual-application recording and the job status change are not a
+  single atomic unit and there is no per-job application uniqueness constraint, so a
+  status-write failure after the application insert could let a later "Ya apliqué"
+  create a duplicate. Correct fix: atomic insert-or-recover backed by a uniqueness
+  constraint.
+These harden behaviour only under partial crashes; the happy-path send flow is
+guarded against double-send by the eligible-state check and the email claim, and is
+covered by tests.

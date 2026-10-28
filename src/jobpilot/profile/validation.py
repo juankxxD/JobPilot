@@ -133,3 +133,158 @@ def extract_mentioned_technologies(profile: ProfileModel, text: str) -> list[str
         if re.search(pattern, text.lower()):
             mentioned.append(tech)
     return mentioned
+
+
+# A curated catalogue of common technology names. It lets the cover-letter
+# validator detect a technology *claimed in free text that is NOT in the profile*
+# (an invention), rather than only re-confirming technologies already in the
+# profile. This is deliberately broad; missing entries only mean a fabricated name
+# is not caught here, never that a legitimate profile technology is rejected.
+_TECHNOLOGY_CATALOGUE: frozenset[str] = frozenset(
+    {
+        # languages
+        "java",
+        "python",
+        "javascript",
+        "typescript",
+        "go",
+        "golang",
+        "rust",
+        "c",
+        "c++",
+        "c#",
+        "ruby",
+        "php",
+        "kotlin",
+        "scala",
+        "swift",
+        "elixir",
+        "perl",
+        "r",
+        "dart",
+        "haskell",
+        "clojure",
+        "erlang",
+        "objective-c",
+        "cobol",
+        "fortran",
+        "lua",
+        "julia",
+        "sql",
+        "bash",
+        "powershell",
+        # frameworks / libraries
+        "spring",
+        "spring boot",
+        "django",
+        "flask",
+        "fastapi",
+        "rails",
+        "react",
+        "angular",
+        "vue",
+        "svelte",
+        "next.js",
+        "nuxt",
+        "express",
+        "nestjs",
+        "laravel",
+        "symfony",
+        "dotnet",
+        ".net",
+        "quarkus",
+        "micronaut",
+        "node",
+        "node.js",
+        "deno",
+        "bun",
+        "jquery",
+        "ember",
+        "backbone",
+        "pytorch",
+        "tensorflow",
+        "keras",
+        "scikit-learn",
+        "pandas",
+        "numpy",
+        "spark",
+        "hadoop",
+        "kafka",
+        "rabbitmq",
+        "celery",
+        "graphql",
+        "grpc",
+        # cloud / infra
+        "aws",
+        "azure",
+        "gcp",
+        "google cloud",
+        "docker",
+        "kubernetes",
+        "k8s",
+        "terraform",
+        "ansible",
+        "pulumi",
+        "helm",
+        "jenkins",
+        "gitlab ci",
+        "github actions",
+        "circleci",
+        "nginx",
+        "apache",
+        "cloudflare",
+        "heroku",
+        "lambda",
+        "ec2",
+        "s3",
+        "ecs",
+        "eks",
+        "fargate",
+        "dynamodb",
+        "cloudformation",
+        "serverless",
+        "istio",
+        "prometheus",
+        "grafana",
+        "datadog",
+        # databases
+        "postgresql",
+        "postgres",
+        "mysql",
+        "mariadb",
+        "mongodb",
+        "redis",
+        "cassandra",
+        "elasticsearch",
+        "sqlite",
+        "oracle",
+        "sql server",
+        "cockroachdb",
+        "neo4j",
+        "couchbase",
+        "influxdb",
+        "snowflake",
+    }
+)
+
+
+def find_invented_technologies(profile: ProfileModel, text: str) -> list[str]:
+    """Return catalogue technologies mentioned in ``text`` but absent from the profile.
+
+    Unlike :func:`extract_mentioned_technologies` (which only finds profile
+    technologies and therefore can never surface an invention), this scans the text
+    for *any* known technology name and flags those the profile does not contain.
+    This is what enforces anti-invention on a generated cover letter: a claim of a
+    technology the candidate has never listed is rejected.
+    """
+    known = _profile_technologies(profile)
+    lowered = text.lower()
+    invented: list[str] = []
+    # Check longer names first so "spring boot" is matched before "spring", etc.
+    for tech in sorted(_TECHNOLOGY_CATALOGUE, key=len, reverse=True):
+        if tech in known:
+            continue
+        pattern = r"(?<![\w+#.])" + re.escape(tech) + r"(?![\w+#])"
+        if re.search(pattern, lowered) and tech not in invented:
+            invented.append(tech)
+    return invented
