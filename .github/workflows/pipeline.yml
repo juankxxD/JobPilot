@@ -10,7 +10,8 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  # Never run two pipeline executions at once (idempotency relies on sequential runs).
+  # Never run two pipeline executions at once: the normal-path idempotency keys
+  # (dedupe, Telegram offset, send claims) assume sequential runs.
   group: jobpilot-pipeline
   cancel-in-progress: false
 
@@ -33,18 +34,31 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -e "."
 
+      - name: Materialize profile.yaml
+        # profile.yaml is the owner-approved single source of truth. It is
+        # .gitignored and never committed, so the deployment provides it through
+        # the PROFILE_YAML secret. Written with owner-only permissions and removed
+        # from the log scope; `jobpilot run` loads it from the project root.
+        env:
+          PROFILE_YAML: ${{ secrets.PROFILE_YAML }}
+        run: |
+          if [ -z "$PROFILE_YAML" ]; then
+            echo "PROFILE_YAML secret is not set; the pipeline cannot run without a profile." >&2
+            exit 1
+          fi
+          umask 177
+          printf '%s' "$PROFILE_YAML" > profile.yaml
+
       - name: Run pipeline
         env:
+          # Secrets: sensitive credentials only.
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GROQ_MODEL: ${{ secrets.GROQ_MODEL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_OWNER_CHAT_ID: ${{ secrets.TELEGRAM_OWNER_CHAT_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          MAIL_PROVIDER: ${{ secrets.MAIL_PROVIDER }}
           GRAPH_CLIENT_ID: ${{ secrets.GRAPH_CLIENT_ID }}
-          GRAPH_TENANT_ID: ${{ secrets.GRAPH_TENANT_ID }}
           GRAPH_REFRESH_TOKEN: ${{ secrets.GRAPH_REFRESH_TOKEN }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
@@ -52,10 +66,25 @@ jobs:
           MAIL_FROM_ADDRESS: ${{ secrets.MAIL_FROM_ADDRESS }}
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          # Non-secret tunables: Actions variables with explicit fallbacks so an
+          # unset variable keeps the in-code default instead of exporting an empty
+          # string (an empty value would fail Settings validation). Only export a
+          # value when the variable is actually defined.
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+          GRAPH_TENANT_ID: ${{ vars.GRAPH_TENANT_ID }}
+          MAIL_PROVIDER: ${{ vars.MAIL_PROVIDER }}
           MIN_SCORE: ${{ vars.MIN_SCORE }}
           DAILY_APPLICATION_LIMIT: ${{ vars.DAILY_APPLICATION_LIMIT }}
           DEFAULT_LANGUAGE: ${{ vars.DEFAULT_LANGUAGE }}
         run: |
+          # Drop any non-secret tunable that expands to an empty string so the
+          # application applies its own default (Settings only defaults when the
+          # env key is absent, not when it is present-but-empty).
+          for key in GROQ_MODEL GRAPH_TENANT_ID MAIL_PROVIDER MIN_SCORE DAILY_APPLICATION_LIMIT DEFAULT_LANGUAGE; do
+            if [ -z "${!key}" ]; then
+              unset "$key"
+            fi
+          done
           # Apply any pending DB migrations, then run one full pipeline cycle.
           # Phase 8 (assisted form filling) is LOCAL ONLY: the `forms`/playwright
           # extra is intentionally not installed and `apply-form` is never invoked

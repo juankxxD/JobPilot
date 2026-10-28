@@ -335,7 +335,15 @@ uv run pytest
 
 Los tests usan fakes que implementan los Protocols; no se contacta ningún servicio
 real. Los tests de PDF que requieren las librerías nativas de WeasyPrint se saltan en
-local y corren en CI.
+local y corren en CI. El workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+ejecuta la misma puerta de calidad (ruff + mypy + pytest) con `CI=true`, de modo que
+esos tests de PDF **corren** allí en vez de saltarse; un fallo de librería nativa o de
+renderizado hace fallar la corrida.
+
+> **Idempotencia:** es por la ruta normal (feliz). Existen ventanas aceptadas de fallo
+> en caídas a mitad de acción, documentadas en
+> [docs/deployment.md](docs/deployment.md#known-durability-limitations) y en los
+> ADR-011/012 de [docs/decisions.md](docs/decisions.md).
 
 ---
 
@@ -374,8 +382,12 @@ corre solo por GitHub Actions.
   - [ ] Instala el extra: `uv pip install -e ".[forms]"` y luego `playwright install`.
   - [ ] Nunca corre en CI; se invoca a mano con `jobpilot apply-form <id>`.
 - **Fase 9 — Despliegue**
-  - [ ] Carga cada secreto en GitHub (Settings → Secrets and variables → Actions).
-  - [ ] Variables no secretas (`MIN_SCORE`, `DAILY_APPLICATION_LIMIT`, `DEFAULT_LANGUAGE`) como *variables*.
+  - [ ] Carga el secreto `PROFILE_YAML` con el contenido de tu `profile.yaml` revisado
+        (nunca se commitea; el workflow lo materializa antes de `jobpilot run`).
+  - [ ] Carga cada secreto de servicio en GitHub (Settings → Secrets and variables → Actions).
+  - [ ] Ajustes no secretos (`GROQ_MODEL`, `GRAPH_TENANT_ID`, `MAIL_PROVIDER`, `MIN_SCORE`,
+        `DAILY_APPLICATION_LIMIT`, `DEFAULT_LANGUAGE`) como *variables* (opcionales; si no se
+        definen se usa el valor por defecto del código).
   - [ ] (Opcional) Ajusta la cadencia del cron en `.github/workflows/pipeline.yml`.
   - Detalle completo en [docs/deployment.md](docs/deployment.md).
 

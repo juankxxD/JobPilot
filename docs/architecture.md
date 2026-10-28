@@ -8,7 +8,9 @@ Actions cron tick or a manual invocation) executes the full cycle once, processe
 any pending Telegram responses, records everything, and exits. All durable state
 lives in Postgres (Neon) and in `profile.yaml`; nothing is held in memory between
 runs. This is what makes the free-tier, serverless-cron deployment possible and
-what makes every stage idempotent.
+what makes each stage idempotent **on the normal path** — re-running does not
+duplicate the work that completed. A few crash-mid-action windows are accepted as
+deferred durability debt; see [Normal-path idempotency and its limits](#normal-path-idempotency-and-its-limits).
 
 ## The pipeline, stage by stage
 
@@ -55,9 +57,12 @@ flowchart LR
    layout; the cover letter is validated at ≤ 200 words before rendering.
 8. **upload** — the PDFs go to Google Drive; the web view link is stored.
 9. **propose** — Telegram message with attachments and inline buttons.
-10. **process_telegram_updates** — each `update_id` is processed exactly once
-    (offset stored in `telegram_state`), driving status transitions and, on an
-    explicit Enviar, the send (email or manual) with the application recorded.
+10. **process_telegram_updates** — on the normal path each `update_id` is processed
+    once (offset stored in `telegram_state`), driving status transitions and, on an
+    explicit Enviar, the send (email or manual) with the application recorded. The
+    offset is a checkpoint, not a transactional outbox: a crash between advancing the
+    offset and completing an action is an accepted window (ADR-011/012), not an
+    exactly-once guarantee.
 11. **follow_up** — due reminders, outcome transitions from `/entrevista` and
     `/rechazo`, and the weekly report on the configured weekday.
 
@@ -102,9 +107,34 @@ moves `pending → interview | rejected | offer | no_response` via follow-up.
 
 - **Cost**: the whole thing fits in free tiers (GitHub Actions minutes, Neon,
   Groq, Drive) because there is no always-on process.
-- **Safety**: a crash mid-run is harmless — the next run re-derives state from the
-  database. Dedupe keys, the Telegram offset, and send claims prevent any
-  duplicate work from re-processing.
+- **Safety (normal path)**: on the happy path a crash mid-run is recoverable — the
+  next run re-derives state from the database. Dedupe keys, the Telegram offset, and
+  send claims keep re-processing from duplicating completed work.
 - **Portability**: the same code runs continuously on a VM by wrapping the single
-  `get_updates` call in a poll loop; no business logic changes. See
+  `get_updates` call in a poll loop; no business logic changes. The loop is
+  resume-safe on the normal path but not across every crash-mid-action window. See
   [deployment.md](deployment.md).
+
+## Normal-path idempotency and its limits
+
+Idempotency here means the *completed* work of a run is safe to re-run: dedupe keys
+make collection repeatable, the Telegram offset skips already-processed updates, and
+the email send claim blocks a double-send. It does **not** mean exactly-once
+processing or that any crash is free of visible effects.
+
+The Phase 5/6 reviews accepted a small set of crash/retry windows as deferred debt,
+to be closed by a durable transactional outbox. They are recorded in
+[ADR-011](decisions.md#adr-011-telegram-processing-is-idempotent-by-update_id-full-transactional-outbox-is-deferred)
+and [ADR-012](decisions.md#adr-012-phase-6-send-path-durability--one-bug-fixed-two-transport-atomicity-items-deferred),
+and summarized for operators under
+[Known durability limitations](deployment.md#known-durability-limitations):
+
+- an interrupted language-choice/adjust can be checkpointed before its effect
+  completes and never resume (P5-013);
+- a partial proposal delivery can resend attachments / re-upload on retry (P5-014);
+- `DAILY_APPLICATION_LIMIT` is per-run, so it can be exceeded across the cron (P5-015);
+- an ambiguous mail-transport failure can resend on a later Enviar (P6-004);
+- a partial DB failure can let a later manual "Ya apliqué" duplicate an application
+  (P6-006).
+
+Treat these as the boundary of the idempotency guarantee until the outbox work lands.
