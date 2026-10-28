@@ -350,6 +350,67 @@ def build_cover_letter_prompt(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Phase 8 — assisted-form open-question answers (profile + offer ONLY)
+# --------------------------------------------------------------------------- #
+
+FORM_ANSWER_PROMPT = """\
+You are answering ONE open question on a job-application form, in {language_name}.
+You answer ONLY from the candidate profile and the analysed offer below. You never
+invent a fact, number, date, employer, or technology that is not in them.
+
+{anti_invention}
+
+Instructions:
+- Answer the question concisely and professionally in {language_name}, using ONLY
+  the facts in the candidate profile and the analysed offer.
+- NEVER state a salary figure, a visa/work-authorization status, a relocation
+  commitment, any background/legal/criminal detail, any demographic information, or
+  a specific number of years of experience with a particular technology. If the
+  question asks for any of those, you MUST set "confident" to false and give an
+  empty-intent answer; those are handled elsewhere, never by you.
+- If the profile and offer do not contain enough information to answer truthfully,
+  set "confident" to false so a human reviews it. Never guess to fill the blank.
+- Set "confident" to true ONLY when the answer is fully supported by the facts
+  below and is not one of the forbidden topics above.
+
+Candidate profile:
+---
+{profile}
+---
+Analysed offer:
+---
+{analysis}
+---
+Form question:
+---
+{question}
+---
+
+Return JSON for this schema:
+{schema}
+"""
+
+
+def build_form_answer_prompt(
+    *,
+    question: str,
+    language: str,
+    profile_json: str,
+    analysis_json: str,
+    schema_json: str,
+) -> str:
+    language_name = "Spanish" if language == "es" else "English"
+    return FORM_ANSWER_PROMPT.format(
+        anti_invention=ANTI_INVENTION_RULES,
+        language_name=language_name,
+        profile=profile_json,
+        analysis=analysis_json,
+        question=question,
+        schema=schema_json,
+    )
+
+
 def build_select_content_prompt(
     *,
     profile_json: str,

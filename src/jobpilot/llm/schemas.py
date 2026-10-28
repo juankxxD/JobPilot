@@ -25,9 +25,25 @@ __all__ = [
     "ConfirmedLanguage",
     "CoverLetterDraft",
     "CvImportResult",
+    "FormAnswer",
     "JobAnalysis",
     "JobScore",
 ]
+
+
+class FormAnswer(BaseModel):
+    """An LLM answer to a single open (non-sensitive) application-form question.
+
+    The model answers ONLY from the candidate profile and the analysed offer; it
+    never invents facts. ``confident`` lets it flag an answer it is unsure about so
+    the field is marked uncertain for the owner to review before submit. Sensitive
+    questions (salary, work authorization/visa, relocation, background/legal,
+    demographics, years-of-experience in a specific technology) are never routed to
+    this call; they come only from the approved ``answers_bank``.
+    """
+
+    answer: str = Field(min_length=1)
+    confident: bool = True
 
 
 class CoverLetterDraft(BaseModel):

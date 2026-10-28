@@ -59,3 +59,11 @@ follow_up:
 # --- Pipeline schedule hint (documentation only; actual cron in workflow) ---
 schedule:
   cron_hours: 2
+
+# --- Assisted forms (Phase 8, LOCAL only; never runs in CI) ---
+forms:
+  # Run the browser visibly (false) so you watch the form being filled, or headless
+  # (true) only for local debugging.
+  headless: false
+  # Optional per-action delay (ms) to make a visible run easy to follow.
+  slow_mo_ms: 0

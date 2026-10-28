@@ -152,6 +152,19 @@ class ScheduleConfig(BaseModel):
     cron_hours: int = 2
 
 
+class FormsConfig(BaseModel):
+    """Behaviour of the assisted form filler (Phase 8, LOCAL only).
+
+    These forms are driven by Playwright on the owner's machine and are never run
+    in CI. ``headless`` defaults to ``False`` so the owner watches the browser fill
+    the form; set it ``True`` only for local debugging. ``slow_mo_ms`` adds a small
+    per-action delay so the visible run is easy to follow.
+    """
+
+    headless: bool = False
+    slow_mo_ms: int = 0
+
+
 class AppConfig(BaseModel):
     sources: dict[str, SourceFlag] = Field(default_factory=dict)
     prefilter: PrefilterConfig = Field(default_factory=PrefilterConfig)
@@ -160,6 +173,7 @@ class AppConfig(BaseModel):
     proposals: ProposalsConfig = Field(default_factory=ProposalsConfig)
     follow_up: FollowUpConfig = Field(default_factory=FollowUpConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    forms: FormsConfig = Field(default_factory=FormsConfig)
 
     def source_enabled(self, name: str) -> bool:
         flag = self.sources.get(name)

@@ -10,7 +10,7 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from jobpilot.channels.telegram import TelegramDeliveryError
-from jobpilot.interfaces import Button, Update, UpdateBatch
+from jobpilot.interfaces import Button, FillContext, FillResult, Update, UpdateBatch
 from jobpilot.models import (
     Application,
     ApplicationOutcome,
@@ -422,6 +422,55 @@ class FakeMailer:
         )
 
 
+class FakeFormPage:
+    """A fake Playwright page implementing the ``FormPage`` surface (no browser).
+
+    Tests configure which selectors exist (``present``), which custom questions the
+    DOM exposes (``questions`` -> ``query_question_fields``), and the page ``dom``.
+    Every ``fill``/``set_input_files``/``click``/``screenshot`` is recorded so a test
+    can assert what the filler did without launching a browser. A selector is
+    considered present if it is listed in ``present``; anything else returns ``None``
+    from ``query_selector`` so the filler skips it.
+    """
+
+    def __init__(
+        self,
+        *,
+        present: Iterable[str] = (),
+        questions: Iterable[tuple[str, str]] = (),
+        dom: str = "",
+    ) -> None:
+        self._present = set(present)
+        self._questions = list(questions)
+        self._dom = dom
+        self.filled: dict[str, str] = {}
+        self.uploaded: dict[str, str] = {}
+        self.clicked: list[str] = []
+        self.screenshots: list[str] = []
+
+    def content(self) -> str:
+        return self._dom
+
+    def fill(self, selector: str, value: str) -> None:
+        self.filled[selector] = value
+
+    def set_input_files(self, selector: str, files: str) -> None:
+        self.uploaded[selector] = files
+
+    def query_selector(self, selector: str) -> object | None:
+        return object() if selector in self._present else None
+
+    def query_question_fields(self) -> list[tuple[str, str]]:
+        return list(self._questions)
+
+    def click(self, selector: str) -> None:
+        self.clicked.append(selector)
+
+    def screenshot(self, *, path: str) -> None:
+        self.screenshots.append(path)
+        Path(path).write_bytes(b"fake-png")
+
+
 class SentMessage(BaseModel):
     """A record of one :meth:`FakeNotifier.send_message` call."""
 
@@ -504,3 +553,24 @@ class FakeNotifier:
 
     def last(self) -> SentMessage:
         return self.messages[-1]
+
+
+class FakeFormFiller:
+    """A FormFiller that returns a canned FillResult and records its calls.
+
+    Implements the :class:`~jobpilot.interfaces.FormFiller` Protocol
+    (``matches``/``fill``) without any browser, so the pipeline/apply flow can be
+    exercised with a predictable fill outcome.
+    """
+
+    def __init__(self, result: FillResult, *, handles: str = "") -> None:
+        self._result = result
+        self._handles = handles
+        self.fill_calls: list[tuple[str, FillContext]] = []
+
+    def matches(self, url: str) -> bool:
+        return self._handles in url if self._handles else True
+
+    def fill(self, url: str, ctx: FillContext) -> FillResult:
+        self.fill_calls.append((url, ctx))
+        return self._result
