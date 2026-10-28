@@ -633,6 +633,57 @@ def is_sensitive_question(question: str) -> bool:
     return _asks_years_in_technology(question) or _asks_duration_in_technology(question)
 
 
+# Open-ended, motivation/interest questions that are safe to answer with the LLM
+# from the profile and offer. The LLM is consulted ONLY when a question positively
+# matches one of these shapes; anything else is treated as potentially sensitive and
+# routed to the bank-only-or-blank path. This default-to-blank-on-uncertainty design
+# makes a classifier gap safe: an unrecognized question is never answered by the LLM,
+# it is left blank and surfaced to the owner in the pre-submit Telegram review.
+_NON_SENSITIVE_PATTERNS: tuple[str, ...] = (
+    "why do you want",
+    "why are you interested",
+    "why this role",
+    "why this company",
+    "why would you like",
+    "what interests you",
+    "what excites you",
+    "tell us about yourself",
+    "tell us why",
+    "cover letter",
+    "what makes you a good fit",
+    "what makes you a great fit",
+    "why are you a good fit",
+    "what motivates you",
+    "describe your interest",
+    "additional information",
+    "anything else you",
+    "por qué quieres",
+    "por qué te interesa",
+    "por qué esta",
+    "qué te interesa",
+    "qué te motiva",
+    "cuéntanos sobre ti",
+    "cuéntanos por qué",
+    "carta de presentación",
+    "información adicional",
+    "algo más que",
+    "por qué eres",
+)
+
+
+def is_confidently_non_sensitive(question: str) -> bool:
+    """Return whether a question is confidently an open motivation/interest prompt.
+
+    Only questions matching a known non-sensitive shape may be answered by the LLM.
+    This is the positive gate behind the fail-safe rule: a question that is neither
+    confidently non-sensitive nor served by the answers_bank is left blank and
+    reported, so the LLM never fills an unclassified (possibly sensitive) field.
+    """
+    if is_sensitive_question(question):
+        return False
+    return _matches_any(question, _NON_SENSITIVE_PATTERNS)
+
+
 # --------------------------------------------------------------------------- #
 # Page safety helpers (shared by every platform)
 # --------------------------------------------------------------------------- #
@@ -1713,9 +1764,18 @@ class FormFiller(ABC):
             log.info("form_sensitive_from_bank", question=question, key=entry.key)
             return _AnswerOutcome(value=entry.text(language))
 
+        # An approved bank answer always wins for a non-sensitive question.
         entry = find_answer_bank_entry(self._profile, question)
         if entry is not None:
             return _AnswerOutcome(value=entry.text(language))
+
+        # Fail-safe: the LLM is consulted ONLY for questions positively recognized as
+        # open motivation/interest prompts. Any other unrecognized question (a
+        # classifier gap that might be sensitive) is left blank and reported for the
+        # owner's pre-submit review rather than answered by the LLM.
+        if not is_confidently_non_sensitive(question):
+            log.info("form_question_unclassified_blank", question=question)
+            return _AnswerOutcome(value=None, uncertain=True)
         return self._answer_with_llm(question, language)
 
     def _answer_with_llm(self, question: str, language: Language) -> _AnswerOutcome:

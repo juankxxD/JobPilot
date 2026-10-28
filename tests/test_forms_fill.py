@@ -465,6 +465,46 @@ def test_protected_category_never_reaches_llm_and_is_blank_without_bank(
     assert result.unanswered_sensitive == [question]
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Please disclose any arrests in the last 7 years.",
+        "What is your lawful work authorization status?",
+        "Specify your expected total compensation.",
+        "What is your race/ethnicity for EEO reporting?",
+        "Describe a conflict you had with a manager and how it ended.",
+        "List the names and contact details of three references.",
+    ],
+)
+def test_unclassified_question_is_blank_and_never_reaches_llm(
+    example_profile: ProfileModel, question: str
+) -> None:
+    # Fail-safe design: a question that is NOT positively recognized as an open
+    # motivation/interest prompt and has no approved bank entry is left blank and
+    # reported for the owner's pre-submit review — never answered by the LLM. This
+    # makes a sensitive-classifier gap safe instead of a silent wrong answer.
+    from tests.fakes import FakeFormPage, FakeFormQuestion  # noqa: F401
+
+    stripped = example_profile.model_copy(update={"answers_bank": []})
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(stripped, llm, FormsConfig())
+    gh_question = FakeFormQuestion(
+        label=question,
+        container_selector=".field.custom-question",
+        control_id="q_unknown",
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[gh_question])
+
+    result = filler.fill_page(page, _ctx(stripped))
+
+    # The key guarantee: no unclassified question is ever answered by the LLM or
+    # filled; it is reported to the owner either as sensitive (classifier hit) or
+    # uncertain (fail-safe for the gap). Both outcomes are safe.
+    assert llm.prompts == [], f"unclassified question reached the LLM: {question!r}"
+    assert "#q_unknown" not in page.filled
+    assert question in result.uncertain_fields or question in result.unanswered_sensitive
+
+
 def test_sensitive_question_from_bank_never_reaches_llm(example_profile: ProfileModel) -> None:
     # An approved bank entry answers a sensitive question verbatim; the LLM is still
     # never consulted for it.

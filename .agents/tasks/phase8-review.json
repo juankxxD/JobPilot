@@ -1,0 +1,54 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "P8-006",
+      "title": "Explicit sensitive questions still reach the LLM",
+      "files": [
+        "src/jobpilot/forms/base.py:202-624",
+        "src/jobpilot/forms/base.py:1718-1733",
+        "src/jobpilot/llm/schemas.py:34-47"
+      ],
+      "evidence": "A narrow browser-free check returned false for explicit work-authorization, salary, legal/background, and demographic questions. Classifier misses without a matching bank pattern fall through to the LLM, whose FormAnswer schema requires a non-empty answer.",
+      "consequence": "The LLM can fill protected answers, violating R15.5's never-LLM requirement.",
+      "correction": "Route conservative protected-category variants to the bank-only-or-blank path and add zero-LLM regressions for the demonstrated phrasings."
+    },
+    {
+      "id": "P8-010",
+      "title": "Real radio labels and required-group state are still modeled incorrectly",
+      "files": [
+        "src/jobpilot/forms/base.py:834-852",
+        "src/jobpilot/forms/base.py:955-1000",
+        "tests/fakes.py:703-709",
+        "tests/fakes.py:780-805"
+      ],
+      "evidence": "Production stores each radio submit value as both label and value, so an approved visible answer such as No cannot match true/false values. Required validation checks one real radio at a time, while the fake substitutes a pseudo group control whose checked state becomes true when any sibling is selected.",
+      "consequence": "A usable approved bank answer can remain blank, and a correctly selected required radio group can still abort on a real form.",
+      "correction": "Read associated labels for every radio, retain label/value/selector separately, validate required radios once per name group by checking any real member, and make the fake expose actual sibling semantics."
+    },
+    {
+      "id": "P8-013",
+      "title": "A CAPTCHA detected after the click releases an ambiguous submit claim",
+      "files": [
+        "src/jobpilot/forms/base.py:1383-1410",
+        "src/jobpilot/forms/apply.py:297-306"
+      ],
+      "evidence": "After dispatching the submit click, post-submit CAPTCHA detection raises CaptchaError. The caller releases the durable claim for every CaptchaError, unlike SubmitAmbiguousError.",
+      "consequence": "If the site accepted the form before showing the challenge, a later retry can submit a duplicate application.",
+      "correction": "Stop and notify, but classify a CAPTCHA first observed after click dispatch as ambiguous and retain the claim; release only pre-dispatch CAPTCHA stops or outcomes proving non-acceptance."
+    },
+    {
+      "id": "P8-014",
+      "title": "Browser interaction failures during filling bypass safe-abort notification",
+      "files": [
+        "src/jobpilot/forms/base.py:1270-1300",
+        "src/jobpilot/forms/base.py:1441-1691",
+        "src/jobpilot/forms/apply.py:265-273"
+      ],
+      "evidence": "Profile fill, upload, select, radio, and question interactions can raise Playwright errors after a control detaches or rerenders, but the local caller catches only CaptchaError and FormStructureError around fill_page.",
+      "consequence": "The browser closes and the CLI reports a generic failure without the required abort screenshot or Telegram notification for unexpected DOM changes.",
+      "correction": "Convert pre-submit Playwright interaction and DOM errors into the safe-abort path while the page remains open, preserving no-click behavior and sending the screenshot and notification."
+    }
+  ],
+  "reviewDoc": "/Users/juanhoyos/proyectos/jobpilot/.worktrees/phases-2-9/.agents/tasks/phase8-review.md"
+}
