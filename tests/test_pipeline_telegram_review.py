@@ -16,9 +16,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from jobpilot.channels.telegram import CallbackAction, encode_callback
 from jobpilot.config import AppConfig, Language, ProposalsConfig, Settings
-from jobpilot.documents.cover import generate_cover_letter_body
+from jobpilot.documents.cover import CoverLetterError, generate_cover_letter_body
 from jobpilot.interfaces import Update
 from jobpilot.llm.prompts import build_select_content_prompt
 from jobpilot.llm.schemas import CoverLetterDraft
@@ -142,6 +144,49 @@ def test_cover_letter_rejects_instruction_echo(example_profile: ProfileModel) ->
     )
     assert instruction not in body
     assert clean in body
+
+
+# --------------------------------------------------------------------------- #
+# P5-012 — a cover letter claiming a technology absent from the profile is rejected
+# --------------------------------------------------------------------------- #
+def test_cover_letter_rejects_invented_technology(example_profile: ProfileModel) -> None:
+    # The example profile has Java/Spring/AWS but NOT Rust. A body claiming Rust
+    # must be rejected by code validation; the clean retry is then accepted, so an
+    # invented technology never reaches a document.
+    selection = _valid_selection()
+    invented = "Lideré una migración a Rust para 50 ingenieros y reduje costos."
+    clean = "Aporto experiencia en Java y Spring Boot construyendo servicios backend."
+    llm = ScriptedFakeLlmClient([CoverLetterDraft(body=invented), CoverLetterDraft(body=clean)])
+    body = generate_cover_letter_body(
+        example_profile,
+        _analysis(),
+        selection,
+        llm,
+        language=Language.es,
+        company="ACME Corp",
+    )
+    assert "rust" not in body.lower()
+    assert clean in body
+
+
+def test_cover_letter_errors_when_invention_persists(example_profile: ProfileModel) -> None:
+    # If every attempt invents a technology, no valid letter can be produced and the
+    # caller must mark the job error rather than send an invented letter.
+    selection = _valid_selection()
+    invented_a = "Dominio profundo de Kubernetes y Terraform en producción."
+    invented_b = "Experiencia avanzada con Cassandra y GraphQL a gran escala."
+    llm = ScriptedFakeLlmClient(
+        [CoverLetterDraft(body=invented_a), CoverLetterDraft(body=invented_b)]
+    )
+    with pytest.raises(CoverLetterError):
+        generate_cover_letter_body(
+            example_profile,
+            _analysis(),
+            selection,
+            llm,
+            language=Language.es,
+            company="ACME Corp",
+        )
 
 
 # --------------------------------------------------------------------------- #

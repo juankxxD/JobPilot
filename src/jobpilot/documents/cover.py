@@ -27,7 +27,7 @@ from jobpilot.documents.render import MAX_COVER_WORDS, count_words
 from jobpilot.llm.prompts import build_cover_letter_prompt
 from jobpilot.llm.schemas import CoverLetterDraft
 from jobpilot.logging import get_logger
-from jobpilot.profile.validation import extract_mentioned_technologies, find_unknown_technologies
+from jobpilot.profile.validation import find_invented_technologies
 
 if TYPE_CHECKING:
     from jobpilot.interfaces import LlmClient
@@ -144,10 +144,12 @@ def _reject_reason(
         return "empty body"
     if count_words(message) > max_words:
         return f"body has {count_words(message)} words, the limit is {max_words}"
-    mentioned = extract_mentioned_technologies(profile, message)
-    unknown = find_unknown_technologies(profile, mentioned)
-    if unknown:
-        return f"technologies not in profile: {unknown}"
+    # Reject any known technology claimed in the letter that the profile does not
+    # contain. extract_mentioned_technologies only ever returns profile technologies,
+    # so it cannot detect an invention; find_invented_technologies does.
+    invented = find_invented_technologies(profile, message)
+    if invented:
+        return f"technologies not in profile: {invented}"
     if _instruction_leaked(message, instruction):
         return "instruction text leaked into the body"
     return None
