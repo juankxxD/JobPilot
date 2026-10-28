@@ -185,6 +185,7 @@ class Application(BaseModel):
     outcome: ApplicationOutcome = ApplicationOutcome.pending
     notes: str | None = None
     created_at: datetime | None = None
+    reminder_sent_at: datetime | None = None
 
 
 class StoredFile(BaseModel):

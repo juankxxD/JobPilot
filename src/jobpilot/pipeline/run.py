@@ -45,7 +45,20 @@ from jobpilot.documents.selector import SelectionError, select_content
 from jobpilot.filters.prefilter import prefilter
 from jobpilot.language import detect_language
 from jobpilot.logging import get_logger
-from jobpilot.models import Application, ApplicationChannel, Attachment, Job, JobStatus
+from jobpilot.models import (
+    Application,
+    ApplicationChannel,
+    ApplicationOutcome,
+    Attachment,
+    Job,
+    JobStatus,
+)
+from jobpilot.pipeline.follow_up import (
+    compute_follow_up_at,
+    record_outcome,
+    send_due_reminders,
+    send_weekly_report,
+)
 from jobpilot.scoring.scorer import analyze_and_score, passes_threshold
 
 if TYPE_CHECKING:
@@ -363,6 +376,14 @@ class ProposalRepository(Protocol):
     def release_email_send(self, job_id: int) -> None: ...
 
     def finalize_email_send(self, job_id: int, app: Application) -> Application: ...
+
+    def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int: ...
+
+    def applications_without_outcome(self, before: datetime) -> list[Application]: ...
+
+    def mark_reminder_sent(self, application_id: int, when: datetime) -> None: ...
+
+    def applications_in_period(self, start: datetime, end: datetime) -> list[Application]: ...
 
 
 def tailor_and_send_proposal(
@@ -768,12 +789,12 @@ def _handle_intent(  # noqa: C901, PLR0912 - a flat dispatch over the intent kin
 ) -> None:
     kind = intent.kind
     if kind is IntentKind.send:
-        _handle_send(intent, repo, notifier, profile, llm, storage, summary, mailer)
+        _handle_send(intent, repo, notifier, profile, llm, storage, config, summary, mailer)
     elif kind is IntentKind.discard:
         if _transition(repo, notifier, intent.job_id, JobStatus.discarded, "Oferta descartada."):
             summary.discarded += 1
     elif kind is IntentKind.mark_applied:
-        _handle_mark_applied(intent, repo, notifier, summary)
+        _handle_mark_applied(intent, repo, notifier, config, summary)
     elif kind is IntentKind.choose_language:
         if _handle_language_choice(intent, repo, notifier, profile, llm, storage):
             summary.regenerated += 1
@@ -858,6 +879,7 @@ def _handle_send(
     profile: ProfileModel,
     llm: LlmClient,
     storage: FileStorage,
+    config: AppConfig,
     summary: TelegramRunSummary,
     mailer: Mailer | None,
 ) -> None:
@@ -891,7 +913,7 @@ def _handle_send(
         return
 
     if job.contact_email:
-        if _send_by_email(job, repo, notifier, profile, llm, storage, mailer):
+        if _send_by_email(job, repo, notifier, profile, llm, storage, config, mailer):
             summary.applied += 1
         return
     _send_manual(job, repo, notifier)
@@ -905,6 +927,7 @@ def _send_by_email(  # noqa: PLR0911 - a sequence of guarded early returns
     profile: ProfileModel,
     llm: LlmClient,
     storage: FileStorage,
+    config: AppConfig,
     mailer: Mailer | None,
 ) -> bool:
     """Email the exact approved documents to ``job.contact_email``, recorded atomically.
@@ -974,6 +997,7 @@ def _send_by_email(  # noqa: PLR0911 - a sequence of guarded early returns
         )
         return False
 
+    applied_at = datetime.now(UTC)
     application = Application(
         job_id=job_id,
         language=language,
@@ -981,7 +1005,8 @@ def _send_by_email(  # noqa: PLR0911 - a sequence of guarded early returns
         cv_url=artifacts.cv_url,
         cover_letter_url=artifacts.cover_letter_url,
         channel=ApplicationChannel.email,
-        applied_at=datetime.now(UTC),
+        applied_at=applied_at,
+        follow_up_at=compute_follow_up_at(applied_at, config.follow_up),
     )
     try:
         repo.finalize_email_send(job_id, application)
@@ -1038,6 +1063,7 @@ def _handle_mark_applied(
     intent: TelegramIntent,
     repo: ProposalRepository,
     notifier: Notifier,
+    config: AppConfig,
     summary: TelegramRunSummary,
 ) -> None:
     """Handle "Ya apliqué": record a manual application and mark the job ``applied``.
@@ -1072,6 +1098,7 @@ def _handle_mark_applied(
         repo,
         job,
         ApplicationChannel.manual,
+        config=config,
         language=job.language or artifacts.language,
         cv_variant=artifacts.cv_variant,
         cv_url=artifacts.cv_url,
@@ -1087,14 +1114,20 @@ def _record_application(
     job: Job,
     channel: ApplicationChannel,
     *,
+    config: AppConfig,
     language: Language,
     cv_variant: str,
     cv_url: str | None,
     cover_letter_url: str | None,
 ) -> Application:
-    """Create the :class:`Application` row for a sent/applied job (applied now)."""
+    """Create the :class:`Application` row for a sent/applied job (applied now).
+
+    The follow-up due date is stamped at creation from
+    ``follow_up.reminder_after_days`` so the Phase 7 reminder can fire later.
+    """
     if job.id is None:  # pragma: no cover - callers guarantee an id
         raise ValueError("_record_application requires a persisted job with an id")
+    applied_at = datetime.now(UTC)
     application = Application(
         job_id=job.id,
         language=language,
@@ -1102,7 +1135,8 @@ def _record_application(
         cv_url=cv_url,
         cover_letter_url=cover_letter_url,
         channel=channel,
-        applied_at=datetime.now(UTC),
+        applied_at=applied_at,
+        follow_up_at=compute_follow_up_at(applied_at, config.follow_up),
     )
     stored = repo.create_application(application)
     log.info("application_recorded", job_id=job.id, channel=channel.value)
@@ -1283,9 +1317,9 @@ def _handle_command(
     elif kind is IntentKind.status:
         notifier.send_message(_render_status(repo))
     elif kind is IntentKind.mark_interview:
-        _record_outcome(repo, notifier, intent.job_id, "entrevista")
+        record_outcome(repo, notifier, intent.job_id, ApplicationOutcome.interview)
     elif kind is IntentKind.mark_rejected:
-        _record_outcome(repo, notifier, intent.job_id, "rechazo")
+        record_outcome(repo, notifier, intent.job_id, ApplicationOutcome.rejected)
     elif kind is IntentKind.search:
         query = intent.text or "(sin filtro)"
         notifier.send_message(f"Búsqueda solicitada: {query}. Se ejecutará en la próxima corrida.")
@@ -1315,24 +1349,6 @@ def _render_status(repo: ProposalRepository) -> str:
     return "\n".join(lines)
 
 
-def _record_outcome(
-    repo: ProposalRepository,
-    notifier: Notifier,
-    job_id: int | None,
-    label: str,
-) -> None:
-    # Outcome persistence on the application is completed in Phase 7; here we only
-    # acknowledge the owner's command so the Telegram contract is testable.
-    if job_id is None:
-        notifier.send_message(f"Usa el formato: /{label} <id>.")
-        return
-    job = repo.get_job(job_id)
-    if job is None:
-        notifier.send_message(f"No encontré la oferta {job_id}.")
-        return
-    notifier.send_message(f"Registrado {label} para {job.company} — {job.title}.")
-
-
 def _proposed_jobs(repo: ProposalRepository) -> list[Job]:
     lister = getattr(repo, "list_proposed", None)
     if callable(lister):
@@ -1359,6 +1375,8 @@ class RunSummary:
     score: ScoreSummary
     propose: ProposeSummary
     telegram: TelegramRunSummary
+    reminders_sent: int = 0
+    weekly_report_sent: bool = False
 
 
 class RunRepository(Protocol):
@@ -1395,6 +1413,14 @@ class RunRepository(Protocol):
     def release_email_send(self, job_id: int) -> None: ...
 
     def finalize_email_send(self, job_id: int, app: Application) -> Application: ...
+
+    def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int: ...
+
+    def applications_without_outcome(self, before: datetime) -> list[Application]: ...
+
+    def mark_reminder_sent(self, application_id: int, when: datetime) -> None: ...
+
+    def applications_in_period(self, start: datetime, end: datetime) -> list[Application]: ...
 
 
 def run_once(
@@ -1434,5 +1460,17 @@ def run_once(
         active_settings,
     )
     telegram = process_telegram_updates(repo, notifier, profile, llm, storage, config, mailer)
+    # Follow-up runs at the end of every pipeline run: send any due reminders for
+    # applications still without an outcome, then the weekly report when today is the
+    # configured weekday (both idempotent, so repeated runs do not spam the owner).
+    reminders_sent = send_due_reminders(repo, notifier)
+    weekly_report_sent = send_weekly_report(repo, notifier, config.follow_up)
     log.info("run_once_done")
-    return RunSummary(collect=collect, score=score, propose=propose, telegram=telegram)
+    return RunSummary(
+        collect=collect,
+        score=score,
+        propose=propose,
+        telegram=telegram,
+        reminders_sent=reminders_sent,
+        weekly_report_sent=weekly_report_sent,
+    )

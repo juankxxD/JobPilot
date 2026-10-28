@@ -34,6 +34,8 @@ log = get_logger(__name__)
 
 
 class _Cursor(Protocol):
+    rowcount: int
+
     def execute(self, query: str, params: object = ..., /) -> object: ...
 
     def fetchone(self) -> dict[str, Any] | None: ...
@@ -141,6 +143,7 @@ def _row_to_application(row: dict[str, Any]) -> Application:
         outcome=ApplicationOutcome(row["outcome"]),
         notes=row.get("notes"),
         created_at=row.get("created_at"),
+        reminder_sent_at=row.get("reminder_sent_at"),
     )
 
 
@@ -487,13 +490,56 @@ class NeonJobRepository:
         return int(row["n"]) if row is not None else 0
 
     def applications_without_outcome(self, before: dt.datetime) -> list[Application]:
+        """Pending applications due for a first reminder before ``before``.
+
+        Only applications whose ``follow_up_at`` has passed and that have NOT yet
+        been reminded (``reminder_sent_at IS NULL``) are returned, so the reminder is
+        sent exactly once per application (Phase 7).
+        """
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM applications "
                 "WHERE outcome = 'pending' AND follow_up_at IS NOT NULL "
-                "  AND follow_up_at <= %s "
+                "  AND follow_up_at <= %s AND reminder_sent_at IS NULL "
                 "ORDER BY follow_up_at",
                 (before,),
+            )
+            rows = cur.fetchall()
+        return [_row_to_application(row) for row in rows]
+
+    def mark_reminder_sent(self, application_id: int, when: dt.datetime) -> None:
+        """Record that the follow-up reminder for an application was sent."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE applications SET reminder_sent_at = %s WHERE id = %s",
+                (when, application_id),
+            )
+        self._conn.commit()
+
+    def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int:
+        """Set the outcome of every application for ``job_id``; return rows changed.
+
+        The owner's ``/entrevista id`` and ``/rechazo id`` commands reference the
+        job id shown in proposals; a job has at most one application in normal use,
+        but the update targets all of them to stay correct if more than one exists.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE applications SET outcome = %s WHERE job_id = %s",
+                (outcome.value, job_id),
+            )
+            changed = cur.rowcount
+        self._conn.commit()
+        return int(changed)
+
+    def applications_in_period(self, start: dt.datetime, end: dt.datetime) -> list[Application]:
+        """Applications created within ``[start, end)`` (for the weekly report)."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM applications "
+                "WHERE created_at >= %s AND created_at < %s "
+                "ORDER BY created_at",
+                (start, end),
             )
             rows = cur.fetchall()
         return [_row_to_application(row) for row in rows]

@@ -11,7 +11,15 @@ from pydantic import BaseModel
 
 from jobpilot.channels.telegram import TelegramDeliveryError
 from jobpilot.interfaces import Button, Update, UpdateBatch
-from jobpilot.models import Application, Attachment, Job, JobStatus, RawJob, StoredFile
+from jobpilot.models import (
+    Application,
+    ApplicationOutcome,
+    Attachment,
+    Job,
+    JobStatus,
+    RawJob,
+    StoredFile,
+)
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -169,7 +177,12 @@ class FakeJobRepository:
     def create_application(self, app: Application) -> Application:
         app_id = self._next_app_id
         self._next_app_id += 1
-        stored = app.model_copy(update={"id": app_id})
+        # Mirror the DB default (applications.created_at DEFAULT now()) so the
+        # weekly-report period query has a timestamp to filter on.
+        update: dict[str, object] = {"id": app_id}
+        if app.created_at is None:
+            update["created_at"] = self._now()
+        stored = app.model_copy(update=update)
         self._applications.append(stored)
         return stored
 
@@ -236,6 +249,48 @@ class FakeJobRepository:
             if changed is None or changed >= cutoff:
                 return True
         return False
+
+    # Follow-up helpers (mirror NeonJobRepository, migration 004) --------- #
+    def applications_without_outcome(self, before: datetime) -> list[Application]:
+        """Pending applications due for a first (not-yet-sent) reminder before ``before``."""
+        return sorted(
+            (
+                app
+                for app in self._applications
+                if app.outcome is ApplicationOutcome.pending
+                and app.follow_up_at is not None
+                and app.follow_up_at <= before
+                and app.reminder_sent_at is None
+            ),
+            key=lambda a: a.follow_up_at or self._now(),
+        )
+
+    def mark_reminder_sent(self, application_id: int, when: datetime) -> None:
+        """Record that the follow-up reminder for an application was sent."""
+        for index, app in enumerate(self._applications):
+            if app.id == application_id:
+                self._applications[index] = app.model_copy(update={"reminder_sent_at": when})
+                return
+
+    def set_outcome(self, job_id: int, outcome: ApplicationOutcome) -> int:
+        """Set the outcome of every application for ``job_id``; return rows changed."""
+        changed = 0
+        for index, app in enumerate(self._applications):
+            if app.job_id == job_id:
+                self._applications[index] = app.model_copy(update={"outcome": outcome})
+                changed += 1
+        return changed
+
+    def applications_in_period(self, start: datetime, end: datetime) -> list[Application]:
+        """Applications created within ``[start, end)`` (for the weekly report)."""
+        return sorted(
+            (
+                app
+                for app in self._applications
+                if app.created_at is not None and start <= app.created_at < end
+            ),
+            key=lambda a: a.created_at or self._now(),
+        )
 
     def list_proposed(self) -> list[Job]:
         """Return every job currently in the ``proposed`` status."""

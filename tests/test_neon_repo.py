@@ -17,6 +17,7 @@ class FakeCursor:
         self._conn = conn
         self._result: dict[str, Any] | None = None
         self._results: list[dict[str, Any]] = []
+        self.rowcount: int = 0
 
     def execute(self, query: str, params: object = None, /) -> None:
         self._conn.execute(query, params, self)

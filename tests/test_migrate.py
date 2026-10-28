@@ -103,5 +103,5 @@ def test_project_migrations_have_unique_versions(project_root: Path) -> None:
     # Guards against reintroducing a colliding version in the real migrations dir.
     found = discover_migrations(project_root / "migrations")
     versions = [v for v, _ in found]
-    assert versions == ["001", "002", "003"]
+    assert versions == ["001", "002", "003", "004"]
     assert len(versions) == len(set(versions))
