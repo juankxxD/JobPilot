@@ -80,6 +80,47 @@ def test_send_raises_on_non_2xx_response() -> None:
         mailer.send("x@acme.test", "s", "b", [])
 
 
+def test_token_provider_exchanges_stored_refresh_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The persisted refresh token is exchanged with MSAL-valid send scopes.
+
+    Confirms the credential produced by the device flow (a refresh token stored as
+    ``GRAPH_REFRESH_TOKEN``) is consumed by ``_build_msal_token_provider`` with the
+    same ``Mail.Send`` scope the device flow uses, so no reserved-scope error can
+    appear at refresh time. msal is faked — no network.
+    """
+    import msal
+
+    from jobpilot.config import MailProvider, Settings
+    from jobpilot.mail.graph import GRAPH_SEND_SCOPES, _build_msal_token_provider
+
+    captured: dict[str, Any] = {}
+
+    class _FakeRefreshApp:
+        def acquire_token_by_refresh_token(
+            self, refresh_token: str, *, scopes: list[str]
+        ) -> dict[str, str]:
+            captured["refresh_token"] = refresh_token
+            captured["scopes"] = scopes
+            return {"access_token": "minted-access-token"}
+
+    monkeypatch.setattr(msal, "PublicClientApplication", lambda *a, **k: _FakeRefreshApp())
+
+    settings = Settings(
+        mail_provider=MailProvider.outlook,
+        graph_client_id="client-123",
+        graph_refresh_token="stored-refresh-token",
+    )
+    provider = _build_msal_token_provider(settings)
+    assert provider() == "minted-access-token"
+    assert captured["refresh_token"] == "stored-refresh-token"
+    assert captured["scopes"] == GRAPH_SEND_SCOPES
+    # The exchange scopes must survive MSAL's real reserved-scope validation too.
+    real_app = msal.application.PublicClientApplication(
+        "client-123", authority="https://login.microsoftonline.com/consumers"
+    )
+    assert "Mail.Send" in real_app._decorate_scope(GRAPH_SEND_SCOPES)
+
+
 # --------------------------------------------------------------------------- #
 # Device-code flow (auth-mail)
 # --------------------------------------------------------------------------- #
@@ -114,10 +155,34 @@ def test_obtain_refresh_token_device_code_returns_token() -> None:
     )
 
     assert token == "the-refresh-token"
-    # The verification message is shown; offline_access is requested so a refresh
-    # token comes back.
+    # The verification message is shown; only Mail.Send is requested (msal adds the
+    # reserved offline_access/openid/profile scopes itself, and rejects them if we
+    # pass them explicitly — see test_device_flow_scopes_pass_real_msal_validation).
     assert any("devicelogin" in p for p in prompts)
-    assert "offline_access" in fake._scopes
+    assert fake._scopes == ["Mail.Send"]
+
+
+def test_device_flow_scopes_pass_real_msal_validation() -> None:
+    """The requested scopes must satisfy the installed MSAL's own validation.
+
+    MSAL treats ``offline_access``/``openid``/``profile`` as reserved and raises a
+    ``ValueError`` before any network call if they are passed to the device flow.
+    Exercising the real ``PublicClientApplication._decorate_scope`` (no network)
+    guards against reintroducing a reserved scope that would break ``auth-mail``,
+    and confirms MSAL still adds ``offline_access`` so a refresh token comes back.
+    """
+    import msal
+
+    from jobpilot.mail.graph import _DEVICE_FLOW_SCOPES
+
+    app = msal.PublicClientApplication(
+        "client-123", authority="https://login.microsoftonline.com/consumers"
+    )
+    decorated = app._decorate_scope(_DEVICE_FLOW_SCOPES)
+    # No ValueError was raised, and MSAL injected the reserved offline_access scope
+    # that yields a refresh token.
+    assert "offline_access" in decorated
+    assert "Mail.Send" in decorated
 
 
 def test_obtain_refresh_token_raises_without_user_code() -> None:

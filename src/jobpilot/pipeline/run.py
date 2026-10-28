@@ -13,12 +13,13 @@ Later phases extend this module (analysis, scoring, Telegram, sending, follow-up
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from jobpilot.channels.telegram import (
     IntentKind,
@@ -209,10 +210,16 @@ def score_new_jobs(
         # to filtered_out so they never continue to a proposal (R8.6/R10.7); only
         # jobs at or above MIN_SCORE become 'scored' and proposable.
         status = JobStatus.scored if above else JobStatus.filtered_out
+        # R5.3/R11.1: a contact email the source never populated but the analysis
+        # extracted from the description must reach the job so the post-approval
+        # send flow routes the offer through email instead of manual mode. A
+        # source-provided address always wins; the analysed one only fills a gap.
+        contact_email = job.contact_email or analysis.contact_email
         updated = job.model_copy(
             update={
                 "analysis": analysis,
                 "language": detected,
+                "contact_email": contact_email,
                 "score": score.score,
                 "score_reason": "; ".join(score.reasons) or None,
                 "missing_requirements": score.missing_requirements,
@@ -351,6 +358,12 @@ class ProposalRepository(Protocol):
 
     def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool: ...
 
+    def claim_email_send(self, job_id: int) -> bool: ...
+
+    def release_email_send(self, job_id: int) -> None: ...
+
+    def finalize_email_send(self, job_id: int, app: Application) -> Application: ...
+
 
 def tailor_and_send_proposal(
     job: Job,
@@ -402,17 +415,42 @@ def tailor_and_send_proposal(
 
 @dataclass(slots=True)
 class ProposalArtifacts:
-    """The stored-document metadata needed to record an application later.
+    """The exact documents and metadata the owner reviewed in the proposal.
 
     Captured when a proposal is delivered and persisted in ``telegram_state`` so the
-    post-approval send flow records the exact variant and Drive links the owner
-    reviewed, without re-running selection/rendering.
+    post-approval send flow records the exact variant and Drive links the owner saw
+    AND attaches the exact approved PDF bytes, without re-running selection, cover
+    generation, rendering or upload. Regenerating after approval could email and
+    record a different, unseen document set (R10.9), so the bytes are frozen at
+    proposal time. ``cv`` / ``cover_letter`` are the approved attachments; they are
+    absent only for a legacy/seeded job proposed without stored bytes, in which case
+    the email path refuses to send (it must never invent a document).
     """
 
     language: Language
     cv_variant: str
     cv_url: str | None
     cover_letter_url: str | None
+    cv: Attachment | None = None
+    cover_letter: Attachment | None = None
+
+
+def _attachment_to_json(attachment: Attachment) -> dict[str, str]:
+    """Serialise an attachment (filename + mime + base64 bytes) for state storage."""
+    return {
+        "filename": attachment.filename,
+        "mime_type": attachment.mime_type,
+        "content_b64": base64.b64encode(attachment.content).decode("ascii"),
+    }
+
+
+def _attachment_from_json(data: dict[str, Any]) -> Attachment:
+    """Rebuild an attachment from its stored JSON, decoding the base64 bytes."""
+    return Attachment(
+        filename=data["filename"],
+        content=base64.b64decode(data["content_b64"]),
+        mime_type=data.get("mime_type", "application/pdf"),
+    )
 
 
 def _store_proposal_artifacts(
@@ -421,12 +459,14 @@ def _store_proposal_artifacts(
     language: Language,
     documents: GeneratedDocuments,
 ) -> None:
-    """Persist the document metadata for ``job_id`` so a later send can record it."""
+    """Persist the approved documents (metadata + exact bytes) for a later send."""
     payload = {
         "language": language.value,
         "cv_variant": documents.selection.summary_variant,
         "cv_url": documents.cv_file.web_view_link,
         "cover_letter_url": documents.cover_letter_file.web_view_link,
+        "cv": _attachment_to_json(documents.cv),
+        "cover_letter": _attachment_to_json(documents.cover_letter),
     }
     repo.set_state(PROPOSAL_ARTIFACTS_PREFIX + str(job_id), json.dumps(payload))
 
@@ -437,18 +477,23 @@ def _load_proposal_artifacts(repo: ProposalRepository, job: Job) -> ProposalArti
     A job proposed in a prior version (or seeded without going through the proposal
     flow) may have no stored metadata; in that case the application is still
     recorded with the job's resolved language, an empty variant and no document
-    links, so the owner's action is never lost.
+    links/bytes, so the owner's manual action is never lost (the email path, which
+    needs the approved bytes, refuses such a job rather than inventing a document).
     """
     if job.id is not None:
         raw = repo.get_state(PROPOSAL_ARTIFACTS_PREFIX + str(job.id))
         if raw:
             try:
                 data = json.loads(raw)
+                cv_data = data.get("cv")
+                cover_data = data.get("cover_letter")
                 return ProposalArtifacts(
                     language=Language(data["language"]),
                     cv_variant=str(data.get("cv_variant", "")),
                     cv_url=data.get("cv_url"),
                     cover_letter_url=data.get("cover_letter_url"),
+                    cv=_attachment_from_json(cv_data) if cv_data else None,
+                    cover_letter=_attachment_from_json(cover_data) if cover_data else None,
                 )
             except (ValueError, KeyError):  # pragma: no cover - defensive
                 log.warning("telegram_invalid_proposal_artifacts", job_id=job.id)
@@ -853,7 +898,7 @@ def _handle_send(
     summary.approved += 1
 
 
-def _send_by_email(
+def _send_by_email(  # noqa: PLR0911 - a sequence of guarded early returns
     job: Job,
     repo: ProposalRepository,
     notifier: Notifier,
@@ -862,12 +907,20 @@ def _send_by_email(
     storage: FileStorage,
     mailer: Mailer | None,
 ) -> bool:
-    """Email the application to ``job.contact_email`` and record it as ``applied``.
+    """Email the exact approved documents to ``job.contact_email``, recorded atomically.
+
+    The attachments are the exact PDF bytes the owner reviewed in the proposal
+    (loaded from the stored artifacts, never regenerated), so approval under R10.9
+    applies to the documents actually sent. A durable, unique email-send claim is
+    taken BEFORE the provider call and only finalized (application row + ``applied``
+    status + claim closed) in one atomic transaction afterwards, so a successful send
+    followed by a database failure can never be resent by a later Enviar.
 
     Returns ``True`` once the email was sent and the application recorded. When no
-    mailer is configured, or document regeneration/sending fails, the job keeps its
-    ``proposed`` state so a later run can retry, and nothing is recorded — so a
-    failed send never looks like a successful application.
+    mailer is configured, the approved bytes are missing, or the provider rejects the
+    message, the job keeps its ``proposed`` state, the claim is released, and nothing
+    is recorded — a failed send never looks like a successful application. A failure
+    AFTER the provider accepted leaves the claim ``in_progress`` so it is not resent.
     """
     job_id = job.id
     if job_id is None:  # pragma: no cover - callers guarantee an id
@@ -881,13 +934,27 @@ def _send_by_email(
         return False
     artifacts = _load_proposal_artifacts(repo, job)
     language = job.language or artifacts.language
-    try:
-        documents = generate_documents(job, profile, llm, storage, language=language)
-    except _UNRECOVERABLE_DOCUMENT_ERRORS as exc:
-        log.error("send_email_generation_failed", job_id=job_id, error=str(exc))
-        repo.set_status(job_id, JobStatus.error)
-        notifier.send_message(f"No pude preparar los documentos para la oferta {job_id}.")
+    if artifacts.cv is None or artifacts.cover_letter is None:
+        # The approved PDF bytes are unavailable (legacy/seeded proposal). Never
+        # regenerate — approval was given for documents we no longer have, so sending
+        # a freshly generated set would email something the owner never saw.
+        log.warning("send_email_missing_approved_documents", job_id=job_id)
+        notifier.send_message(
+            f"No tengo los documentos aprobados de la oferta {job_id}; vuelve a proponerla "
+            "antes de enviarla por correo."
+        )
         return False
+
+    # Claim the send durably and uniquely BEFORE calling the provider. A second
+    # Enviar (or a crash replay) cannot re-claim, so the provider is reached at most
+    # once per job.
+    if not repo.claim_email_send(job_id):
+        log.info("send_email_already_claimed", job_id=job_id)
+        notifier.send_message(
+            f"La oferta {job_id} ya tiene un envío por correo en curso o completado."
+        )
+        return False
+
     subject, body = _email_subject_and_body(job, profile, language)
     try:
         assert job.contact_email is not None
@@ -895,24 +962,41 @@ def _send_by_email(
             job.contact_email,
             subject,
             body,
-            [documents.cv, documents.cover_letter],
+            [artifacts.cv, artifacts.cover_letter],
         )
-    except Exception as exc:  # noqa: BLE001 - keep proposed so a later run retries
+    except Exception as exc:  # noqa: BLE001 - provider rejected: nothing was sent
+        # The provider rejected the message, so nothing left the mailbox: release the
+        # claim and keep the job proposed so a later run can retry cleanly.
+        repo.release_email_send(job_id)
         log.warning("send_email_failed", job_id=job_id, error=str(exc))
         notifier.send_message(
             f"No pude enviar el correo de la oferta {job_id}. Lo reintentaré más tarde."
         )
         return False
-    _record_application(
-        repo,
-        job,
-        ApplicationChannel.email,
+
+    application = Application(
+        job_id=job_id,
         language=language,
-        cv_variant=documents.selection.summary_variant,
-        cv_url=documents.cv_file.web_view_link,
-        cover_letter_url=documents.cover_letter_file.web_view_link,
+        cv_variant=artifacts.cv_variant,
+        cv_url=artifacts.cv_url,
+        cover_letter_url=artifacts.cover_letter_url,
+        channel=ApplicationChannel.email,
+        applied_at=datetime.now(UTC),
     )
-    repo.set_status(job_id, JobStatus.applied)
+    try:
+        repo.finalize_email_send(job_id, application)
+    except Exception as exc:  # noqa: BLE001 - provider accepted but DB write failed
+        # Ambiguous: the message was sent but the database write failed. Do NOT
+        # release the claim (that would allow an automatic resend); the claim stays
+        # in_progress and blocks a second Enviar. The owner is told so they can
+        # resolve it manually.
+        log.error("send_email_finalize_failed", job_id=job_id, error=str(exc))
+        notifier.send_message(
+            f"Envié el correo de la oferta {job_id} pero no pude registrar la postulación. "
+            "No la reenviaré automáticamente; revísala manualmente."
+        )
+        return False
+
     notifier.send_message(
         f"Postulación enviada por correo a {job.contact_email} ({job.company} — {job.title})."
     )
@@ -1305,6 +1389,12 @@ class RunRepository(Protocol):
     def recent_company_role(self, company: str, role: str, *, within_days: int) -> bool: ...
 
     def list_by_status(self, status: JobStatus) -> list[Job]: ...
+
+    def claim_email_send(self, job_id: int) -> bool: ...
+
+    def release_email_send(self, job_id: int) -> None: ...
+
+    def finalize_email_send(self, job_id: int, app: Application) -> Application: ...
 
 
 def run_once(

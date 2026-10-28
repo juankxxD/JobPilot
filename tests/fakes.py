@@ -77,9 +77,11 @@ class FakeJobRepository:
         self._by_url: dict[str, int] = {}
         self._applications: list[Application] = []
         self._state: dict[str, str] = {}
+        self._email_send_claims: dict[int, str] = {}
         self._next_job_id = 1
         self._next_app_id = 1
         self.upsert_calls = 0
+        self.fail_finalize = False
         self.status_changes: list[tuple[int, JobStatus]] = []
 
     def upsert_job(self, job: RawJob) -> Job:
@@ -165,6 +167,37 @@ class FakeJobRepository:
         stored = app.model_copy(update={"id": app_id})
         self._applications.append(stored)
         return stored
+
+    # Email-send idempotency (mirrors NeonJobRepository, migration 002) --- #
+    def claim_email_send(self, job_id: int) -> bool:
+        """Create a unique in-progress email-send claim; False if one exists."""
+        if job_id in self._email_send_claims:
+            return False
+        self._email_send_claims[job_id] = "in_progress"
+        return True
+
+    def release_email_send(self, job_id: int) -> None:
+        """Drop an in-progress claim (provider rejected; safe to retry)."""
+        if self._email_send_claims.get(job_id) == "in_progress":
+            del self._email_send_claims[job_id]
+
+    def finalize_email_send(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark applied and close the claim.
+
+        ``fail_finalize`` lets a test simulate a database failure AFTER the provider
+        accepted the message: nothing is recorded, the job stays proposed, and the
+        claim is left ``in_progress`` so a later Enviar cannot resend.
+        """
+        if self.fail_finalize:
+            raise RuntimeError("simulated database failure after provider acceptance")
+        stored = self.create_application(app)
+        self.set_status(job_id, JobStatus.applied)
+        self._email_send_claims[job_id] = "done"
+        return stored
+
+    def email_claim_state(self, job_id: int) -> str | None:
+        """Return the stored email-send claim state for ``job_id`` (test helper)."""
+        return self._email_send_claims.get(job_id)
 
     def get_state(self, key: str) -> str | None:
         return self._state.get(key)
@@ -290,6 +323,7 @@ class SentEmail(BaseModel):
     subject: str
     body: str
     attachments: list[str] = []
+    attachment_bytes: list[bytes] = []
 
 
 class FakeMailer:
@@ -298,12 +332,15 @@ class FakeMailer:
     Records each ``send`` (recipient, subject, body and attachment filenames) so
     tests can assert the email path was taken with the right documents. Set
     ``fail`` to have the next ``send`` raise, exercising the retry-safe path where a
-    failed send must not record an application.
+    failed send must not record an application. Set ``record_bytes`` to also capture
+    the raw attachment bytes, so a test can assert byte identity with the approved
+    proposal documents.
     """
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, record_bytes: bool = False) -> None:
         self.sent: list[SentEmail] = []
         self._fail = fail
+        self._record_bytes = record_bytes
 
     def send(
         self,
@@ -320,6 +357,7 @@ class FakeMailer:
                 subject=subject,
                 body=body,
                 attachments=[a.filename for a in attachments],
+                attachment_bytes=[a.content for a in attachments] if self._record_bytes else [],
             )
         )
 

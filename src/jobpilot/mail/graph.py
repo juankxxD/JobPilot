@@ -28,10 +28,11 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# Delegated scope required to send mail as the signed-in user. ``offline_access`` is
-# requested during the device-code flow so msal returns a refresh token to store.
+# Delegated scope required to send mail as the signed-in user. msal adds the reserved
+# OIDC/``offline_access`` scopes itself (and rejects them if we pass them explicitly),
+# so a refresh token is still returned by the device-code flow without listing them.
 GRAPH_SEND_SCOPES = ["Mail.Send"]
-_DEVICE_FLOW_SCOPES = ["Mail.Send", "offline_access"]
+_DEVICE_FLOW_SCOPES = ["Mail.Send"]
 _GRAPH_SENDMAIL_URL = "https://graph.microsoft.com/v1.0/me/sendMail"
 
 
@@ -165,9 +166,12 @@ def obtain_refresh_token_device_code(
     Prints the verification URL and user code (via ``prompt``), blocks on
     :meth:`PublicClientApplication.acquire_token_by_device_flow` until the owner
     completes consent in a browser, and returns the ``refresh_token`` to store as a
-    secret. ``app_factory`` and ``prompt`` are injected so the CLI test drives the
-    flow without msal or any network. Never prints or returns an access token — only
-    the long-lived refresh token the mailer later exchanges.
+    secret. Only the ``Mail.Send`` scope is requested: msal silently adds the
+    reserved ``openid``/``profile``/``offline_access`` scopes (and raises if they are
+    passed explicitly), so a refresh token still comes back. ``app_factory`` and
+    ``prompt`` are injected so the CLI test drives the flow without msal or any
+    network. Never prints or returns an access token — only the long-lived refresh
+    token the mailer later exchanges.
     """
     emit = prompt or (lambda message: None)
     if app_factory is None:

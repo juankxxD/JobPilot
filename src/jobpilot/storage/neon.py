@@ -297,13 +297,14 @@ class NeonJobRepository:
         with self._conn.cursor() as cur:
             cur.execute(
                 "UPDATE jobs SET "
-                " language = %s, modality = %s, analysis = %s, score = %s, "
-                " score_reason = %s, missing_requirements = %s, status = %s, "
-                " status_changed_at = now() "
+                " language = %s, modality = %s, contact_email = %s, analysis = %s, "
+                " score = %s, score_reason = %s, missing_requirements = %s, "
+                " status = %s, status_changed_at = now() "
                 "WHERE id = %s RETURNING *",
                 (
                     job.language.value if job.language else None,
                     job.modality.value if job.modality else None,
+                    job.contact_email,
                     analysis_json,
                     job.score,
                     job.score_reason,
@@ -320,28 +321,109 @@ class NeonJobRepository:
 
     def create_application(self, app: Application) -> Application:
         with self._conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO applications "
-                "(job_id, language, cv_variant, cv_url, cover_letter_url, channel, "
-                " applied_at, follow_up_at, outcome, notes) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
-                (
-                    app.job_id,
-                    app.language.value,
-                    app.cv_variant,
-                    str(app.cv_url) if app.cv_url is not None else None,
-                    str(app.cover_letter_url) if app.cover_letter_url is not None else None,
-                    app.channel.value,
-                    app.applied_at,
-                    app.follow_up_at,
-                    app.outcome.value,
-                    app.notes,
-                ),
-            )
+            self._insert_application(cur, app)
             row = cur.fetchone()
         self._conn.commit()
         if row is None:  # pragma: no cover - RETURNING always yields a row
             raise RuntimeError("create_application did not return a row")
+        return _row_to_application(row)
+
+    @staticmethod
+    def _insert_application(cur: _Cursor, app: Application) -> None:
+        cur.execute(
+            "INSERT INTO applications "
+            "(job_id, language, cv_variant, cv_url, cover_letter_url, channel, "
+            " applied_at, follow_up_at, outcome, notes) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+            (
+                app.job_id,
+                app.language.value,
+                app.cv_variant,
+                str(app.cv_url) if app.cv_url is not None else None,
+                str(app.cover_letter_url) if app.cover_letter_url is not None else None,
+                app.channel.value,
+                app.applied_at,
+                app.follow_up_at,
+                app.outcome.value,
+                app.notes,
+            ),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Email-send idempotency (R11.1 no-double-send) — see migration 002.
+    # ------------------------------------------------------------------ #
+    def claim_email_send(self, job_id: int) -> bool:
+        """Durably and uniquely claim the email send for ``job_id`` before sending.
+
+        Atomically inserts an ``in_progress`` row into ``email_send_claims`` whose
+        primary key ``(job_id, channel='email')`` enforces one email operation per
+        job. Returns ``True`` when this call created the claim (the caller may now
+        call the provider), ``False`` when a claim already exists — either a send is
+        in progress / ambiguous or already done — so a second Enviar can never reach
+        the provider again.
+        """
+        import psycopg
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO email_send_claims (job_id, channel, state) "
+                    "VALUES (%s, 'email', 'in_progress')",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except psycopg.errors.UniqueViolation:
+            self._conn.rollback()
+            log.info("email_send_claim_exists", job_id=job_id)
+            return False
+        except Exception:
+            self._conn.rollback()
+            raise
+        return True
+
+    def release_email_send(self, job_id: int) -> None:
+        """Drop an ``in_progress`` claim so a provider-rejected send can be retried.
+
+        Only called when the provider itself rejected the message (nothing was
+        sent), so re-claiming on a later run is safe. An ambiguous outcome (provider
+        accepted, then a database failure) must NOT be released: the claim stays and
+        blocks any automatic resend.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM email_send_claims "
+                "WHERE job_id = %s AND channel = 'email' AND state = 'in_progress'",
+                (job_id,),
+            )
+        self._conn.commit()
+
+    def finalize_email_send(self, job_id: int, app: Application) -> Application:
+        """Atomically record the application, mark the job applied, close the claim.
+
+        All three writes happen in one transaction so the application row, the job's
+        ``applied`` status, and the claim's ``done`` state commit together or not at
+        all. A failure here leaves the claim ``in_progress`` (the ambiguous state),
+        which keeps a later Enviar from re-sending.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                self._insert_application(cur, app)
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE jobs SET status = %s, status_changed_at = now() WHERE id = %s",
+                    (JobStatus.applied.value, job_id),
+                )
+                cur.execute(
+                    "UPDATE email_send_claims SET state = 'done', updated_at = now() "
+                    "WHERE job_id = %s AND channel = 'email'",
+                    (job_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if row is None:  # pragma: no cover - RETURNING always yields a row
+            raise RuntimeError("finalize_email_send did not return a row")
         return _row_to_application(row)
 
     def get_state(self, key: str) -> str | None:
