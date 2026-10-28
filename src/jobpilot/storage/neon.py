@@ -202,7 +202,7 @@ class NeonJobRepository:
                     " title = EXCLUDED.title, company = EXCLUDED.company, "
                     " location = EXCLUDED.location, remote = EXCLUDED.remote, "
                     " modality = EXCLUDED.modality, salary_text = EXCLUDED.salary_text, "
-                    " contact_email = EXCLUDED.contact_email, "
+                    " contact_email = COALESCE(EXCLUDED.contact_email, jobs.contact_email), "
                     " language = COALESCE(jobs.language, EXCLUDED.language), "
                     " description = EXCLUDED.description "
                     "RETURNING *",
@@ -255,7 +255,8 @@ class NeonJobRepository:
             cur.execute(
                 "UPDATE jobs SET "
                 " apply_url = %s, title = %s, company = %s, location = %s, "
-                " remote = %s, modality = %s, salary_text = %s, contact_email = %s, "
+                " remote = %s, modality = %s, salary_text = %s, "
+                " contact_email = COALESCE(%s, contact_email), "
                 " language = COALESCE(language, %s), description = %s "
                 "WHERE url = %s RETURNING *",
                 (

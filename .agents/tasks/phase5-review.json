@@ -1,0 +1,38 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "P5-012",
+      "title": "Cover-letter code validation accepts invented technologies and facts",
+      "location": "src/jobpilot/documents/cover.py:147-151; src/jobpilot/profile/validation.py:124-135",
+      "evidence": "The cover path extracts only technologies already present in the profile and then checks that extracted subset against the same profile, so the unknown set is always empty. No code validates other free-form factual claims. A narrow spot-check confirmed that a body claiming an absent Rust migration for 50 engineers returns no rejection reason.",
+      "consequence": "A hallucinated cover letter can pass validation and be sent to the owner, violating the approved profile-as-source-of-truth and anti-invention requirements.",
+      "correction": "Use an enforceable constrained output based on approved profile fragments or cited IDs and validate every emitted claim and technology in code. Retry once and mark the job error if validation still fails; add unknown-technology and invented-number regressions."
+    },
+    {
+      "id": "P5-013",
+      "title": "Pre-effect update checkpointing permanently loses failed owner actions",
+      "location": "src/jobpilot/pipeline/run.py:607-614, 732-772, 544-547, 854-869",
+      "evidence": "The pipeline stores telegram_last_update_id before dispatch. Retryable language-choice and adjustment failures do not complete the requested operation, but the stored offset suppresses that update on every later run. A narrow spot-check left a language-unresolved proposed job unchanged after a delivery failure and processed zero updates on replay.",
+      "consequence": "An explicit Español/Inglés or Ajustar action can disappear permanently without producing documents or notifying the owner, so interrupted processing is not resumable.",
+      "correction": "Persist a per-update operation lifecycle, retry incomplete operations, and mark/checkpoint completion only after required effects finish. Preserve document and delivery progress so retries do not repeat completed effects."
+    },
+    {
+      "id": "P5-014",
+      "title": "Partial proposal delivery duplicates attachments on retry",
+      "location": "src/jobpilot/channels/telegram.py:361-367; src/jobpilot/pipeline/run.py:376-381, 544-547",
+      "evidence": "Telegram sends the CV, cover, and button message as separate calls, while the job is saved as proposed only after all calls return. If a later call fails after an earlier attachment succeeded, the job remains scored and the next run sends every attachment again. Generated Drive upload progress is likewise not persisted.",
+      "consequence": "A normal retry can create duplicate Drive files and send duplicate proposal attachments, violating pipeline idempotency.",
+      "correction": "Persist generated files and per-part proposal delivery progress in a durable outbox or equivalent state, resume only incomplete parts, and add a regression covering first-attachment success followed by second-send failure and rerun."
+    },
+    {
+      "id": "P5-015",
+      "title": "The daily proposal limit resets on each scheduled run",
+      "location": "src/jobpilot/pipeline/run.py:424-431; src/jobpilot/storage/neon.py:397-405",
+      "evidence": "The guard counts applications recorded today and proposals only in the current function call; it does not count proposals from earlier runs that day. A narrow two-run spot-check with a limit of five produced five proposals in each run and ten same-day proposed jobs.",
+      "consequence": "The normal two-hour schedule can exceed DAILY_APPLICATION_LIMIT repeatedly, so the required durable daily guard does not hold across pipeline runs.",
+      "correction": "Persist an immutable proposal timestamp or daily reservation and include prior same-day proposals when calculating remaining capacity without double-counting related applications. Add a same-day two-run regression test."
+    }
+  ],
+  "reviewDoc": "/Users/juanhoyos/proyectos/jobpilot/.worktrees/phases-2-9/.agents/tasks/phase5-review.md"
+}

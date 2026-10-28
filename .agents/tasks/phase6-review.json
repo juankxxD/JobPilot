@@ -1,0 +1,34 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "P6-002",
+      "title": "Recollection erases an analysis-derived contact email before approval is processed",
+      "evidence": "score_new_jobs persists analysis.contact_email at src/jobpilot/pipeline/run.py:217, but NeonJobRepository overwrites contact_email with the recollected source value at src/jobpilot/storage/neon.py:205 and :258. run_once collects before processing Telegram at pipeline/run.py:1422 and :1436, proposed jobs are not rescored because scoring is restricted to new jobs at :192, and routing checks only job.contact_email at :893.",
+      "consequence": "A proposed offer whose source returns no email can lose the address extracted from its description on the next scheduled run and enter manual mode after Enviar instead of using Graph or Gmail.",
+      "correction": "Preserve the stored contact email whenever recollection supplies null in both upsert paths and the fake, and add a score-to-recollect-to-Enviar regression test proving the email route remains selected."
+    },
+    {
+      "id": "P6-004",
+      "title": "An ambiguous provider transport failure releases the send claim and permits a duplicate",
+      "evidence": "Graph and Gmail dispatch at src/jobpilot/mail/graph.py:148 and src/jobpilot/mail/gmail.py:135. _send_by_email catches every exception from mailer.send at src/jobpilot/pipeline/run.py:967 and unconditionally deletes the claim at :970, although a timeout or connection reset can occur after provider acceptance.",
+      "consequence": "A later Enviar can re-claim and send the same application again after an accepted email produced an ambiguous transport exception, violating no-double-send.",
+      "correction": "Release only on a typed outcome that proves no provider acceptance; retain an in-progress/ambiguous claim for transport or unclassified failures, and test an exception after simulated provider acceptance followed by a second Enviar."
+    },
+    {
+      "id": "P6-005",
+      "title": "The Phase 6 migration reuses version 002",
+      "evidence": "migrations/002_email_send_claims.sql:19 and migrations/002_status_changed_at.sql:10 share numeric version 002. src/jobpilot/storage/migrate.py:98-113 uses only that prefix as the schema_migrations primary-key identity and does not distinguish the files.",
+      "consequence": "An upgraded Phase 5 database skips creation of email_send_claims, while a fresh migration run fails on the duplicate version and rolls back status_changed_at; Phase 6 sending or the existing proposal guards then fail against a missing table or column.",
+      "correction": "Rename the email-claim migration to 003_email_send_claims.sql and add migration discovery/application coverage that rejects duplicate versions and verifies both schema changes are applied."
+    },
+    {
+      "id": "P6-006",
+      "title": "Manual application recording and status change are not atomic or uniquely idempotent",
+      "evidence": "src/jobpilot/pipeline/run.py:1071-1080 creates the application before setting the job applied. NeonJobRepository.create_application commits independently at src/jobpilot/storage/neon.py:322-326, migrations/001_init.sql:47-64 has no per-job application uniqueness constraint, and proposed or approved jobs remain eligible for Ya aplique at pipeline/run.py:812.",
+      "consequence": "If the status write fails after the application insert commits, another Ya aplique callback creates a duplicate application, corrupting history and daily-limit/follow-up counts.",
+      "correction": "Atomically insert or idempotently recover the manual application and set the job applied, backed by an appropriate uniqueness constraint; add failure injection proving a later callback leaves one application."
+    }
+  ],
+  "reviewDoc": "/Users/juanhoyos/proyectos/jobpilot/.worktrees/phases-2-9/.agents/tasks/phase6-review.md"
+}

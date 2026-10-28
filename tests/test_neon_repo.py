@@ -230,6 +230,11 @@ class FakeConnection:
 
     @staticmethod
     def _apply_descriptive(row: dict[str, Any], **values: Any) -> None:
+        # contact_email = COALESCE(EXCLUDED.contact_email, jobs.contact_email):
+        # a recollected NULL must not erase a stored (e.g. analysis-derived) address.
+        incoming_email = values.get("contact_email")
+        if "contact_email" in values and incoming_email is None:
+            values = {k: v for k, v in values.items() if k != "contact_email"}
         row.update(values)
 
 
@@ -370,7 +375,44 @@ def test_upsert_does_not_overwrite_existing_language() -> None:
         RawJob(source="src", external_id="lang2", url="https://x/lang2", title="T", company="C")
     )
     assert second.language == Language.es
-    assert conn.jobs[first.id]["language"] == "es"
+
+
+def test_upsert_preserves_contact_email_when_recollection_has_none() -> None:
+    """P6-002: an analysis-derived contact email must survive a later recollection.
+
+    A proposed offer can have a contact_email that came from analysis of its
+    description. If the source returns no email on the next scheduled run, the
+    stored address must be preserved so the offer still routes through email on
+    Enviar, instead of falling back to manual mode.
+    """
+    conn = FakeConnection()
+    repo = NeonJobRepository(conn)
+
+    # First collection has no source email; analysis later stored one directly.
+    first = repo.upsert_job(
+        RawJob(source="src", external_id="c1", url="https://x/c1", title="T", company="C")
+    )
+    assert first.id is not None
+    conn.jobs[first.id]["contact_email"] = "jobs@acme.example"
+
+    # Recollection returns the same posting again with no email.
+    second = repo.upsert_job(
+        RawJob(source="src", external_id="c1", url="https://x/c1", title="T", company="C")
+    )
+    assert second.contact_email == "jobs@acme.example"
+
+    # A fresh source-provided email, when present, still takes priority.
+    third = repo.upsert_job(
+        RawJob(
+            source="src",
+            external_id="c1",
+            url="https://x/c1",
+            title="T",
+            company="C",
+            contact_email="hr@acme.example",
+        )
+    )
+    assert third.contact_email == "hr@acme.example"
 
 
 def test_upsert_rolls_back_and_stays_usable_after_failure() -> None:

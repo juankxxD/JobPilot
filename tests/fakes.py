@@ -102,7 +102,12 @@ class FakeJobRepository:
                     "remote": job.remote,
                     "modality": job.modality,
                     "salary_text": job.salary_text,
-                    "contact_email": job.contact_email,
+                    # Prefer a freshly supplied source email, but preserve a stored
+                    # (e.g. analysis-derived) address when recollection yields None
+                    # (mirrors COALESCE(EXCLUDED.contact_email, jobs.contact_email)).
+                    "contact_email": job.contact_email
+                    if job.contact_email is not None
+                    else current.contact_email,
                     # Only fill language while still unknown so a language established
                     # later by analysis is never overwritten (mirrors the COALESCE in
                     # NeonJobRepository.upsert_job).

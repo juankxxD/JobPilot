@@ -82,3 +82,36 @@ document/delivery outbox, claim-then-complete effects atomically, and count prio
 same-day proposals from a persisted timestamp. These do not block the happy-path
 flow or the later phases; they harden behaviour under partial crashes and across
 scheduled runs. Noted in the PR for the owner's review.
+
+## ADR-012: Phase 6 send-path durability — one bug fixed, two transport-atomicity items deferred
+The Phase 6 review surfaced four issues. Two are fixed here; two join the durable
+outbox debt of ADR-011 because they are the same transactional-atomicity concern
+and the automated review loop was not converging on them.
+
+Fixed:
+- **P6-005 (critical, migration collision)** — `002_status_changed_at.sql` (Phase 5)
+  and the new email-claims migration both used version `002`; the runner keys
+  `schema_migrations` by the numeric prefix only, so an upgraded DB would skip the
+  claims table and a fresh run would fail on the duplicate. Renamed the email-claims
+  migration to `003_email_send_claims.sql` and added a `DuplicateMigrationVersionError`
+  guard in `discover_migrations` plus tests (duplicate rejected; real migrations are
+  001/002/003 and unique).
+- **P6-002 (contact email lost on recollection)** — `contact_email` is now preserved
+  with `COALESCE(EXCLUDED.contact_email, jobs.contact_email)` in both upsert paths
+  (and mirrored in the fakes), so an analysis-derived address is not erased when a
+  later source fetch returns null; a fresh source email still takes priority. Tests
+  cover preserve-on-null and prefer-fresh.
+
+Deferred to the durable-outbox iteration (ADR-011):
+- **P6-004** — an ambiguous email-provider transport failure (timeout/reset after
+  the provider may have accepted) currently releases the send claim, so a later
+  Enviar could re-send. Correct fix: release only on a typed outcome proving no
+  acceptance; keep an in-progress/ambiguous claim otherwise.
+- **P6-006** — manual-application recording and the job status change are not a
+  single atomic unit and there is no per-job application uniqueness constraint, so a
+  status-write failure after the application insert could let a later "Ya apliqué"
+  create a duplicate. Correct fix: atomic insert-or-recover backed by a uniqueness
+  constraint.
+These harden behaviour only under partial crashes; the happy-path send flow is
+guarded against double-send by the eligible-state check and the email claim, and is
+covered by tests.
