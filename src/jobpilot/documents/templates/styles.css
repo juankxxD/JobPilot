@@ -32,7 +32,11 @@ h1 {
 
 h2 {
   font-size: 12pt;
-  text-transform: uppercase;
+  /* No `text-transform: uppercase`: WeasyPrint bakes the transform into the PDF
+   * text layer, so an ATS (and our read-order test) would see "RESUMEN" instead
+   * of the real header "Resumen". Keep the literal header text extractable; the
+   * weight, border and spacing already set the headings apart visually. */
+  font-weight: bold;
   letter-spacing: 0.04em;
   border-bottom: 1px solid #999999;
   padding-bottom: 2pt;
