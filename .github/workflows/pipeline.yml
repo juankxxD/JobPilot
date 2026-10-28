@@ -31,12 +31,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Create virtual environment
-        run: uv venv --python 3.12
-
       - name: Install dependencies
-        # Install into the uv venv (not --system: the runner's system Python is
-        # externally managed, PEP 668). Later steps use `uv run` so they pick it up.
+        # setup-uv already provisions a venv and exports VIRTUAL_ENV, so install
+        # into it (no --system: the runner's system Python is externally managed,
+        # PEP 668). The run step uses `uv run` so it picks up that same venv.
         run: uv pip install -e "."
 
       - name: Materialize profile.yaml
