@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from typing import TypeVar
 
+import pytest
 from pydantic import BaseModel
 
 from jobpilot.config import FormsConfig, Language
+from jobpilot.forms.base import is_sensitive_question
 from jobpilot.forms.greenhouse import GreenhouseFormFiller
 from jobpilot.forms.lever import LeverFormFiller
 from jobpilot.interfaces import FillContext
@@ -245,3 +247,104 @@ def test_lever_known_fields_mapped(example_profile: ProfileModel) -> None:
     assert not result.aborted
     # The organization control is never filled with the candidate's location.
     assert "input[name='org']" not in page.filled
+
+
+# --------------------------------------------------------------------------- #
+# P8-006: every protected category is classified sensitive and never reaches the LLM
+# --------------------------------------------------------------------------- #
+# One representative, common-wording question per protected category (R15.5). Each
+# must be classified sensitive even though its exact wording is not a bank pattern.
+_PROTECTED_CATEGORY_QUESTIONS: list[tuple[str, str]] = [
+    ("salary", "What is your expected salary for this role?"),
+    ("salary_rate", "What is your desired pay rate?"),
+    ("work_authorization", "Are you legally eligible for employment in the United States?"),
+    ("work_authorization_citizen", "Are you a US citizen?"),
+    ("work_authorization_sponsorship", "Will you require sponsorship now or in the future?"),
+    ("relocation", "Are you willing to move to Austin for this role?"),
+    ("relocation_open", "Are you open to relocation?"),
+    ("legal_background", "Have you ever been convicted of a felony?"),
+    ("legal_noncompete", "Are you subject to a non-compete agreement?"),
+    ("demographics_gender", "What is your gender?"),
+    ("demographics_pronouns", "What are your pronouns?"),
+    ("demographics_veteran", "Are you a protected veteran?"),
+    ("demographics_disability", "Do you have a disability?"),
+    ("years_in_tech_how_many", "How many years of experience do you have with SAP?"),
+    ("years_in_tech_number", "Number of years using Kubernetes"),
+    ("years_in_tech_parenthetical", "Python experience (years)"),
+    ("years_in_tech_state", "Please state years of Java experience"),
+    ("years_in_tech_es", "¿Cuántos años de experiencia tienes con SAP?"),
+]
+
+
+_PROTECTED_IDS = [c for c, _ in _PROTECTED_CATEGORY_QUESTIONS]
+_PROTECTED_VALUES = [q for _, q in _PROTECTED_CATEGORY_QUESTIONS]
+
+
+@pytest.mark.parametrize("question", _PROTECTED_VALUES, ids=_PROTECTED_IDS)
+def test_protected_category_classified_sensitive(question: str) -> None:
+    assert is_sensitive_question(question) is True
+
+
+# Generic-tenure and ordinary open questions must NOT be classified sensitive, so
+# the broadened classifier does not block legitimate LLM answering.
+_NON_SENSITIVE_QUESTIONS = [
+    "How many years of total experience do you have?",
+    "How many years of professional experience?",
+    "Why do you want to work here?",
+    "Tell us about a challenging project you led.",
+    "What is your availability or start date?",
+    "What interests you about this company?",
+]
+
+
+@pytest.mark.parametrize("question", _NON_SENSITIVE_QUESTIONS)
+def test_non_sensitive_questions_not_blocked(question: str) -> None:
+    assert is_sensitive_question(question) is False
+
+
+@pytest.mark.parametrize("question", _PROTECTED_VALUES, ids=_PROTECTED_IDS)
+def test_protected_category_never_reaches_llm_and_is_blank_without_bank(
+    example_profile: ProfileModel, question: str
+) -> None:
+    # With no matching approved bank answer, every protected-category question is left
+    # blank and reported as unanswered sensitive — never routed to the LLM (R15.5).
+    from tests.fakes import FakeFormPage, FakeFormQuestion  # noqa: F401
+
+    stripped = example_profile.model_copy(update={"answers_bank": []})
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(stripped, llm, FormsConfig())
+    gh_question = FakeFormQuestion(
+        label=question,
+        container_selector=".field.custom-question",
+        control_id="q_sensitive",
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[gh_question])
+
+    result = filler.fill_page(page, _ctx(stripped))
+
+    assert llm.prompts == [], f"sensitive question reached the LLM: {question!r}"
+    assert "#q_sensitive" not in page.filled
+    assert result.unanswered_sensitive == [question]
+
+
+def test_sensitive_question_from_bank_never_reaches_llm(example_profile: ProfileModel) -> None:
+    # An approved bank entry answers a sensitive question verbatim; the LLM is still
+    # never consulted for it.
+    from tests.fakes import FakeFormPage, FakeFormQuestion  # noqa: F401
+
+    llm = TrackingLlm()
+    filler = GreenhouseFormFiller(example_profile, llm, FormsConfig())
+    question = FakeFormQuestion(
+        label="Are you willing to relocate?",
+        container_selector=".field.custom-question",
+        control_id="q_reloc",
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+
+    result = filler.fill_page(page, _ctx(example_profile))
+
+    bank = example_profile.answer_by_key("relocation")
+    assert bank is not None
+    assert page.filled["#q_reloc"] == bank.text(Language.en)
+    assert llm.prompts == []
+    assert not result.unanswered_sensitive

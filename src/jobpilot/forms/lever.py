@@ -48,7 +48,17 @@ _LEVER_SCHEMA = FormSchema(
     cv_selector="input[name='resume']",
     cover_letter_selector="input[name='cover_letter']",
     required_markers=(".application-form", "input[name='name']", "input[name='email']"),
-    captcha_markers=("iframe[src*='recaptcha']", ".g-recaptcha", "#px-captcha"),
+    captcha_markers=(
+        "iframe[src*='recaptcha']",
+        ".g-recaptcha",
+        "iframe[src*='hcaptcha']",
+        ".h-captcha",
+        "#px-captcha",
+        "iframe[src*='turnstile']",
+        ".cf-turnstile",
+        "iframe[src*='arkoselabs']",
+        "iframe[title*='captcha' i]",
+    ),
     submit_selector="button[data-qa='btn-submit']",
     # Lever renders each "additional information" question inside an
     # ``.application-question`` card whose label is the question text and whose
@@ -58,6 +68,10 @@ _LEVER_SCHEMA = FormSchema(
         RequiredField(selector="input[name='name']", label="Nombre completo"),
         RequiredField(selector="input[name='email']", label="Correo electrónico"),
     ),
+    # Lever often has no dedicated cover-letter upload (its "additional information"
+    # free-text field serves that role), so a missing cover-letter control must not
+    # make an otherwise complete Lever form impossible to submit.
+    cover_letter_required=False,
 )
 
 

@@ -187,55 +187,118 @@ def detect_platform(url: str, dom: str | None = None) -> str | None:
 # separately by _asks_years_in_technology so a generic "years of experience" without
 # a named technology is NOT treated as sensitive by itself.
 _SENSITIVE_PATTERNS: tuple[str, ...] = (
-    # salary expectation
+    # salary expectation / compensation
     "salary",
     "compensation",
     "pay expectation",
     "expected pay",
+    "expected pay rate",
+    "desired pay",
+    "desired compensation",
+    "pay range",
+    "rate expectation",
+    "remuneration",
     "pretensión salarial",
     "aspiración salarial",
     "expectativa salarial",
+    "expectativa de salario",
     "salario",
-    # work authorization / visa
+    "remuneración",
+    "sueldo",
+    # work authorization / visa / eligibility
     "work authorization",
+    "work authorisation",
     "authorized to work",
+    "authorised to work",
+    "legally authorized",
+    "legally authorised",
+    "legally eligible",
+    "eligible to work",
+    "eligible for employment",
+    "legal right to work",
     "right to work",
+    "require sponsorship",
+    "need sponsorship",
     "visa",
     "sponsorship",
     "work permit",
+    "employment authorization",
+    "citizenship",
+    "citizen",
+    "citizen of",
+    "security clearance",
+    "clearance",
     "autorización de trabajo",
+    "autorización para trabajar",
     "permiso de trabajo",
     "patrocinio",
+    "ciudadanía",
+    "nacionalidad",
     # relocation
     "relocate",
     "relocation",
+    "willing to move",
+    "willing to relocate",
+    "able to relocate",
+    "open to relocation",
+    "move to",
+    "commute to",
     "reubicar",
     "reubicación",
     "reubicarse",
+    "dispuesto a mudarte",
+    "dispuesta a mudarte",
+    "mudarte",
+    "trasladarte",
     "mudar",
     # background / legal
     "background check",
     "criminal",
     "felony",
     "conviction",
+    "convicted",
     "legal status",
+    "non-compete",
+    "noncompete",
+    "non compete",
+    "disciplinary",
+    "litigation",
+    "lawsuit",
+    "drug test",
+    "drug screening",
     "antecedentes",
     "penales",
     "judiciales",
+    "no competencia",
+    "cláusula de no competencia",
     # demographics (EEO and similar)
     "gender",
+    "pronoun",
+    "pronouns",
     "race",
     "ethnicity",
+    "ethnic",
     "disability",
     "veteran",
     "sexual orientation",
+    "marital status",
+    "religion",
+    "religious",
+    "nationality",
     "age",
     "date of birth",
+    "birth date",
+    "birthdate",
     "género",
+    "pronombres",
     "raza",
     "etnia",
+    "etnicidad",
     "discapacidad",
+    "veterano",
     "orientación sexual",
+    "estado civil",
+    "religión",
     "edad",
     "fecha de nacimiento",
 )
@@ -248,15 +311,28 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
 # detection must not depend on the profile catalogue.
 _YEARS_PATTERNS: tuple[str, ...] = (
     "years of experience",
+    "years of ",
     "years experience",
     "year of experience",
     "yrs of experience",
     "yrs experience",
+    "years using",
+    "years with",
+    "years of hands-on",
+    "years hands-on",
+    "number of years",
     "how many years",
+    "(years)",
+    "(yrs)",
+    "in years",
     "años de experiencia",
     "año de experiencia",
+    "años usando",
+    "años con",
+    "número de años",
     "cuántos años",
     "cuantos años",
+    "(años)",
 )
 
 # Words that commonly carry the years-of-experience phrasing WITHOUT naming a concrete
@@ -293,23 +369,35 @@ _YEARS_PHRASE_TOKENS: frozenset[str] = frozenset(
     {
         "how",
         "many",
+        "number",
+        "num",
         "years",
         "year",
         "yrs",
         "of",
         "experience",
+        "hands",
+        "on",
         "do",
         "you",
         "have",
         "with",
         "in",
         "using",
+        "use",
         "the",
         "a",
         "an",
         "your",
+        "please",
+        "specify",
+        "enter",
+        "indicate",
+        "state",
         "cuantos",
         "cuántos",
+        "numero",
+        "número",
         "anos",
         "años",
         "ano",
@@ -317,15 +405,19 @@ _YEARS_PHRASE_TOKENS: frozenset[str] = frozenset(
         "de",
         "experiencia",
         "tienes",
+        "tengo",
         "con",
         "en",
         "usando",
+        "uso",
         "tiene",
         "el",
         "la",
         "los",
         "las",
         "tu",
+        "indica",
+        "especifica",
     }
 )
 
@@ -454,19 +546,36 @@ def _control_selector(control: FormElement) -> str | None:
     return None
 
 
+# Selectors for the free-text controls the driver can answer. Anything matched by
+# ``question_container_selector`` whose control is NOT one of these (a select, a
+# radio/checkbox group, a number spinner) is a control the driver cannot safely
+# answer; when such a control is required it must abort the form rather than guess.
+_OPEN_TEXT_CONTROL_SELECTOR = (
+    "textarea, input[type='text'], input[type='email'], input[type='url'], "
+    "input[type='tel'], input:not([type])"
+)
+# Controls that look like a question but are NOT free-text (so the driver cannot
+# author an answer for them). A required one aborts the form.
+_NON_TEXT_CONTROL_SELECTOR = (
+    "select, input[type='radio'], input[type='checkbox'], input[type='number']"
+)
+
+
 def discover_questions(page: FormPage, schema: FormSchema) -> list[OpenQuestion]:
-    """Discover the form's custom questions using the real Playwright element API.
+    """Discover the form's answerable custom questions via the real element API.
 
     Each container matched by ``schema.question_container_selector`` is read with
     ``query_selector_all`` and inspected with ``ElementHandle`` methods
     (``inner_text`` for the label, ``query_selector`` for the control, ``get_attribute``
-    for a stable selector). Containers whose label or control cannot be resolved are
-    skipped. This is the exact path a local browser run takes, so the mocked tests
-    exercise production behaviour instead of a page-only shortcut.
+    for a stable selector). Only free-text controls are returned here — those the
+    driver can actually answer. Non-text question controls (selects, radios,
+    checkboxes, number spinners) are handled by :func:`validate_required_controls`,
+    which aborts the form when such a control is required, so an unanswerable
+    required question is never left silently blank (R15.3/R15.7).
     """
     questions: list[OpenQuestion] = []
     for container in page.query_selector_all(schema.question_container_selector):
-        control = container.query_selector("textarea, input[type='text'], input:not([type])")
+        control = container.query_selector(_OPEN_TEXT_CONTROL_SELECTOR)
         if control is None:
             continue
         selector = _control_selector(control)
@@ -479,19 +588,120 @@ def discover_questions(page: FormPage, schema: FormSchema) -> list[OpenQuestion]
     return questions
 
 
-def validate_required_fields(page: FormPage, schema: FormSchema) -> list[str]:
-    """Return the labels of required controls that are missing, hidden or blank.
+def _control_is_complete(control: FormElement) -> bool:
+    """Return whether a single control carries an acceptable, non-empty answer.
 
-    A required control must exist, be visible and carry a non-empty value. The
-    returned list is empty when every required control is complete; a non-empty list
-    is the caller's signal to abort safely and never submit (R15.7).
+    * a radio/checkbox is complete only when it is checked;
+    * any other control (text, textarea, select, number) is complete only when it
+      has a non-blank value.
+
+    A hidden control is never complete: the owner cannot see or correct it.
+    """
+    if not control.is_visible():
+        return False
+    control_type = (control.get_attribute("type") or "").lower()
+    if control_type in {"radio", "checkbox"}:
+        return control.is_checked()
+    return bool(control.input_value().strip())
+
+
+def _label_for(container: FormElement, control: FormElement) -> str:
+    """Best-effort human label for a required control, for the owner's abort notice."""
+    text = container.inner_text().strip()
+    if text:
+        return text
+    for attr in ("aria-label", "name", "id"):
+        value = control.get_attribute(attr)
+        if value:
+            return value
+    return "(sin etiqueta)"
+
+
+def discover_unanswerable_required_controls(page: FormPage, schema: FormSchema) -> list[str]:
+    """Return labels of required question controls the driver cannot answer.
+
+    Every container matched by ``question_container_selector`` whose control is a
+    select, radio, checkbox or number input (not a free-text field) and which is
+    marked required but is not already complete is reported. These are controls the
+    driver must never guess at, so a required, incomplete one aborts the form safely
+    (R15.3/R15.7).
+    """
+    unanswerable: list[str] = []
+    for container in page.query_selector_all(schema.question_container_selector):
+        if container.query_selector(_OPEN_TEXT_CONTROL_SELECTOR) is not None:
+            continue  # answerable free-text question, handled elsewhere
+        control = container.query_selector(_NON_TEXT_CONTROL_SELECTOR)
+        if control is None:
+            continue
+        required = control.get_attribute("required") is not None or (
+            container.get_attribute("required") is not None
+        )
+        if not required:
+            continue
+        if _control_is_complete(control):
+            continue
+        unanswerable.append(_label_for(container, control))
+    return unanswerable
+
+
+def discover_dom_required_controls(page: FormPage, schema: FormSchema) -> list[str]:
+    """Return labels of every DOM-marked ``[required]`` control that is incomplete.
+
+    Beyond each platform's static ``required_fields``, forms mark their own required
+    controls with the ``required`` attribute. Every visible such control must carry
+    a value (or be checked); any that does not is reported so the form aborts rather
+    than reaching submit incomplete (R15.7). The look-up uses the real element API.
+    """
+    incomplete: list[str] = []
+    for control in page.query_selector_all("[required]"):
+        if not control.is_visible():
+            incomplete.append(_dom_label(control))
+            continue
+        if not _control_is_complete(control):
+            incomplete.append(_dom_label(control))
+    return incomplete
+
+
+def _dom_label(control: FormElement) -> str:
+    """Label a bare DOM-required control for the owner's notice."""
+    for attr in ("aria-label", "name", "id"):
+        value = control.get_attribute(attr)
+        if value:
+            return value
+    label = control.inner_text().strip()
+    return label or "(control requerido)"
+
+
+def validate_required_controls(page: FormPage, schema: FormSchema) -> list[str]:
+    """Return the labels of EVERY required control that is missing, hidden or blank.
+
+    This is the single completeness gate used both before asking the owner to
+    confirm and again immediately before the final click. It unions three sources so
+    nothing required can slip through to submit incomplete (R15.3/R15.7):
+
+    #. the platform's static ``required_fields`` (name/email controls);
+    #. every DOM-marked ``[required]`` control on the page;
+    #. every required non-text question control (select/radio/checkbox/number) the
+       driver cannot author an answer for.
+
+    The returned list is empty only when every required control is present, visible
+    and complete; a non-empty list is the caller's signal to abort safely.
     """
     incomplete: list[str] = []
     for required in schema.required_fields:
         control = page.query_selector(required.selector)
-        if control is None or not control.is_visible() or not control.input_value().strip():
+        if control is None or not _control_is_complete(control):
             incomplete.append(required.label)
-    return incomplete
+    incomplete.extend(discover_dom_required_controls(page, schema))
+    incomplete.extend(discover_unanswerable_required_controls(page, schema))
+    # De-duplicate while preserving order (a control can appear via two sources).
+    seen: set[str] = set()
+    unique: list[str] = []
+    for label in incomplete:
+        if label not in seen:
+            seen.add(label)
+            unique.append(label)
+    return unique
 
 
 # --------------------------------------------------------------------------- #
@@ -515,7 +725,11 @@ class FormElement(Protocol):
 
     def is_visible(self) -> bool: ...
 
+    def is_checked(self) -> bool: ...
+
     def query_selector(self, selector: str) -> FormElement | None: ...
+
+    def query_selector_all(self, selector: str) -> list[FormElement]: ...
 
 
 @runtime_checkable
@@ -596,6 +810,15 @@ class FormSchema:
     #: Controls that must be present, visible and non-empty before the form can be
     #: submitted. A missing or blank required control aborts safely, never submits.
     required_fields: tuple[RequiredField, ...] = ()
+    #: Whether the CV upload control MUST be present (its absence aborts the form).
+    #: A CV is always expected on a real application, so this defaults to ``True``.
+    cv_required: bool = True
+    #: Whether a dedicated cover-letter upload control MUST be present. Greenhouse
+    #: exposes one, so it is mandatory there; Lever often has no separate cover-letter
+    #: upload (its "additional information" free-text field serves that role), so the
+    #: Lever schema sets this ``False`` and the cover letter is attached only when a
+    #: control exists — never making an otherwise complete Lever form unsubmittable.
+    cover_letter_required: bool = True
 
 
 @dataclass(slots=True)
@@ -689,14 +912,11 @@ class FormFiller(ABC):
         self._upload_documents(page, schema, ctx, acc)
         self._answer_open_questions(page, language, acc)
 
-        # Never ask the owner to confirm an incomplete form: every required visible
-        # control must carry a value. A missing or blank one is a safe abort.
-        incomplete = validate_required_fields(page, schema)
-        if incomplete:
-            log.warning(
-                "form_required_incomplete", platform=self.platform.value, missing=incomplete
-            )
-            raise IncompleteFormError(incomplete)
+        # Never ask the owner to confirm an incomplete form. The full required-control
+        # set (static fields, DOM-marked [required], and unanswerable required
+        # selects/radios/checkboxes/number inputs) must be complete, and both the CV
+        # and cover-letter uploads must have succeeded. Any gap is a safe abort.
+        self._ensure_complete(page, schema)
 
         screenshot_path = _take_screenshot(page, ctx.job_id, self.platform.value)
         result = acc.to_result(screenshot_path=screenshot_path)
@@ -729,27 +949,37 @@ class FormFiller(ABC):
             return self._abort_result(page, ctx.job_id, "unexpected_structure", exc)
 
     def submit(self, page: FormPage) -> None:
-        """Click the platform's final submit button.
+        """Click the platform's final submit button, re-running every safety guard.
 
         Called ONLY after the owner's explicit Enviar confirmation; filling never
-        calls this. The submit control must be present (it was part of the required
-        structure the fill step verified), so a missing button here is a
-        :class:`FormStructureError` rather than a silent no-op.
+        calls this. The page may have changed during the Telegram review (a CAPTCHA
+        may have appeared, a required control may have been reset, the DOM may have
+        been re-rendered), so immediately before the click this re-runs the full
+        safety gate:
+
+        #. a CAPTCHA / anti-bot challenge raises :class:`CaptchaError` (never evaded);
+        #. an unexpected structure or a missing submit control raises
+           :class:`FormStructureError`;
+        #. any required control that is now blank/hidden, or a missing document
+           upload, raises :class:`IncompleteFormError`.
+
+        The caller converts any of these to a stop/safe-abort that records nothing,
+        so a challenge or a changed DOM at the boundary never produces a submit
+        (R15.6/R15.7).
         """
         schema = self.schema
+        # Re-detect anti-bot and re-validate structure first: a challenge or DOM
+        # change after the owner confirmed must stop the submit, not sail past it.
+        if _detect_captcha(page, schema):
+            log.warning("form_submit_blocked_captcha", platform=self.platform.value)
+            raise CaptchaError(f"CAPTCHA detected on {self.platform.value} form before submit")
+        _require_structure(page, schema, platform=self.platform.value, dom=page.content())
         selector = schema.submit_selector
         if page.query_selector(selector) is None:
             raise FormStructureError(f"submit control {selector} not found")
-        # Re-validate immediately before the click: nothing must have become blank or
-        # hidden since the owner confirmed. An incomplete form is never submitted.
-        incomplete = validate_required_fields(page, schema)
-        if incomplete:
-            log.warning(
-                "form_submit_blocked_incomplete",
-                platform=self.platform.value,
-                missing=incomplete,
-            )
-            raise IncompleteFormError(incomplete)
+        # Re-validate completeness: nothing must have become blank or hidden and both
+        # documents must still be attached. An incomplete form is never submitted.
+        self._ensure_complete(page, schema)
         page.click(selector)
         log.info("form_submitted", platform=self.platform.value)
 
@@ -806,13 +1036,56 @@ class FormFiller(ABC):
     def _upload_documents(
         self, page: FormPage, schema: FormSchema, ctx: FillContext, acc: FillAccumulator
     ) -> None:
-        """Upload the CV and cover letter (already rendered in the chosen language)."""
+        """Upload the CV and cover letter (already rendered in the chosen language).
+
+        Both uploads are mandatory: a supported form must expose a CV control and a
+        cover-letter control, and :meth:`_ensure_complete` aborts when either is
+        absent. Here we upload whichever controls are present and record them; the
+        completeness gate is what enforces that both landed.
+        """
         if page.query_selector(schema.cv_selector) is not None:
             page.set_input_files(schema.cv_selector, ctx.cv_path)
             acc.known("cv")
         if page.query_selector(schema.cover_letter_selector) is not None:
             page.set_input_files(schema.cover_letter_selector, ctx.cover_letter_path)
             acc.known("cover_letter")
+
+    def _missing_documents(self, page: FormPage, schema: FormSchema) -> list[str]:
+        """Return labels for any mandatory document upload control that is absent.
+
+        Which uploads are mandatory is platform-specific (``cv_required`` /
+        ``cover_letter_required``): a missing CV control aborts every supported form,
+        while a missing cover-letter control aborts only on platforms that expose one
+        (Greenhouse). Lever has no dedicated cover-letter upload, so it is not treated
+        as missing there.
+        """
+        missing: list[str] = []
+        if schema.cv_required and page.query_selector(schema.cv_selector) is None:
+            missing.append("CV (hoja de vida)")
+        if (
+            schema.cover_letter_required
+            and page.query_selector(schema.cover_letter_selector) is None
+        ):
+            missing.append("Carta de presentación")
+        return missing
+
+    def _ensure_complete(self, page: FormPage, schema: FormSchema) -> None:
+        """Abort safely unless every required control and both uploads are complete.
+
+        Unions the required-control gate with the mandatory CV + cover-letter upload
+        check so an incomplete form — a blank/hidden required field, an unanswerable
+        required select/radio/checkbox/number input, or a missing document control —
+        is never shown to the owner for confirmation nor submitted (R15.3/R15.7).
+        """
+        incomplete = [
+            *self._missing_documents(page, schema),
+            *validate_required_controls(page, schema),
+        ]
+        if incomplete:
+            log.warning(
+                "form_required_incomplete", platform=self.platform.value, missing=incomplete
+            )
+            raise IncompleteFormError(incomplete)
 
     def _answer_open_questions(
         self, page: FormPage, language: Language, acc: FillAccumulator

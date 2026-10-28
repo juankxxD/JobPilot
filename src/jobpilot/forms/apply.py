@@ -110,6 +110,9 @@ def apply_via_form(
     language: Language,
     cv_path: str,
     cover_letter_path: str,
+    cv_variant: str = "",
+    cv_url: str | None = None,
+    cover_letter_url: str | None = None,
     page_factory: Callable[[str, AppConfig], AbstractContextManager[FormPage]] | None = None,
     now: Callable[[], datetime] | None = None,
     confirmation_nonce: str | None = None,
@@ -123,6 +126,11 @@ def apply_via_form(
     dispatches directly; otherwise the page is opened and
     ``detect_platform(url, page.content())`` identifies an embedded Greenhouse/Lever
     form, returning :attr:`FormApplyStatus.unsupported` for anything still unknown.
+
+    ``cv_variant``, ``cv_url`` and ``cover_letter_url`` are the approved proposal's
+    document metadata; they are persisted on the recorded :class:`Application` so a
+    successful form submission carries the same tracking fields (CV variant and both
+    document URLs) an email send does (R12.6).
     """
     if job.id is None:
         raise ValueError("apply_via_form requires a persisted job with an id")
@@ -199,9 +207,30 @@ def apply_via_form(
         if decision is not SubmitDecision.submit:
             return _handle_not_submitted(job, notifier, result, decision)
 
-        filler.submit(page_obj)
+        # Final-submit boundary. A CAPTCHA may have appeared during the Telegram
+        # review, or the DOM / a required control may have changed since the owner
+        # confirmed. ``filler.submit`` rechecks both and clicks only when the form is
+        # still complete and challenge-free; any failure here is routed to the same
+        # stop/safe-abort handling as during filling, and NOTHING is submitted or
+        # recorded (R15.6/R15.7).
+        try:
+            filler.submit(page_obj)
+        except CaptchaError as exc:
+            return _handle_captcha(job, notifier, page_obj, filler, exc)
+        except FormStructureError as exc:
+            return _handle_abort(job, notifier, page_obj, filler, exc)
 
-    application = _record(job, repo, config, language, result, now)
+    application = _record(
+        job,
+        repo,
+        config,
+        language,
+        result,
+        now,
+        cv_variant=cv_variant,
+        cv_url=cv_url,
+        cover_letter_url=cover_letter_url,
+    )
     notifier.send_message(f"Postulación enviada por formulario ({job.company} — {job.title}).")
     log.info("form_apply_submitted", job_id=job.id, platform=platform)
     return FormApplyResult(
@@ -278,8 +307,17 @@ def _record(
     language: Language,
     result: FillResult,
     now: Callable[[], datetime] | None,
+    *,
+    cv_variant: str,
+    cv_url: str | None,
+    cover_letter_url: str | None,
 ) -> Application:
-    """Record the submitted application (channel ``form_assisted``) and mark applied."""
+    """Record the submitted application (channel ``form_assisted``) and mark applied.
+
+    The approved proposal's document metadata (CV variant and both document URLs) is
+    persisted on the record so a form submission carries the same tracking fields an
+    email send does (R12.6).
+    """
     from jobpilot.models import JobStatus  # noqa: PLC0415 - avoid a module-load cycle
 
     assert job.id is not None
@@ -287,7 +325,9 @@ def _record(
     application = Application(
         job_id=job.id,
         language=language,
-        cv_variant="",
+        cv_variant=cv_variant,
+        cv_url=cv_url,
+        cover_letter_url=cover_letter_url,
         channel=ApplicationChannel.form_assisted,
         applied_at=applied_at,
         follow_up_at=compute_follow_up_at(applied_at, config.follow_up),

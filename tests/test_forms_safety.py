@@ -77,6 +77,10 @@ def _apply(
     page: FakeFormPage,
     notifier: FakeNotifier,
     repo: FakeJobRepository,
+    *,
+    cv_variant: str = "",
+    cv_url: str | None = None,
+    cover_letter_url: str | None = None,
 ) -> FormApplyResult:
     repo.seed_job(_job())
     filler = GreenhouseFormFiller(profile, _StubLlm(), FormsConfig())
@@ -89,6 +93,9 @@ def _apply(
         language=Language.en,
         cv_path="/tmp/cv_en.pdf",
         cover_letter_path="/tmp/cover_en.pdf",
+        cv_variant=cv_variant,
+        cv_url=cv_url,
+        cover_letter_url=cover_letter_url,
         page_factory=_page_factory(page),
         confirmation_nonce=_NONCE,
     )
@@ -333,3 +340,261 @@ def test_unsupported_url_rejected_before_browser(example_profile: ProfileModel) 
     assert result.status is FormApplyStatus.unsupported
     assert page.filled == {}  # browser page was never driven
     assert repo.applications == []
+
+
+# --------------------------------------------------------------------------- #
+# P8-007: required non-text controls and mandatory uploads gate the submit
+# --------------------------------------------------------------------------- #
+def test_required_select_question_safe_abort(example_profile: ProfileModel) -> None:
+    from tests.fakes import FakeFormQuestion
+
+    # A required <select> the driver cannot answer must abort the form, never submit.
+    question = FakeFormQuestion(
+        label="How did you hear about us?",
+        container_selector=".field.custom-question",
+        control_id="q_source",
+        kind="select",
+        required=True,
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+    notifier = FakeNotifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+    assert any("segura" in m.text for m in notifier.messages)
+
+
+def test_required_radio_question_safe_abort(example_profile: ProfileModel) -> None:
+    from tests.fakes import FakeFormQuestion
+
+    question = FakeFormQuestion(
+        label="Do you agree to the terms?",
+        container_selector=".field.custom-question",
+        control_id="q_terms",
+        kind="radio",
+        required=True,
+        checked=False,
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+    notifier = FakeNotifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+
+
+def test_required_number_question_safe_abort(example_profile: ProfileModel) -> None:
+    from tests.fakes import FakeFormQuestion
+
+    # A required number input (e.g. a sensitive years-in-tech left blank) aborts.
+    question = FakeFormQuestion(
+        label="How many years of experience do you have with SAP?",
+        container_selector=".field.custom-question",
+        control_id="q_years",
+        kind="number",
+        required=True,
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+    notifier = FakeNotifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+
+
+def test_checked_required_checkbox_allows_submit(example_profile: ProfileModel) -> None:
+    from jobpilot.forms.submit import SubmitAction
+    from tests.fakes import FakeFormQuestion
+
+    # A required checkbox that is already checked is complete, so the form proceeds.
+    question = FakeFormQuestion(
+        label="I confirm the information is accurate.",
+        container_selector=".field.custom-question",
+        control_id="q_confirm",
+        kind="checkbox",
+        required=True,
+        checked=True,
+    )
+    page = FakeFormPage(present=_GH_PRESENT, questions=[question])
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:7:{_NONCE}",
+            )
+        ]
+    )
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.submitted
+    assert page.clicked == ["#submit_app"]
+
+
+def test_missing_cv_control_safe_abort(example_profile: ProfileModel) -> None:
+    # The CV upload control is absent: a supported form must expose one, so abort.
+    present = set(_GH_PRESENT)
+    present.discard("input#resume")
+    page = FakeFormPage(present=present)
+    notifier = FakeNotifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+
+
+def test_missing_cover_letter_control_safe_abort_on_greenhouse(
+    example_profile: ProfileModel,
+) -> None:
+    # Greenhouse exposes a cover-letter upload, so a missing one aborts.
+    present = set(_GH_PRESENT)
+    present.discard("input#cover_letter")
+    page = FakeFormPage(present=present)
+    notifier = FakeNotifier()
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+
+
+# --------------------------------------------------------------------------- #
+# P8-008: CAPTCHA / DOM change are re-checked at the final-submit boundary
+# --------------------------------------------------------------------------- #
+class _CaptchaOnSubmitPage(FakeFormPage):
+    """A page that is clean during filling but grows a CAPTCHA before the submit."""
+
+    def __init__(self, captcha_marker: str) -> None:
+        super().__init__(present=_GH_PRESENT)
+        self._captcha_marker = captcha_marker
+        self._armed = False
+
+    def screenshot(self, *, path: str) -> None:  # the fill screenshot arms the CAPTCHA
+        super().screenshot(path=path)
+        self._armed = True
+        self._present.add(self._captcha_marker)
+
+
+def test_captcha_appearing_before_submit_stops_and_notifies(
+    example_profile: ProfileModel,
+) -> None:
+    from jobpilot.forms.submit import SubmitAction
+
+    page = _CaptchaOnSubmitPage(".h-captcha")  # hCaptcha marker
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:7:{_NONCE}",
+            )
+        ]
+    )
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    # The owner pressed Enviar, but a CAPTCHA appeared at the boundary: stop + notify,
+    # never click, never record.
+    assert result.status is FormApplyStatus.captcha
+    assert page.clicked == []
+    assert repo.applications == []
+    assert any("CAPTCHA" in m.text for m in notifier.messages)
+
+
+class _DomChangesBeforeSubmitPage(FakeFormPage):
+    """A page whose required #email vanishes after filling (DOM re-render)."""
+
+    def __init__(self) -> None:
+        super().__init__(present=_GH_PRESENT)
+
+    def screenshot(self, *, path: str) -> None:
+        super().screenshot(path=path)
+        self._present.discard("#email")  # the structure changes after confirmation
+
+
+def test_dom_change_before_submit_aborts_safely(example_profile: ProfileModel) -> None:
+    from jobpilot.forms.submit import SubmitAction
+
+    page = _DomChangesBeforeSubmitPage()
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:7:{_NONCE}",
+            )
+        ]
+    )
+    repo = FakeJobRepository()
+
+    result = _apply(example_profile, page, notifier, repo)
+
+    assert result.status is FormApplyStatus.aborted
+    assert page.clicked == []
+    assert repo.applications == []
+
+
+def test_hcaptcha_detected_at_fill(example_profile: ProfileModel) -> None:
+    # hCaptcha (and Cloudflare Turnstile) markers are recognised like reCAPTCHA.
+    for marker in (".h-captcha", ".cf-turnstile"):
+        page = FakeFormPage(present={*_GH_PRESENT, marker})
+        notifier = FakeNotifier()
+        repo = FakeJobRepository()
+        result = _apply(example_profile, page, notifier, repo)
+        assert result.status is FormApplyStatus.captcha
+        assert page.clicked == []
+
+
+# --------------------------------------------------------------------------- #
+# P8-009: a confirmed submit records the CV variant and both document URLs
+# --------------------------------------------------------------------------- #
+def test_confirmed_submit_records_document_metadata(example_profile: ProfileModel) -> None:
+    from jobpilot.forms.submit import SubmitAction
+
+    page = FakeFormPage(present=_GH_PRESENT)
+    notifier = FakeNotifier(
+        updates_after_send=[
+            Update(
+                update_id=1,
+                chat_id="owner",
+                callback_data=f"{SubmitAction.submit.value}:7:{_NONCE}",
+            )
+        ]
+    )
+    repo = FakeJobRepository()
+
+    result = _apply(
+        example_profile,
+        page,
+        notifier,
+        repo,
+        cv_variant="backend_en",
+        cv_url="https://drive.example/cv_en.pdf",
+        cover_letter_url="https://drive.example/cover_en.pdf",
+    )
+
+    assert result.status is FormApplyStatus.submitted
+    assert len(repo.applications) == 1
+    app = repo.applications[0]
+    assert app.channel is ApplicationChannel.form_assisted
+    assert app.cv_variant == "backend_en"
+    assert str(app.cv_url) == "https://drive.example/cv_en.pdf"
+    assert str(app.cover_letter_url) == "https://drive.example/cover_en.pdf"

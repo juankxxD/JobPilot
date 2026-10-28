@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel
 
@@ -423,19 +423,55 @@ class FakeMailer:
         )
 
 
+#: The kind of control a fake question renders. ``text``/``textarea`` are free-text
+#: controls the driver can answer; ``select``/``radio``/``checkbox``/``number`` are
+#: non-text controls it must never guess at (a required one aborts the form).
+FakeControlKind = Literal["text", "textarea", "select", "radio", "checkbox", "number"]
+
+#: How each control kind maps to the CSS group the driver queries containers with.
+_CONTROL_KIND_CSS: dict[str, str] = {
+    "text": "input[type='text']",
+    "textarea": "textarea",
+    "select": "select",
+    "radio": "input[type='radio']",
+    "checkbox": "input[type='checkbox']",
+    "number": "input[type='number']",
+}
+_FREE_TEXT_KINDS = {"text", "textarea"}
+
+
+def _selector_matches(query: str, css: str) -> bool:
+    """Return whether a comma-separated CSS ``query`` includes the exact ``css`` token.
+
+    The fake stores each control under a precise CSS token (e.g. ``select`` or
+    ``input[type='radio']``); the driver queries with comma-separated groups, so a
+    match means the control belongs to that group. ``[required]`` matches any control
+    the test marked required (handled separately by the page), so it is not resolved
+    here.
+    """
+    parts = [part.strip() for part in query.split(",")]
+    return css in parts
+
+
 class FakeFormQuestion(BaseModel):
     """One custom question in a :class:`FakeFormPage`'s DOM.
 
     ``container_selector`` is what the platform's ``question_container_selector``
     matches; ``control_id``/``control_name`` back the stable selector the driver
     derives (``#id`` preferred, then ``[name="..."]``); ``label`` is the visible
-    question text the driver reads via ``inner_text``.
+    question text the driver reads via ``inner_text``. ``kind`` selects the control
+    type the container renders (free-text by default); ``required``/``checked`` model
+    a required and/or already-answered non-text control so the completeness gate can
+    be exercised without a browser.
     """
 
     label: str
     container_selector: str
     control_id: str | None = None
     control_name: str | None = None
+    kind: FakeControlKind = "text"
+    required: bool = False
+    checked: bool = False
 
     def control_selector(self) -> str:
         if self.control_id:
@@ -443,6 +479,12 @@ class FakeFormQuestion(BaseModel):
         if self.control_name:
             return f'[name="{self.control_name}"]'
         raise ValueError("a question needs a control id or name")
+
+    def control_css(self) -> str:
+        return _CONTROL_KIND_CSS[self.kind]
+
+    def is_free_text(self) -> bool:
+        return self.kind in _FREE_TEXT_KINDS
 
 
 class FakeFormElement:
@@ -457,6 +499,8 @@ class FakeFormElement:
         value_selector: str | None = None,
         child: FakeFormElement | None = None,
         visible: bool = True,
+        checked: bool = False,
+        children: dict[str, FakeFormElement] | None = None,
     ) -> None:
         self._page = page
         self._attributes = attributes or {}
@@ -464,6 +508,10 @@ class FakeFormElement:
         self._value_selector = value_selector
         self._child = child
         self._visible = visible
+        self._checked = checked
+        # Optional CSS-selector -> child element map so a container can expose
+        # different controls to different selectors (free-text vs. non-text).
+        self._children = children or {}
 
     def get_attribute(self, name: str) -> str | None:
         return self._attributes.get(name)
@@ -479,8 +527,19 @@ class FakeFormElement:
     def is_visible(self) -> bool:
         return self._visible
 
+    def is_checked(self) -> bool:
+        return self._checked
+
     def query_selector(self, selector: str) -> FormElement | None:
+        for css, element in self._children.items():
+            if _selector_matches(selector, css):
+                return element
         return self._child
+
+    def query_selector_all(self, selector: str) -> list[FormElement]:
+        return [
+            element for css, element in self._children.items() if _selector_matches(selector, css)
+        ]
 
 
 class FakeFormPage:
@@ -535,20 +594,47 @@ class FakeFormPage:
             visible=selector not in self._hidden,
         )
 
+    def _question_control(self, question: FakeFormQuestion) -> FakeFormElement:
+        attrs: dict[str, str] = {}
+        if question.control_id:
+            attrs["id"] = question.control_id
+        if question.control_name:
+            attrs["name"] = question.control_name
+        if question.kind == "radio":
+            attrs["type"] = "radio"
+        elif question.kind == "checkbox":
+            attrs["type"] = "checkbox"
+        elif question.kind == "number":
+            attrs["type"] = "number"
+        elif question.kind == "text":
+            attrs["type"] = "text"
+        if question.required:
+            attrs["required"] = "required"
+        return FakeFormElement(
+            self,
+            attributes=attrs,
+            value_selector=question.control_selector(),
+            checked=question.checked,
+        )
+
     def query_selector_all(self, selector: str) -> list[FormElement]:
+        if selector == "[required]":
+            return [
+                self._question_control(q)
+                for q in self._questions
+                if q.required and q.control_selector() in self._present
+            ]
         elements: list[FormElement] = []
         for question in self._questions:
             if question.container_selector != selector:
                 continue
-            attrs: dict[str, str] = {}
-            if question.control_id:
-                attrs["id"] = question.control_id
-            if question.control_name:
-                attrs["name"] = question.control_name
-            control = FakeFormElement(
-                self, attributes=attrs, value_selector=question.control_selector()
+            control = self._question_control(question)
+            container = FakeFormElement(
+                self,
+                inner_text=question.label,
+                children={question.control_css(): control},
             )
-            elements.append(FakeFormElement(self, inner_text=question.label, child=control))
+            elements.append(container)
         return elements
 
     def click(self, selector: str) -> None:
