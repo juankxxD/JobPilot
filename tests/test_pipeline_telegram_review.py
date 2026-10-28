@@ -494,7 +494,8 @@ def test_dedupe_window_uses_proposal_time_not_collection_time(
     fresh = repo.seed_job(_scored_job(job_id=2))
     config = AppConfig(proposals=ProposalsConfig(dedupe_company_role_days=30))
     notifier = FakeNotifier()
-    llm = ScriptedFakeLlmClient([_valid_selection()])
+    # A full proposal needs both the content selection and the cover-letter draft.
+    llm = ScriptedFakeLlmClient([_valid_selection(), _cover()])
     storage = FakeFileStorage()
 
     from tests.conftest import weasyprint_available
