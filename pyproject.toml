@@ -96,6 +96,8 @@ module = [
     "google.*",
     "google_auth_oauthlib.*",
     "msal.*",
+    # Phase 8 only; the `forms` extra is intentionally not installed in CI.
+    "playwright.*",
 ]
 ignore_missing_imports = true
 
