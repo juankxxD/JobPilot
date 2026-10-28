@@ -118,7 +118,7 @@ def _default_page(url: str, config: AppConfig) -> Iterator[FormPage]:
 
 def apply_via_form(
     job: Job,
-    filler: FormFiller,
+    filler: FormFiller | None,
     notifier: Notifier,
     repo: FormRepository,
     config: AppConfig,
@@ -130,6 +130,7 @@ def apply_via_form(
     cv_url: str,
     cover_letter_url: str,
     cover_letter_text: str | None = None,
+    filler_factory: Callable[[str], FormFiller] | None = None,
     page_factory: Callable[[str, AppConfig], AbstractContextManager[FormPage]] | None = None,
     now: Callable[[], datetime] | None = None,
     confirmation_nonce: str | None = None,
@@ -143,6 +144,13 @@ def apply_via_form(
     dispatches directly; otherwise the page is opened and
     ``detect_platform(url, page.content())`` identifies an embedded Greenhouse/Lever
     form, returning :attr:`FormApplyStatus.unsupported` for anything still unknown.
+
+    Exactly one of ``filler`` or ``filler_factory`` identifies the driver. A pre-built
+    ``filler`` is used when the platform is already known from the URL (and the
+    detected platform must match it). ``filler_factory`` is used by the local command
+    for an UNKNOWN company-careers URL: the page is opened, its rendered DOM is
+    detected, and the factory builds the matching Greenhouse/Lever filler for that
+    platform so the flow continues on the SAME guarded page (P8-012).
 
     ``cv_variant``, ``cv_url`` and ``cover_letter_url`` are the approved proposal's
     document metadata and are REQUIRED: a form submission must carry the same tracking
@@ -195,21 +203,36 @@ def apply_via_form(
         )
         return FormApplyResult(status=FormApplyStatus.unsupported)
 
+    if filler is None and filler_factory is None:
+        raise ValueError("apply_via_form requires either a filler or a filler_factory")
+
+    def resolve_filler(platform: str) -> FormFiller | None:
+        """Return the filler for ``platform``, or ``None`` on an unrecoverable mismatch.
+
+        With a ``filler_factory`` (DOM-only local path) the matching filler is built
+        for whatever platform the page turned out to be. With a pre-built ``filler``
+        the detected platform must equal it, otherwise the form is applied manually.
+        """
+        if filler_factory is not None:
+            return filler_factory(platform)
+        assert filler is not None
+        if platform != filler.platform.value:
+            log.info(
+                "form_apply_platform_mismatch",
+                job_id=job.id,
+                platform=platform,
+                filler=filler.platform.value,
+            )
+            notifier.send_message(
+                f"La oferta {job.id} usa {platform}, pero el llenador es "
+                f"{filler.platform.value}; aplícala manualmente."
+            )
+            return None
+        return filler
+
     # A URL match is enough to dispatch; otherwise open the page and let the DOM
     # identify an embedded Greenhouse/Lever form on a company careers domain.
     url_platform = detect_platform(url)
-    if url_platform is not None and url_platform != filler.platform.value:
-        log.info(
-            "form_apply_platform_mismatch",
-            job_id=job.id,
-            url_platform=url_platform,
-            filler=filler.platform.value,
-        )
-        notifier.send_message(
-            f"La oferta {job.id} usa {url_platform}, pero el llenador es "
-            f"{filler.platform.value}; aplícala manualmente."
-        )
-        return FormApplyResult(status=FormApplyStatus.unsupported)
 
     ctx = FillContext(
         job_id=job.id,
@@ -221,38 +244,32 @@ def apply_via_form(
     factory = page_factory or _default_page
     with factory(url, config) as page_obj:
         if url_platform is None:
-            # DOM-only detection: inspect the rendered page before touching anything.
-            dom_platform = detect_platform(url, page_obj.content())
-            if dom_platform is None:
+            # DOM-only detection: inspect the rendered page before touching anything,
+            # so an embedded Greenhouse/Lever form on a company careers domain whose
+            # URL gives nothing away is still handled (P8-012).
+            platform = detect_platform(url, page_obj.content())
+            if platform is None:
                 log.info("form_apply_unsupported", job_id=job.id, url=url, reason="unknown_dom")
                 notifier.send_message(
                     f"La oferta {job.id} no usa un formulario compatible; aplícala manualmente."
                 )
                 return FormApplyResult(status=FormApplyStatus.unsupported)
-            if dom_platform != filler.platform.value:
-                log.info(
-                    "form_apply_platform_mismatch",
-                    job_id=job.id,
-                    dom_platform=dom_platform,
-                    filler=filler.platform.value,
-                )
-                notifier.send_message(
-                    f"La oferta {job.id} usa {dom_platform}, pero el llenador es "
-                    f"{filler.platform.value}; aplícala manualmente."
-                )
-                return FormApplyResult(status=FormApplyStatus.unsupported)
-            platform = dom_platform
         else:
             platform = url_platform
+
+        active_filler = resolve_filler(platform)
+        if active_filler is None:
+            return FormApplyResult(status=FormApplyStatus.unsupported)
+
         try:
-            result = filler.fill_page(page_obj, ctx)
+            result = active_filler.fill_page(page_obj, ctx)
         except CaptchaError as exc:
             # CAPTCHA / anti-bot: stop and notify; never evade. A dedicated status so
             # the owner is told to take over, distinct from an unexpected-DOM abort.
-            return _handle_captcha(job, notifier, page_obj, filler, exc)
+            return _handle_captcha(job, notifier, page_obj, active_filler, exc)
         except FormStructureError as exc:
             # Unexpected form structure: safe abort with a screenshot, submit nothing.
-            return _handle_abort(job, notifier, page_obj, filler, exc)
+            return _handle_abort(job, notifier, page_obj, active_filler, exc)
 
         decision = request_submit_confirmation(notifier, job.id, result, nonce=confirmation_nonce)
         if decision is not SubmitDecision.submit:
@@ -277,18 +294,18 @@ def apply_via_form(
         # can retry; an AMBIGUOUS outcome keeps the claim for manual reconciliation.
         # NOTHING is recorded on any non-success path (R15.6/R15.7).
         try:
-            filler.submit(page_obj, ctx)
+            active_filler.submit(page_obj, ctx)
         except CaptchaError as exc:
             repo.release_form_submit(job.id)
-            return _handle_captcha(job, notifier, page_obj, filler, exc)
+            return _handle_captcha(job, notifier, page_obj, active_filler, exc)
         except FormStructureError as exc:
             repo.release_form_submit(job.id)
-            return _handle_abort(job, notifier, page_obj, filler, exc)
+            return _handle_abort(job, notifier, page_obj, active_filler, exc)
         except SubmitAmbiguousError as exc:
             # The click returned but acceptance could not be confirmed. Do NOT release
             # the claim: the remote site may already have accepted it, so block any
             # resubmission and ask the owner to reconcile it manually.
-            return _handle_ambiguous(job, notifier, page_obj, filler, exc)
+            return _handle_ambiguous(job, notifier, page_obj, active_filler, exc)
 
     try:
         application = _finalize(

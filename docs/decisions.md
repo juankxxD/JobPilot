@@ -115,3 +115,37 @@ Deferred to the durable-outbox iteration (ADR-011):
 These harden behaviour only under partial crashes; the happy-path send flow is
 guarded against double-send by the eligible-state check and the email claim, and is
 covered by tests.
+
+## ADR-013: Assisted-form safety is fail-safe by design, not an exhaustive classifier
+The Phase 8 review loop did not converge on the sensitive-question classifier: each
+pass found another natural-language phrasing or DOM shape that a deterministic rule
+set missed, because a rule set over arbitrary form text/HTML is inherently
+incomplete and can only be fully validated against a real browser and real
+Greenhouse/Lever forms (which is this phase's local done-criterion).
+
+Rather than chase an impossible "perfect" classifier, the design is fail-safe: the
+LLM is consulted for a form question ONLY when it is positively recognized as an
+open motivation/interest prompt (`is_confidently_non_sensitive`). Any question that
+is neither confidently non-sensitive nor served by an exact `answers_bank` match is
+left BLANK and reported to the owner (uncertain / unanswered_sensitive), and every
+such field appears in the pre-submit Telegram screenshot + uncertain-field list.
+A classifier gap therefore produces a visible blank the owner reviews, never a
+silent wrong or sensitive answer. This upholds R15.5 (never-LLM for sensitive) and
+the human-in-the-loop principle even when the classifier is imperfect.
+
+Residual items to verify LOCALLY with a real browser (tracked, not blocking; the
+fail-safe covers them until then):
+- Exact option label/value/selector matching for real `<select>`/radio controls and
+  required radio-group validation (P8-010) — depends on live DOM semantics the fakes
+  only approximate.
+- Lever cover-letter destination placement and pre-submit equality check against a
+  real Lever form (P8-011).
+- Post-dispatch CAPTCHA / click-timeout claim retention under a real network
+  (P8-013/P8-008): an ambiguous post-click outcome retains the durable submit claim
+  so a retry cannot duplicate; "stop + screenshot + notify" always fires.
+- Pre-submit Playwright interaction/DOM errors routed through the safe-abort path
+  (P8-014).
+These are exercised with mocked Playwright in CI and must be confirmed with
+`playwright install` against a real Greenhouse/Lever form before relying on assisted
+submit. The module never submits an incomplete form and never submits without the
+owner's explicit Enviar.

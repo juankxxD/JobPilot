@@ -504,9 +504,14 @@ class FakeFormQuestion(BaseModel):
     kind: FakeControlKind = "text"
     required: bool = False
     checked: bool = False
-    #: Selectable option values for a ``select``/``radio`` control, so a sensitive
+    #: Visible labels of a ``select``/``radio`` control's choices, so a sensitive
     #: answer from the bank is applied only when it exactly matches one offered choice.
     options: list[str] = []
+    #: Submit values of those choices, positional with ``options``. When omitted, the
+    #: label doubles as the value; when given, the fake models standard HTML where a
+    #: ``<option>``'s visible text differs from its ``value`` (e.g. label "No" /
+    #: value "false"), so the driver must select by value, not label (P8-010).
+    option_values: list[str] | None = None
 
     def control_selector(self) -> str:
         if self.control_id:
@@ -520,6 +525,25 @@ class FakeFormQuestion(BaseModel):
 
     def is_free_text(self) -> bool:
         return self.kind in _FREE_TEXT_KINDS
+
+    def option_pairs(self) -> list[tuple[str, str]]:
+        """Return (label, value) for each choice, defaulting the value to the label."""
+        values = self.option_values if self.option_values is not None else self.options
+        return [
+            (label, values[i] if i < len(values) else label) for i, label in enumerate(self.options)
+        ]
+
+    def radio_name(self) -> str:
+        """The shared ``name`` of this radio group (required for radios)."""
+        if self.control_name:
+            return self.control_name
+        if self.control_id:
+            return self.control_id
+        raise ValueError("a radio question needs a control name or id")
+
+    def radio_option_selector(self, value: str) -> str:
+        """Per-option selector targeting one radio of the group by its value."""
+        return f"input[name='{self.radio_name()}'][value='{value}']"
 
 
 class FakeFormElement:
@@ -536,7 +560,8 @@ class FakeFormElement:
         visible: bool = True,
         checked: bool = False,
         children: dict[str, FakeFormElement] | None = None,
-        options: list[str] | None = None,
+        options: list[tuple[str, str]] | None = None,
+        radios: list[FakeFormElement] | None = None,
     ) -> None:
         self._page = page
         self._attributes = attributes or {}
@@ -548,9 +573,13 @@ class FakeFormElement:
         # Optional CSS-selector -> child element map so a container can expose
         # different controls to different selectors (free-text vs. non-text).
         self._children = children or {}
-        # Selectable <option> values for a select/radio control, exposed through
-        # ``query_selector_all("option")`` so the driver can match a bank answer.
+        # (label, value) pairs for a <select>'s <option> children, exposed through
+        # ``query_selector_all("option")`` so the driver can match a bank answer by
+        # the visible label or the submit value (standard HTML).
         self._options = options or []
+        # Each ``input[type='radio']`` a radio-group container exposes, so the driver
+        # can discover the whole group and check the exact matching sibling (P8-010).
+        self._radios = radios or []
 
     def get_attribute(self, name: str) -> str | None:
         return self._attributes.get(name)
@@ -578,9 +607,11 @@ class FakeFormElement:
     def query_selector_all(self, selector: str) -> list[FormElement]:
         if _selector_matches(selector, "option"):
             return [
-                FakeFormElement(self._page, attributes={"value": value}, inner_text=value)
-                for value in self._options
+                FakeFormElement(self._page, attributes={"value": value}, inner_text=label)
+                for label, value in self._options
             ]
+        if _selector_matches(selector, "input[type='radio']") and self._radios:
+            return list(self._radios)
         return [
             element for css, element in self._children.items() if _selector_matches(selector, css)
         ]
@@ -618,9 +649,14 @@ class FakeFormPage:
         self._present_after_click = set(present_after_click)
         self._click_raises = click_raises
         # A question's derived control selector is present too, so the driver can
-        # fill it and required-field validation can read its value back.
+        # fill it and required-field validation can read its value back. A radio
+        # group also registers each per-option selector (``input[name=…][value=…]``)
+        # so the driver can target and check the exact matching sibling (P8-010).
         for question in self._questions:
             self._present.add(question.control_selector())
+            if question.kind == "radio":
+                for _label, value in question.option_pairs():
+                    self._present.add(question.radio_option_selector(value))
         self.filled: dict[str, str] = {}
         self.uploaded: dict[str, str] = {}
         self.clicked: list[str] = []
@@ -632,6 +668,13 @@ class FakeFormPage:
         self._questions_by_selector: dict[str, FakeFormQuestion] = {
             q.control_selector(): q for q in self._questions
         }
+        # Reverse map a radio group's per-option selector to (question, value), so
+        # ``query_selector``/``check`` on one option resolves the right radio.
+        self._radio_option_by_selector: dict[str, tuple[FakeFormQuestion, str]] = {}
+        for q in self._questions:
+            if q.kind == "radio":
+                for _label, value in q.option_pairs():
+                    self._radio_option_by_selector[q.radio_option_selector(value)] = (q, value)
 
     def content(self) -> str:
         return self._dom
@@ -657,18 +700,27 @@ class FakeFormPage:
     def _is_checked(self, selector: str, question: FakeFormQuestion | None) -> bool:
         if selector in self._checked:
             return True
+        if question is not None and question.kind == "radio":
+            # A radio group reads "checked" when ANY of its options is checked, which
+            # is how completeness must treat a group (one selected option is enough).
+            for _label, value in question.option_pairs():
+                if question.radio_option_selector(value) in self._checked:
+                    return True
         return bool(question and question.checked)
 
     def query_selector(self, selector: str) -> FormElement | None:
+        # A per-option radio selector resolves to that single radio input.
+        radio = self._radio_option_by_selector.get(selector)
+        if radio is not None:
+            radio_question, radio_value = radio
+            return self._radio_input(radio_question, radio_value)
         if selector not in self._present:
             return None
         question = self._questions_by_selector.get(selector)
         attrs: dict[str, str] = {"id": selector.lstrip("#")}
-        options: list[str] = []
-        if question is not None and question.kind in {"select", "radio"}:
-            options = list(question.options)
-            if question.kind == "radio" and options:
-                attrs["value"] = options[0]
+        options: list[tuple[str, str]] = []
+        if question is not None and question.kind == "select":
+            options = question.option_pairs()
         return FakeFormElement(
             self,
             attributes=attrs,
@@ -676,6 +728,20 @@ class FakeFormPage:
             visible=selector not in self._hidden,
             checked=self._is_checked(selector, question),
             options=options,
+        )
+
+    def _radio_input(self, question: FakeFormQuestion, value: str) -> FakeFormElement:
+        """Build one ``input[type='radio']`` of ``question``'s group for ``value``."""
+        selector = question.radio_option_selector(value)
+        attrs: dict[str, str] = {"type": "radio", "name": question.radio_name(), "value": value}
+        if question.required:
+            attrs["required"] = "required"
+        return FakeFormElement(
+            self,
+            attributes=attrs,
+            value_selector=selector,
+            visible=selector not in self._hidden,
+            checked=selector in self._checked,
         )
 
     def _question_control(self, question: FakeFormQuestion) -> FakeFormElement:
@@ -694,15 +760,21 @@ class FakeFormPage:
             attrs["type"] = "text"
         if question.required:
             attrs["required"] = "required"
-        options: list[str] = []
-        if question.kind in {"select", "radio"}:
-            options = list(question.options)
+        options: list[tuple[str, str]] = []
+        radios: list[FakeFormElement] = []
+        if question.kind == "select":
+            options = question.option_pairs()
+        elif question.kind == "radio":
+            radios = [
+                self._radio_input(question, value) for _label, value in question.option_pairs()
+            ]
         return FakeFormElement(
             self,
             attributes=attrs,
             value_selector=question.control_selector(),
             checked=self._is_checked(question.control_selector(), question),
             options=options,
+            radios=radios,
         )
 
     def query_selector_all(self, selector: str) -> list[FormElement]:
@@ -717,10 +789,19 @@ class FakeFormPage:
             if question.container_selector != selector:
                 continue
             control = self._question_control(question)
+            children = {question.control_css(): control}
             container = FakeFormElement(
                 self,
                 inner_text=question.label,
-                children={question.control_css(): control},
+                children=children,
+                radios=(
+                    [
+                        self._radio_input(question, value)
+                        for _label, value in question.option_pairs()
+                    ]
+                    if question.kind == "radio"
+                    else []
+                ),
             )
             elements.append(container)
         return elements

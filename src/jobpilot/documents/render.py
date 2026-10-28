@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markupsafe import Markup
 
 from jobpilot.config import Language
 from jobpilot.models import Attachment
@@ -55,8 +56,13 @@ def _env() -> Environment:
 
 
 @lru_cache(maxsize=1)
-def _styles() -> str:
-    return (TEMPLATES_DIR / "styles.css").read_text(encoding="utf-8")
+def _styles() -> Markup:
+    # Inject our own trusted CSS verbatim. It must NOT be HTML-escaped: autoescape
+    # would turn characters like the quotes in `font-family: "Helvetica"` into
+    # entities, producing invalid CSS that WeasyPrint drops ("Stop token reached
+    # before {} block"), which breaks the ATS layout and header order. Autoescape
+    # stays ON for all data fields (name, summary, ...), which is the safe default.
+    return Markup((TEMPLATES_DIR / "styles.css").read_text(encoding="utf-8"))
 
 
 def count_words(text: str) -> int:

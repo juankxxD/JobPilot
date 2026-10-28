@@ -1,0 +1,57 @@
+name: ci
+
+# Quality gate: lint, format check, strict typing, and the full test suite.
+# This job installs the WeasyPrint native libraries and the dev extra so the
+# PDF/ATS tests actually RUN here (they skip locally when pango/cairo are
+# absent). CI=true forces those tests to execute and to fail — never skip — on a
+# missing library or a rendering regression.
+on:
+  push:
+    branches: ["**"]
+  pull_request: {}
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries for WeasyPrint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libffi-dev
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (with dev extra)
+        # Phase 8's `forms`/playwright extra is intentionally NOT installed: its
+        # tests mock Playwright, so no browser is needed and none runs in CI.
+        # setup-uv already provisions a venv and exports VIRTUAL_ENV, so install
+        # into it (no --system: the runner's system Python is externally managed,
+        # PEP 668). `uv run` below uses that same venv automatically.
+        run: uv pip install -e ".[dev]"
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy .
+
+      - name: Test
+        # CI=true (job env) makes conftest run the WeasyPrint PDF/ATS tests rather
+        # than skip them, so both-language rendering and ATS header order are
+        # verified against the installed native libraries.
+        run: uv run pytest

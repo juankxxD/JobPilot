@@ -98,12 +98,11 @@ def apply_to_approved_job_via_form(
             f"La oferta {job_id} es de LinkedIn/Indeed (fuera de alcance); aplícala manualmente."
         )
         return FormApplyResult(status=FormApplyStatus.unsupported)
-    platform = detect_platform(url)
-    if platform is None:
-        notifier.send_message(
-            f"La oferta {job_id} no tiene una URL de formulario compatible; aplícala manualmente."
-        )
-        return FormApplyResult(status=FormApplyStatus.unsupported)
+    # A URL match gives the platform up front; an unknown (non-LinkedIn/Indeed) URL is
+    # NOT rejected here — an embedded Greenhouse/Lever form on a company careers domain
+    # is only visible in the rendered DOM, so the page is opened and detected inside
+    # ``apply_via_form`` via a filler factory (P8-012).
+    url_platform = detect_platform(url)
 
     artifacts = _load_proposal_artifacts(repo, job)
     if artifacts.cv is None or artifacts.cover_letter is None:
@@ -114,7 +113,16 @@ def apply_to_approved_job_via_form(
         return FormApplyResult(status=FormApplyStatus.unsupported)
 
     language = job.language or artifacts.language
-    filler = _build_filler(platform, profile, llm, config, job.analysis)
+
+    # When the URL identifies the platform, build the filler up front. Otherwise defer
+    # to a factory that ``apply_via_form`` calls AFTER detecting the rendered DOM, so
+    # an embedded Greenhouse/Lever form on a company domain is handled on the same
+    # guarded page (P8-012). Anything the DOM still cannot identify is applied manually.
+    def make_filler(platform: str) -> FormFiller:
+        return _build_filler(platform, profile, llm, config, job.analysis)
+
+    filler = make_filler(url_platform) if url_platform is not None else None
+    filler_factory = None if url_platform is not None else make_filler
 
     # Write the exact approved PDFs to temp files for upload; they are removed when
     # the flow returns. The cover-letter TEXT is passed for platforms with no
@@ -125,7 +133,7 @@ def apply_to_approved_job_via_form(
         cover_path = _write_temp(
             tmp_dir, artifacts.cover_letter.filename, artifacts.cover_letter.content
         )
-        log.info("form_local_apply_start", job_id=job_id, platform=platform)
+        log.info("form_local_apply_start", job_id=job_id, url_platform=url_platform)
         return apply_via_form(
             job,
             filler,
@@ -139,6 +147,7 @@ def apply_to_approved_job_via_form(
             cv_url=_require_url(artifacts, "cv_url"),
             cover_letter_url=_require_url(artifacts, "cover_letter_url"),
             cover_letter_text=artifacts.cover_letter_body or None,
+            filler_factory=filler_factory,
         )
 
 
