@@ -136,44 +136,148 @@ def test_no_drive_auth_configured_fails_clearly() -> None:
 
 
 class _FakeFlow:
-    def __init__(self, refresh_token: str | None) -> None:
-        self._refresh_token = refresh_token
-        self.run_kwargs: dict[str, Any] = {}
+    """Stands in for InstalledAppFlow: no network, no browser."""
 
-    def run_local_server(self, **kwargs: Any) -> Any:
-        self.run_kwargs = kwargs
+    def __init__(self, refresh_token: str | None) -> None:
+        self.redirect_uri: str | None = None
+        self.auth_kwargs: dict[str, Any] = {}
+        self.fetched_with: str | None = None
 
         class _Creds:
-            refresh_token = self._refresh_token
+            pass
 
-        return _Creds()
+        self.credentials = _Creds()
+        self.credentials.refresh_token = refresh_token  # type: ignore[attr-defined]
+
+    def authorization_url(self, **kwargs: Any) -> tuple[str, str]:
+        self.auth_kwargs = kwargs
+        return "https://accounts.example/auth?x=1", "state-1"
+
+    def fetch_token(self, *, authorization_response: str) -> None:
+        self.fetched_with = authorization_response
 
 
-def test_obtain_refresh_token_returns_token_and_requests_offline_consent() -> None:
+def _run_consent(
+    flow: _FakeFlow, redirect: str = "http://localhost:9090/?code=abc&state=state-1"
+) -> tuple[str, dict[str, Any]]:
     from jobpilot.storage.drive import obtain_refresh_token
 
-    flow = _FakeFlow("the-refresh-token")
-    seen: dict[str, Any] = {}
+    seen: dict[str, Any] = {"opened": [], "announced": []}
 
     def factory(config: dict[str, Any], scopes: list[str]) -> _FakeFlow:
         seen["config"] = config
         seen["scopes"] = scopes
         return flow
 
-    token = obtain_refresh_token("cid", "csecret", port=9090, flow_factory=factory)
+    token = obtain_refresh_token(
+        "cid",
+        "csecret",
+        port=9090,
+        flow_factory=factory,
+        open_url=seen["opened"].append,
+        announce=seen["announced"].append,
+        wait=lambda _port: redirect,
+    )
+    return token, seen
+
+
+def test_obtain_refresh_token_returns_token_and_requests_offline_consent() -> None:
+    flow = _FakeFlow("the-refresh-token")
+
+    token, seen = _run_consent(flow)
 
     assert token == "the-refresh-token"
     assert seen["config"]["installed"]["client_id"] == "cid"
     assert seen["config"]["installed"]["redirect_uris"] == ["http://localhost:9090/"]
     assert seen["scopes"] == ["https://www.googleapis.com/auth/drive"]
-    # offline + consent is what forces Google to issue a refresh token.
-    assert flow.run_kwargs["access_type"] == "offline"
-    assert flow.run_kwargs["prompt"] == "consent"
-    assert flow.run_kwargs["port"] == 9090
+    assert flow.redirect_uri == "http://localhost:9090/"
+    # offline + consent forces a refresh token; select_account shows the chooser.
+    assert flow.auth_kwargs["access_type"] == "offline"
+    assert flow.auth_kwargs["prompt"] == "select_account consent"
+    # The consent page is opened and its URL is also printed as a fallback.
+    assert seen["opened"] == ["https://accounts.example/auth?x=1"]
+    assert "https://accounts.example/auth?x=1" in seen["announced"][0]
+    # The authorization code from the redirect is exchanged for tokens.
+    assert flow.fetched_with == "http://localhost:9090/?code=abc&state=state-1"
+
+
+def test_obtain_refresh_token_restores_insecure_transport_env() -> None:
+    import os
+
+    os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
+    _run_consent(_FakeFlow("t"))
+    assert "OAUTHLIB_INSECURE_TRANSPORT" not in os.environ
 
 
 def test_obtain_refresh_token_errors_when_google_returns_none() -> None:
-    from jobpilot.storage.drive import DriveAuthError, obtain_refresh_token
+    from jobpilot.storage.drive import DriveAuthError
 
     with pytest.raises(DriveAuthError, match="refresh token"):
-        obtain_refresh_token("cid", "csecret", flow_factory=lambda c, s: _FakeFlow(None))
+        _run_consent(_FakeFlow(None))
+
+
+def test_obtain_refresh_token_reports_a_google_error_redirect() -> None:
+    from jobpilot.storage.drive import DriveAuthError
+
+    flow = _FakeFlow("t")
+    with pytest.raises(DriveAuthError, match="access_denied"):
+        _run_consent(flow, redirect="http://localhost:9090/?error=access_denied")
+    assert flow.fetched_with is None
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("localhost", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_wait_for_redirect_survives_junk_requests_before_the_real_one() -> None:
+    """Regression: a TLS handshake on the HTTP port consumed the one-shot server.
+
+    The browser hit the port with HTTPS first; the old server spent its only request
+    on that junk and then timed out with no code. The tolerant server must ignore it.
+    """
+    import contextlib
+    import socket
+    import threading
+    import urllib.request
+
+    from jobpilot.storage.drive import wait_for_redirect
+
+    port = _free_port()
+    result: dict[str, str] = {}
+    thread = threading.Thread(
+        target=lambda: result.update(url=wait_for_redirect(port, timeout=20)), daemon=True
+    )
+    thread.start()
+
+    def connect_with_retry() -> socket.socket:
+        import time
+
+        for _ in range(50):
+            try:
+                return socket.create_connection(("localhost", port), timeout=2)
+            except OSError:
+                time.sleep(0.1)
+        raise AssertionError("redirect server did not start")
+
+    # 1) raw TLS ClientHello-like garbage, exactly what the browser sent
+    with connect_with_retry() as junk:
+        junk.sendall(b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03V$n\xd7[\x07\x16U")
+    # 2) a stray favicon request
+    with contextlib.suppress(Exception):  # a 404 is expected and irrelevant here
+        urllib.request.urlopen(f"http://localhost:{port}/favicon.ico", timeout=3)  # noqa: S310
+    # 3) the real redirect carrying the code
+    urllib.request.urlopen(f"http://localhost:{port}/?code=real-code&state=s", timeout=3).read()  # noqa: S310
+
+    thread.join(timeout=10)
+    assert result["url"] == f"http://localhost:{port}/?code=real-code&state=s"
+
+
+def test_wait_for_redirect_times_out_with_a_clear_error() -> None:
+    from jobpilot.storage.drive import DriveAuthError, wait_for_redirect
+
+    with pytest.raises(DriveAuthError, match="Timed out"):
+        wait_for_redirect(_free_port(), timeout=1.5)

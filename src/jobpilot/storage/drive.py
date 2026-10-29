@@ -20,8 +20,13 @@ Two authentication modes are supported:
 from __future__ import annotations
 
 import json
+import os
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+from urllib.parse import parse_qs, urlparse
 
 from jobpilot.config import Settings, get_settings
 from jobpilot.logging import get_logger
@@ -119,20 +124,81 @@ def build_drive_client(settings: Settings) -> DriveClient:
     return client
 
 
+_SUCCESS_PAGE = (
+    b"<html><body style='font-family:sans-serif'><h2>JobPilot: authorization received."
+    b"</h2><p>You can close this tab and return to the terminal.</p></body></html>"
+)
+
+
+class _RedirectCapture(HTTPServer):
+    """HTTP server that remembers the first request carrying an OAuth result."""
+
+    redirect_path: str | None = None
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    server: _RedirectCapture
+
+    def do_GET(self) -> None:
+        params = parse_qs(urlparse(self.path).query)
+        if "code" in params or "error" in params:
+            self.server.redirect_path = self.path
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(_SUCCESS_PAGE)
+        else:
+            # favicon, probes and other stray requests: ignore and keep listening.
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        return None
+
+
+def wait_for_redirect(port: int, timeout: float = 300.0) -> str:
+    """Listen on ``localhost:port`` until the OAuth redirect arrives; return its URL.
+
+    Unlike a one-shot server, this keeps serving until a request that actually carries
+    the authorization ``code`` (or an ``error``) shows up. Browsers sometimes send
+    unrelated or malformed requests first (an HTTPS handshake to a plain-HTTP port, a
+    favicon fetch); a one-shot server would spend its single request on that junk and
+    fail. Junk is answered and ignored here.
+    """
+    server = _RedirectCapture(("localhost", port), _RedirectHandler)
+    server.timeout = 1.0
+    deadline = time.monotonic() + timeout
+    try:
+        while server.redirect_path is None:
+            if time.monotonic() > deadline:
+                raise DriveAuthError(
+                    f"Timed out after {int(timeout)}s waiting for the Google redirect."
+                )
+            server.handle_request()
+    finally:
+        server.server_close()
+    return f"http://localhost:{port}{server.redirect_path}"
+
+
 def obtain_refresh_token(
     client_id: str,
     client_secret: str,
     *,
     port: int = DEFAULT_CONSENT_PORT,
     flow_factory: Callable[[dict[str, Any], list[str]], Any] | None = None,
+    open_url: Callable[[str], object] | None = None,
+    announce: Callable[[str], object] | None = None,
+    wait: Callable[[int], str] | None = None,
 ) -> str:
     """Run the one-time interactive OAuth consent and return a Drive refresh token.
 
-    Opens the browser on a local redirect (``http://localhost:<port>/``). The owner
-    signs in with the Google account that should own the uploaded files and grants
-    Drive access. ``access_type=offline`` plus ``prompt=consent`` forces Google to
-    issue a refresh token even if the app was authorized before. ``flow_factory`` is
-    injectable so tests never open a browser.
+    Opens the browser on Google's consent page with a local redirect
+    (``http://localhost:<port>/``). The owner signs in with the account that should own
+    the uploaded files and grants Drive access. ``access_type=offline`` plus the
+    ``consent`` prompt forces Google to issue a refresh token even if the app was
+    authorized before, and ``select_account`` always shows the account chooser. The
+    browser, the redirect listener and the OAuth flow are injectable so tests never
+    open a browser or a socket.
     """
     client_config = {
         "installed": {
@@ -149,11 +215,37 @@ def obtain_refresh_token(
         def flow_factory(config: dict[str, Any], scopes: list[str]) -> Any:
             return InstalledAppFlow.from_client_config(config, scopes=scopes)
 
+    if open_url is None:
+        open_url = webbrowser.open
+    if wait is None:
+        wait = wait_for_redirect
+
     flow = flow_factory(client_config, _SCOPES)
-    creds = flow.run_local_server(
-        port=port, access_type="offline", prompt="consent", open_browser=True
+    flow.redirect_uri = f"http://localhost:{port}/"
+    auth_url, _state = flow.authorization_url(
+        access_type="offline", prompt="select_account consent"
     )
-    token = getattr(creds, "refresh_token", None)
+    if announce is not None:
+        announce(f"If the browser does not open, visit this URL:\n{auth_url}")
+    open_url(auth_url)
+
+    redirect_url = wait(port)
+    if "error=" in redirect_url and "code=" not in redirect_url:
+        raise DriveAuthError(f"Google returned an error: {urlparse(redirect_url).query}")
+
+    # oauthlib refuses a non-HTTPS redirect unless this is set; the redirect is to
+    # localhost on this machine, which is what Google allows for installed apps.
+    previous = os.environ.get("OAUTHLIB_INSECURE_TRANSPORT")
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    try:
+        flow.fetch_token(authorization_response=redirect_url)
+    finally:
+        if previous is None:
+            os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
+        else:
+            os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = previous
+
+    token = getattr(flow.credentials, "refresh_token", None)
     if not token:
         raise DriveAuthError(
             "Google did not return a refresh token. Revoke the app's access at "

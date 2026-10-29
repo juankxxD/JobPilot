@@ -150,7 +150,7 @@ def auth_drive(
         f"http://localhost:{port}/ is an authorized redirect URI."
     )
     try:
-        token = obtain_refresh_token(client_id, client_secret, port=port)
+        token = obtain_refresh_token(client_id, client_secret, port=port, announce=typer.echo)
     except DriveAuthError as exc:
         typer.echo(f"auth-drive failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
