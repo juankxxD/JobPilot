@@ -65,9 +65,15 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_owner_chat_id: str | None = None
 
-    # Google Drive
+    # Google Drive. Two auth modes: a service account (no storage quota of its own,
+    # so it only works with a Shared Drive) or user OAuth (files are owned by the
+    # authorizing account). OAuth is used whenever DRIVE_REFRESH_TOKEN is set; the
+    # OAuth client defaults to the Google client configured for Gmail.
     google_service_account_json: str | None = None
     drive_folder_id: str | None = None
+    drive_refresh_token: str | None = None
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
 
     # Mail provider selection
     mail_provider: MailProvider = MailProvider.outlook
@@ -91,6 +97,16 @@ class Settings(BaseSettings):
     min_score: int = 70
     daily_application_limit: int = 5
     default_language: Language = Language.es
+
+    @property
+    def drive_oauth_client_id(self) -> str | None:
+        """OAuth client id for Drive: the dedicated value, else the Gmail client."""
+        return self.google_oauth_client_id or self.gmail_client_id
+
+    @property
+    def drive_oauth_client_secret(self) -> str | None:
+        """OAuth client secret for Drive: the dedicated value, else the Gmail client."""
+        return self.google_oauth_client_secret or self.gmail_client_secret
 
 
 # --------------------------------------------------------------------------- #

@@ -120,6 +120,48 @@ def auth_mail() -> None:
     typer.echo(refresh_token)
 
 
+@app.command("auth-drive")
+def auth_drive(
+    port: int = typer.Option(8080, "--port", help="Local port for the OAuth redirect."),
+) -> None:
+    """Obtain a Google Drive refresh token via the browser OAuth consent (LOCAL).
+
+    Opens your browser so you sign in with the Google account that should own the
+    uploaded CVs, then prints the refresh token to store as ``DRIVE_REFRESH_TOKEN``.
+    Uses GOOGLE_OAUTH_CLIENT_ID/SECRET, or the GMAIL_CLIENT_ID/SECRET Google client.
+    """
+    from jobpilot.config import get_settings
+    from jobpilot.storage.drive import DriveAuthError, obtain_refresh_token
+
+    settings = get_settings()
+    client_id = settings.drive_oauth_client_id
+    client_secret = settings.drive_oauth_client_secret
+    if not client_id or not client_secret:
+        typer.echo("Cannot run auth-drive: no Google OAuth client configured.", err=True)
+        typer.echo(
+            "Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (or "
+            "GMAIL_CLIENT_ID/SECRET) in your .env.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"Opening your browser. If the OAuth client is a Web type, make sure "
+        f"http://localhost:{port}/ is an authorized redirect URI."
+    )
+    try:
+        token = obtain_refresh_token(client_id, client_secret, port=port, announce=typer.echo)
+    except DriveAuthError as exc:
+        typer.echo(f"auth-drive failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001 - surface a clear message, not a traceback
+        typer.echo(f"auth-drive failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("\nAuthentication successful. Store this value as DRIVE_REFRESH_TOKEN:\n")
+    typer.echo(token)
+
+
 @app.command()
 def run() -> None:
     """Run the full pipeline once: collect, score, propose and process approvals."""

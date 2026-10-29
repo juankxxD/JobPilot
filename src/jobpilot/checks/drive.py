@@ -1,46 +1,31 @@
-"""Verify the Google Drive service-account credential.
+"""Verify the Google Drive credential (user OAuth or service account).
 
-Confirms the configured folder is reachable with the service account.
+Confirms the configured folder is reachable with whichever auth mode is configured.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from jobpilot.checks.base import CheckResult, missing
 from jobpilot.config import get_settings
-
-_SCOPES = ["https://www.googleapis.com/auth/drive"]
-
-
-def _load_service_account_info(value: str) -> dict[str, object]:
-    """Accept either a path to a JSON file or inline JSON."""
-    candidate = Path(value)
-    raw = candidate.read_text(encoding="utf-8") if candidate.exists() else value
-    data: dict[str, object] = json.loads(raw)
-    return data
 
 
 def check_drive() -> CheckResult:
     settings = get_settings()
-    if not settings.google_service_account_json:
-        return missing("Drive", "GOOGLE_SERVICE_ACCOUNT_JSON")
     if not settings.drive_folder_id:
         return missing("Drive", "DRIVE_FOLDER_ID")
+    if not settings.drive_refresh_token and not settings.google_service_account_json:
+        return missing("Drive", "DRIVE_REFRESH_TOKEN (run `jobpilot auth-drive`)")
 
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
+        from jobpilot.storage.drive import build_drive_client, uses_oauth
 
-        info = _load_service_account_info(settings.google_service_account_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        service = build_drive_client(settings)
         meta = (
             service.files()
             .get(fileId=settings.drive_folder_id, fields="id,name", supportsAllDrives=True)
             .execute()
         )
-        return CheckResult("Drive", True, f"folder reachable: '{meta.get('name')}'")
+        mode = "OAuth" if uses_oauth(settings) else "service account"
+        return CheckResult("Drive", True, f"folder reachable via {mode}: '{meta.get('name')}'")
     except Exception as exc:  # noqa: BLE001
         return CheckResult("Drive", False, f"connection failed: {exc}")

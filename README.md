@@ -288,6 +288,7 @@ jobpilot check-all        # verifica cada credencial (Groq, Neon, Telegram, Driv
 jobpilot migrate          # aplica las migraciones de la base de datos
 jobpilot import-cv CV.pdf # importa tu CV a un borrador revisable
 jobpilot auth-mail        # consentimiento OAuth único para el correo (Outlook/Graph)
+jobpilot auth-drive       # consentimiento OAuth único para Google Drive (abre el navegador)
 jobpilot run              # ejecuta el pipeline completo una vez
 jobpilot apply-form <id>  # modo asistido de formulario, LOCAL (requiere `playwright install`)
 ```
@@ -318,7 +319,8 @@ Las credenciales se configuran al final. Para confirmar que todo conecta:
 | Groq | `GROQ_API_KEY`, `GROQ_MODEL` |
 | Neon (Postgres) | `DATABASE_URL` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_CHAT_ID` |
-| Google Drive | `GOOGLE_SERVICE_ACCOUNT_JSON`, `DRIVE_FOLDER_ID` |
+| Google Drive (OAuth, recomendado) | `DRIVE_FOLDER_ID`, `DRIVE_REFRESH_TOKEN`, `GOOGLE_OAUTH_CLIENT_ID/SECRET` (o `GMAIL_CLIENT_ID/SECRET`) |
+| Google Drive (cuenta de servicio, solo Shared Drive) | `GOOGLE_SERVICE_ACCOUNT_JSON`, `DRIVE_FOLDER_ID` |
 | Outlook (Graph, default) | `GRAPH_CLIENT_ID`, `GRAPH_TENANT_ID`, `GRAPH_REFRESH_TOKEN` |
 | Gmail (alternativa) | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN` |
 

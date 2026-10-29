@@ -33,3 +33,15 @@ htmlcov/
 
 # uv
 # keep uv.lock tracked; nothing to ignore here
+
+# Google / OAuth credentials (never commit)
+google-service-account*.json
+*service-account*.json
+*service_account*.json
+client_secret*.json
+credentials*.json
+token*.json
+
+# Local workflow artifacts and worktrees
+.worktrees/
+.agents/

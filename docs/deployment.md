@@ -60,7 +60,7 @@ from `.env.example` (plus `PROFILE_YAML`); nothing secret is ever committed.
 | `TELEGRAM_BOT_TOKEN` | yes | Telegram bot token |
 | `TELEGRAM_OWNER_CHAT_ID` | yes | Your chat id (the only chat the bot answers) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | yes | Service-account JSON for Drive uploads |
-| `DRIVE_FOLDER_ID` | yes | Target Drive folder id |
+| `DRIVE_FOLDER_ID`, `DRIVE_REFRESH_TOKEN`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | yes | Drive folder id plus user-OAuth credentials (see ADR-014) |
 | `MAIL_FROM_ADDRESS` | yes | Sender address used by the mailer |
 | `GRAPH_CLIENT_ID` / `GRAPH_REFRESH_TOKEN` | if `MAIL_PROVIDER=outlook` | Outlook via Microsoft Graph (default mailer) |
 | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN` | if `MAIL_PROVIDER=gmail` | Gmail mailer |
