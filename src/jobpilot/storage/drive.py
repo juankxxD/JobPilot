@@ -1,11 +1,20 @@
 """Google Drive implementation of the :class:`~jobpilot.interfaces.FileStorage`
 Protocol.
 
-``DriveFileStorage`` uploads a generated document to a Drive folder with a service
-account and returns a :class:`~jobpilot.models.StoredFile` carrying the file's
-``web_view_link``. The Drive client is built lazily (and can be injected in tests),
-and the whole backend sits behind the ``FileStorage`` Protocol, so a Cloudflare R2
-(or other) backend can replace it without touching any caller.
+``DriveFileStorage`` uploads a generated document to a Drive folder and returns a
+:class:`~jobpilot.models.StoredFile` carrying the file's ``web_view_link``. The Drive
+client is built lazily (and can be injected in tests), and the whole backend sits
+behind the ``FileStorage`` Protocol, so a Cloudflare R2 (or other) backend can
+replace it without touching any caller.
+
+Two authentication modes are supported:
+
+* **User OAuth** (used whenever ``DRIVE_REFRESH_TOKEN`` is set): files are created
+  as the authorizing Google account, so they count against that account's quota.
+  This is the mode for a personal Google account. Obtain the token once with
+  ``jobpilot auth-drive``.
+* **Service account**: a service account has no storage quota of its own, so this
+  only works when the folder lives in a Shared Drive the account belongs to.
 """
 
 from __future__ import annotations
@@ -19,11 +28,20 @@ from jobpilot.logging import get_logger
 from jobpilot.models import StoredFile
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 log = get_logger(__name__)
 
-_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+# Full Drive scope: ``drive.file`` only grants access to files this app created, so
+# it cannot write into the owner's pre-existing folder (DRIVE_FOLDER_ID).
+_SCOPES = ["https://www.googleapis.com/auth/drive"]
+_TOKEN_URI = "https://oauth2.googleapis.com/token"  # noqa: S105 - public endpoint, not a secret
+_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
+DEFAULT_CONSENT_PORT = 8080
+
+
+class DriveAuthError(RuntimeError):
+    """Raised when Drive OAuth cannot be configured or the consent flow fails."""
 
 
 class DriveClient(Protocol):
@@ -50,18 +68,98 @@ def _guess_mime_type(path: Path) -> str:
     return "application/octet-stream"
 
 
-def build_drive_client(settings: Settings) -> DriveClient:
-    """Build a real Drive v3 client from the service-account settings (lazy imports)."""
+def uses_oauth(settings: Settings) -> bool:
+    """Return whether Drive should authenticate as the user (OAuth refresh token)."""
+    return bool(settings.drive_refresh_token)
+
+
+def build_drive_credentials(settings: Settings) -> Any:
+    """Build Google credentials for Drive from OAuth when configured, else a service account.
+
+    OAuth needs the refresh token plus the OAuth client id and secret; the access
+    token is minted on demand from the refresh token, so nothing short-lived is
+    stored. Imports are lazy because the Google libraries are heavy.
+    """
+    if uses_oauth(settings):
+        client_id = settings.drive_oauth_client_id
+        client_secret = settings.drive_oauth_client_secret
+        if not client_id or not client_secret:
+            raise DriveAuthError(
+                "Drive OAuth needs GOOGLE_OAUTH_CLIENT_ID/SECRET (or GMAIL_CLIENT_ID/SECRET)"
+            )
+        from google.oauth2.credentials import Credentials  # noqa: PLC0415 - lazy dep
+
+        return Credentials(
+            token=None,
+            refresh_token=settings.drive_refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri=_TOKEN_URI,
+            scopes=_SCOPES,
+        )
+
     if not settings.google_service_account_json:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured")
-    from google.oauth2 import service_account  # noqa: PLC0415 - optional, lazy dep
+        raise ValueError(
+            "Drive is not configured: set DRIVE_REFRESH_TOKEN (OAuth, run "
+            "`jobpilot auth-drive`) or GOOGLE_SERVICE_ACCOUNT_JSON"
+        )
+    from google.oauth2 import service_account  # noqa: PLC0415 - lazy dep
+
+    info = _load_service_account_info(settings.google_service_account_json)
+    return service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+
+
+def build_drive_client(settings: Settings) -> DriveClient:
+    """Build a real Drive v3 client for the configured auth mode (lazy imports)."""
     from googleapiclient.discovery import build  # noqa: PLC0415 - optional, lazy dep
     from googleapiclient.http import MediaFileUpload  # noqa: F401, PLC0415 - import check
 
-    info = _load_service_account_info(settings.google_service_account_json)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+    creds = build_drive_credentials(settings)
     client: DriveClient = build("drive", "v3", credentials=creds, cache_discovery=False)
     return client
+
+
+def obtain_refresh_token(
+    client_id: str,
+    client_secret: str,
+    *,
+    port: int = DEFAULT_CONSENT_PORT,
+    flow_factory: Callable[[dict[str, Any], list[str]], Any] | None = None,
+) -> str:
+    """Run the one-time interactive OAuth consent and return a Drive refresh token.
+
+    Opens the browser on a local redirect (``http://localhost:<port>/``). The owner
+    signs in with the Google account that should own the uploaded files and grants
+    Drive access. ``access_type=offline`` plus ``prompt=consent`` forces Google to
+    issue a refresh token even if the app was authorized before. ``flow_factory`` is
+    injectable so tests never open a browser.
+    """
+    client_config = {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": _AUTH_URI,
+            "token_uri": _TOKEN_URI,
+            "redirect_uris": [f"http://localhost:{port}/"],
+        }
+    }
+    if flow_factory is None:
+        from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415 - lazy dep
+
+        def flow_factory(config: dict[str, Any], scopes: list[str]) -> Any:
+            return InstalledAppFlow.from_client_config(config, scopes=scopes)
+
+    flow = flow_factory(client_config, _SCOPES)
+    creds = flow.run_local_server(
+        port=port, access_type="offline", prompt="consent", open_browser=True
+    )
+    token = getattr(creds, "refresh_token", None)
+    if not token:
+        raise DriveAuthError(
+            "Google did not return a refresh token. Revoke the app's access at "
+            "https://myaccount.google.com/permissions and run the consent again."
+        )
+    return str(token)
 
 
 class DriveFileStorage:

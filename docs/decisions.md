@@ -149,3 +149,23 @@ These are exercised with mocked Playwright in CI and must be confirmed with
 `playwright install` against a real Greenhouse/Lever form before relying on assisted
 submit. The module never submits an incomplete form and never submits without the
 owner's explicit Enviar.
+
+## ADR-014: Drive authenticates as the user (OAuth); the service account is an alternative
+A Google service account has no storage quota of its own, so uploading to a normal
+(non-Shared) Drive fails with `storageQuotaExceeded`. For a personal Google account
+the fix is user OAuth: files are created as the authorizing account and count against
+its quota. `DriveFileStorage` therefore uses OAuth whenever `DRIVE_REFRESH_TOKEN` is
+set (obtained once with `jobpilot auth-drive`) and falls back to the service account
+otherwise, which still works for a Shared Drive. The OAuth client defaults to the
+Gmail client (`GMAIL_CLIENT_ID/SECRET`) unless `GOOGLE_OAUTH_CLIENT_ID/SECRET` are set.
+
+The scope is the full `drive` scope on purpose: `drive.file` only covers files the app
+itself created, so it cannot write into the owner's pre-existing `DRIVE_FOLDER_ID`.
+Caveat: while the OAuth consent screen is in "Testing" status Google expires refresh
+tokens after 7 days; publish the app (or re-run `auth-drive`) for a durable token.
+
+## ADR-015: Tests never read the developer's real `.env`
+`Settings` loads `.env` from the working directory, so a test that "removed" a secret
+from the environment still saw the real one from the file and hit live services.
+An autouse fixture in `tests/conftest.py` now disables the env file for every test and
+clears the cached settings, keeping the suite offline and deterministic.

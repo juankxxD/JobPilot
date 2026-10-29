@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,24 @@ import pytest
 from jobpilot.profile.model import ProfileModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_settings_from_dotenv(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Never let a test read the developer's real ``.env``.
+
+    ``Settings`` loads ``.env`` from the working directory. Tests that "remove" an
+    environment variable would otherwise still see the real credential from the file,
+    and credential checks would hit live services (slow, flaky, and a leak risk). Turn
+    the file off for every test and drop the cached Settings so each test starts clean.
+    Tests that need values pass them explicitly or via ``monkeypatch.setenv``.
+    """
+    from jobpilot.config import Settings, get_settings
+
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
